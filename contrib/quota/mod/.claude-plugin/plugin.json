@@ -1,0 +1,17 @@
+{
+  "name": "quota",
+  "version": "0.1.0",
+  "description": "Every claude-swap account's usage, the pool's pace and where it runs out: on demand with /quota, under an answer once per interval, and in the band above the prompt. Needs cswap-quota on PATH.",
+  "author": {
+    "name": "claude-swap contributors"
+  },
+  "userConfig": {
+    "intervalMinutes": {
+      "type": "number",
+      "title": "Minutes between quota tables",
+      "description": "The table prints under the first answer that finishes after this many minutes have passed since the last print.",
+      "required": false,
+      "default": 30
+    }
+  }
+}
