@@ -167,27 +167,37 @@ class TestJsonHelpers:
     def test_account_row_includes_alias_when_set(self):
         from claude_swap.json_output import account_row
 
-        row = account_row(1, "a@x.com", "", "", True, None, alias="dev")
+        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth", alias="dev")
         assert row["alias"] == "dev"
 
     def test_account_row_omits_alias_when_unset(self):
         from claude_swap.json_output import account_row
 
-        row = account_row(1, "a@x.com", "", "", True, None)
+        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth")
         assert "alias" not in row
 
     def test_account_row_includes_login_expiry_when_known(self):
         from claude_swap.json_output import account_row
 
         row = account_row(
-            1, "a@x.com", "", "", True, None, login_expires_at="2026-10-08T01:06:36Z"
+            1, "a@x.com", "", "", True, None, login_kind="oauth", login_expires_at="2026-10-08T01:06:36Z"
         )
         assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
     def test_account_row_omits_login_expiry_when_unknown(self):
         from claude_swap.json_output import account_row
 
-        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None)
+        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None, login_kind="oauth")
+
+    @pytest.mark.parametrize("kind", ["oauth", "setup-token", "api-key"])
+    def test_account_row_always_names_its_login_kind(self, kind):
+        """Asserts: every row carries ``loginKind`` verbatim, so a reader can
+        tell which renewal a near expiry needs."""
+        from claude_swap.json_output import account_row
+
+        assert account_row(1, "a@x.com", "", "", True, None, login_kind=kind)[
+            "loginKind"
+        ] == kind
 
 
 # --------------------------------------------------------------------------- #
@@ -852,7 +862,7 @@ class TestAccountRowFailure:
 
     def test_unavailable_row_names_its_failure_and_retry(self):
         row = account_row(
-            2, "b@example.com", "", "", False, None,
+            2, "b@example.com", "", "", False, None, login_kind="oauth",
             last_error="http-429", backoff_until=1_800_000_000.0,
         )
         assert row["usageStatus"] == "unavailable"
@@ -860,12 +870,12 @@ class TestAccountRowFailure:
         assert row["usageRetryAt"] == "2027-01-15T08:00:00Z"
 
     def test_lapsed_backoff_leaves_only_the_error(self):
-        row = account_row(2, "b@example.com", "", "", False, None, last_error="timeout")
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", last_error="timeout")
         assert row["usageError"] == "timeout"
         assert "usageRetryAt" not in row
 
     def test_no_failure_adds_nothing(self):
-        row = account_row(2, "b@example.com", "", "", False, None)
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth")
         assert "usageError" not in row
         assert "usageRetryAt" not in row
 
@@ -876,7 +886,7 @@ class TestAccountRowFailure:
         """A served measurement or a sentinel already says what the row is;
         a failure left over from an earlier pass would only contradict it."""
         row = account_row(
-            2, "b@example.com", "", "", False, entry,
+            2, "b@example.com", "", "", False, entry, login_kind="oauth",
             usage_fetched_at=1_800_000_000.0,
             last_error="http-429", backoff_until=1_800_000_000.0,
         )
@@ -888,11 +898,11 @@ class TestAccountRowDisabled:
     """The additive ``disabled`` field on --list rows."""
 
     def test_disabled_true_included(self):
-        row = account_row(2, "b@example.com", "", "", False, None, disabled=True)
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", disabled=True)
         assert row["disabled"] is True
 
     def test_disabled_absent_by_default(self):
-        row = account_row(1, "a@example.com", "", "", False, None)
+        row = account_row(1, "a@example.com", "", "", False, None, login_kind="oauth")
         assert "disabled" not in row
 
 

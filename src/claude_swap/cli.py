@@ -769,6 +769,41 @@ Examples:
         sys.exit(130)
 
 
+def _token_added_command(argv: list[str]) -> None:
+    """Handle `cswap token-added NUM|EMAIL YYYY-MM-DD`.
+
+    Records the day a setup-token account's token was added, for a token
+    stored before `add-token` recorded it; the login expiry `list` shows is
+    that day plus one year. Pre-dispatched like `alias`.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap token-added",
+        description=(
+            "Record the day a setup-token account's token was added. Its "
+            "login expiry (shown by `cswap list`) is that day plus one year. "
+            "`cswap add-token` records it itself; use this for a token "
+            "added before it did."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap token-added 2 2026-10-07
+  cswap token-added user@example.com 2026-10-07
+        """,
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL", help="Setup-token account")
+    parser.add_argument("day", metavar="YYYY-MM-DD", help="Day the token was added (UTC)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        switcher.stamp_token_added(args.account, args.day)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -1288,6 +1323,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "token-added":
+        _token_added_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1319,6 +1357,8 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s token-added <num|email> <YYYY-MM-DD>
+                                      record when a setup-token was added
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation

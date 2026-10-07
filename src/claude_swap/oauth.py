@@ -25,6 +25,39 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 _logger = logging.getLogger("claude-swap")
 
+# Setup-tokens are inference-only server-side; wider scopes trigger 403s
+# on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
+SETUP_TOKEN_SCOPES = ("user:inference",)
+
+#: How long a ``claude setup-token`` login lasts from the day it was minted.
+#: The token carries no expiry of its own, so ``add-token`` records the day
+#: it was added and the login expiry is that day plus this span.
+SETUP_TOKEN_LIFETIME_S = 365 * 86400
+
+
+def is_setup_token_credential(credentials: str | None) -> bool:
+    """Whether a stored credential is a ``claude setup-token`` login.
+
+    Such a credential is the OAuth wrapper ``add-token`` writes: an access
+    token, no refresh token, and only the inference scope. Its scope cannot
+    read the usage endpoint (every ask answers 403), so the account is
+    measured from the rate-limit headers its own replies carry and nothing
+    else. A browser login always carries a refresh token and wider scopes,
+    and a managed API key is not JSON, so neither ever matches.
+    """
+    data = extract_oauth_data(credentials) if credentials else None
+    if not data:
+        return False
+    access = data.get("accessToken")
+    scopes = data.get("scopes")
+    return (
+        isinstance(access, str)
+        and bool(access)
+        and not data.get("refreshToken")
+        and isinstance(scopes, list)
+        and set(scopes) == set(SETUP_TOKEN_SCOPES)
+    )
+
 
 def extract_access_token(credentials: str) -> str | None:
     """Extract the OAuth access token from a credentials JSON string."""

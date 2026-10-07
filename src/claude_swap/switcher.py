@@ -20,6 +20,7 @@ import sys
 import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -109,6 +110,7 @@ from claude_swap.usage_store import (
     UsageEntry,
     UsageStore,
     json_decision_value,
+    with_header_only,
     with_sentinel,
 )
 
@@ -120,9 +122,27 @@ KEYRING_SERVICE = "claude-code"
 # SECURITY_SERVICE and CLAUDE_CODE_KEYCHAIN_SERVICE now live in credentials.py
 # (storage concerns); re-exported above for migrations.py and the test suite.
 
-# Setup-tokens are inference-only server-side; wider scopes trigger 403s
-# on profile endpoints. Matches Claude Code's CLAUDE_CODE_OAUTH_TOKEN path.
-SETUP_TOKEN_SCOPES = ("user:inference",)
+# Re-exported for the test suite; the one definition lives in oauth.py beside
+# `is_setup_token_credential`, which reads it.
+SETUP_TOKEN_SCOPES = oauth.SETUP_TOKEN_SCOPES
+
+
+def _parse_token_added_at(stamp: object, account_num: str) -> float:
+    """A roster record's ``tokenAddedAt`` (``YYYY-MM-DDTHH:MM:SSZ``, the
+    ``get_timestamp`` shape) as epoch seconds. Raises ConfigError on any
+    other value: the stamp is only ever written by cswap, so a bad one is a
+    corrupt record, not an unknown date."""
+    message = (
+        f"Account {account_num}: tokenAddedAt {stamp!r} is not a "
+        "YYYY-MM-DDTHH:MM:SSZ time; re-stamp it with `cswap token-added`"
+    )
+    if not isinstance(stamp, str):
+        raise ConfigError(message)
+    try:
+        parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as e:
+        raise ConfigError(message) from e
+    return parsed.replace(tzinfo=timezone.utc).timestamp()
 
 # Delay between successive usage-request launches in one collect pass, so N
 # accounts never burst the shared usage endpoint from one IP in the same
@@ -3421,7 +3441,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     access_token_fp=oauth.access_token_fingerprint(creds),
-                    login_expires_at=oauth.login_expires_at_epoch(creds),
+                    login_expires_at=self._login_expires_at_epoch(n, creds),
                 )
             )
         return AccountsSnapshot(
@@ -3449,22 +3469,31 @@ class ClaudeAccountSwitcher:
     def record_usage_headers(self, num: str, headers: Mapping[str, str]) -> bool:
         """Public entry point for the pin: record a 5h/7d usage reading
         straight off a ``/v1/messages`` reply's own rate-limit headers for
-        slot ``num`` — no fetch, no credential access, just this slot's
-        roster identity resolved from disk. See
+        slot ``num``: no fetch, just this slot's roster identity and its
+        stored credential's kind resolved from disk. See
         ``UsageStore.record_header_reading`` for the header names, the
         utilization scale, and the throttle contract (the pin calls this at
         most once per 30s per slot). Returns False, recording nothing, for
         an unknown slot, a reply carrying no 5h utilization header, or a row
         currently struck (``authDeadStrikes`` > 0) or failed on anything but
         ``http-429`` (``consecutiveFailures`` > 0) — see
-        ``record_header_reading``.
+        ``record_header_reading``. A setup-token slot
+        (``oauth.is_setup_token_credential`` on its stored credential, the
+        one credential read here) is measured from these headers alone, so
+        its reading is always recorded (``header_only``).
         """
         data = self._get_sequence_data() or {}
         info = data.get("accounts", {}).get(num)
         if info is None:
             return False
-        identity = (info.get("email", ""), info.get("organizationUuid", "") or "")
-        return self._usage_store.record_header_reading(num, {num: identity}, headers)
+        email = info.get("email", "")
+        identity = (email, info.get("organizationUuid", "") or "")
+        header_only = oauth.is_setup_token_credential(
+            self._read_account_credentials(num, email)
+        )
+        return self._usage_store.record_header_reading(
+            num, {num: identity}, headers, header_only=header_only
+        )
 
     def _slot_identity(self, num: str) -> tuple[str, str] | None:
         """``(email, organizationUuid)`` slot ``num`` maps to, or None for
@@ -5885,6 +5914,97 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num), {})
         return "api_key" if record.get("kind") == "api_key" else "oauth"
 
+    def _login_kind(self, account_num: str, creds: str) -> str:
+        """How slot ``account_num`` logs in: ``"api-key"``, ``"setup-token"``
+        (a ``claude setup-token`` one-year login, ``oauth.is_setup_token_credential``)
+        or ``"oauth"`` (a browser login). ``list --json`` emits it as
+        ``loginKind`` so a reader can tell which renewal a row needs."""
+        if looks_like_api_key(creds) or self._account_kind(account_num) == "api_key":
+            return "api-key"
+        if oauth.is_setup_token_credential(creds):
+            return "setup-token"
+        return "oauth"
+
+    def _token_added_at_epoch(self, account_num: str) -> float | None:
+        """When slot ``account_num``'s setup-token was added (``tokenAddedAt``
+        on its roster record, stamped by ``add-token`` or ``token-added``),
+        as epoch seconds; None when the record carries no stamp. A stamp
+        that is not an ISO-8601 UTC time is a corrupt record and raises."""
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num), {})
+        stamp = record.get("tokenAddedAt")
+        if stamp is None:
+            return None
+        return _parse_token_added_at(stamp, account_num)
+
+    def _login_expires_at_epoch(self, account_num: str, creds: str) -> float | None:
+        """When slot ``account_num``'s login lapses, as epoch seconds, or None
+        when unknown. A browser login reads its refresh token's own expiry
+        (``oauth.login_expires_at_epoch``); a setup-token carries no expiry,
+        so it is the recorded add time plus ``oauth.SETUP_TOKEN_LIFETIME_S``."""
+        if oauth.is_setup_token_credential(creds):
+            added = self._token_added_at_epoch(account_num)
+            return None if added is None else added + oauth.SETUP_TOKEN_LIFETIME_S
+        return oauth.login_expires_at_epoch(creds)
+
+    def _login_expires_at_iso(self, account_num: str, creds: str) -> str | None:
+        """ISO-8601 UTC twin of :meth:`_login_expires_at_epoch`, in the same
+        ``...Z`` shape ``oauth.login_expires_at_iso`` gives a browser login."""
+        epoch = self._login_expires_at_epoch(account_num, creds)
+        if epoch is None:
+            return None
+        return (
+            datetime.fromtimestamp(epoch, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+    def stamp_token_added(self, identifier: str, day: str) -> None:
+        """``cswap token-added``: record the day a setup-token slot's token was
+        added (``YYYY-MM-DD``, read as 00:00 UTC), for a token stored before
+        ``add-token`` recorded it. Its login expiry is then that day plus
+        ``oauth.SETUP_TOKEN_LIFETIME_S``. Refuses a slot whose stored
+        credential is not a setup-token: a browser login carries its own
+        expiry and an API key has none."""
+        try:
+            when = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError as e:
+            raise ValidationError(
+                f"Token date must be YYYY-MM-DD, got {day!r}"
+            ) from e
+        with FileLock(self.lock_file, timeout=STORE_LOCK_WAIT_S).held_for(
+            "cswap token-added"
+        ):
+            data = self._get_sequence_data()
+            if not data:
+                raise AccountNotFoundError("No accounts are managed yet")
+            account_num = self._resolve_account_identifier(identifier)
+            record = data.get("accounts", {}).get(account_num or "")
+            if record is None:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            email = record["email"]
+            creds = self._read_account_credentials(account_num, email)
+            if not oauth.is_setup_token_credential(creds):
+                raise ValidationError(
+                    f"Account {account_num} ({email}) is not a setup-token "
+                    "account; only a token added by `cswap add-token` takes "
+                    "a token date"
+                )
+            record["tokenAddedAt"] = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        expires = self._login_expires_at_iso(account_num, creds)
+        self._logger.info(
+            f"Stamped token date {day} on account {account_num} ({email}); "
+            f"login expires {expires}"
+        )
+        print(
+            f"{accent('Stamped')} Account {account_num} ({email}): token added "
+            f"{day}, login expires {expires}"
+        )
+
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
     ) -> None:
@@ -6921,6 +7041,10 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
+            if not is_api_key:
+                # A new setup-token is a new one-year login: its expiry runs
+                # from now (``_login_expires_at_epoch``).
+                seq["accounts"][account_num]["tokenAddedAt"] = get_timestamp()
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -7022,6 +7146,10 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        else:
+            # The one-year login's start: `_login_expires_at_epoch` reads it,
+            # and export/import carry it with the account.
+            record["tokenAddedAt"] = record["added"]
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -9189,6 +9317,21 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             static = self._static_usage_sentinel(info)
             if static is not None:
                 sentinels[num] = static
+        # Setup-token accounts: the usage endpoint refuses their scope with a
+        # 403 on every ask, so they are never reserved or fetched below. Their
+        # one measurement is the reply-header reading the owner proxy records
+        # (``record_usage_headers``), and their entries say so
+        # (``UsageEntry.header_only``) for every reader downstream.
+        header_only = {
+            num
+            for num, info in info_by_num.items()
+            if num not in sentinels and oauth.is_setup_token_credential(info[5])
+        }
+
+        def finish(entry: UsageEntry, num: str) -> UsageEntry:
+            if num in header_only:
+                entry = with_header_only(entry)
+            return with_sentinel(entry, sentinels.get(num))
 
         entries = store.entries(identities, models)
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
@@ -9278,10 +9421,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             # Skip the stash sweep, the reserve claim and the fetch pool:
             # read-only means the store is served as-is, so no login is
             # adopted and no refresh grant is consumed.
-            return {
-                num: with_sentinel(entries[num], sentinels.get(num))
-                for num in info_by_num
-            }
+            return {num: finish(entries[num], num) for num in info_by_num}
         # Every pass, fetches or none: arm A of the sweep still drains a
         # refresh-and-access-dead row even when every fetch below fails, and
         # only THIS loop measures which slots are live enough to license
@@ -9306,7 +9446,9 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         requested = [
             num
             for num in info_by_num
-            if num not in sentinels and (fetch is None or num in fetch)
+            if num not in sentinels
+            and num not in header_only
+            and (fetch is None or num in fetch)
         ]
         if fetch is None:
             # Repair reset-parked plans written by releases that stopped
@@ -9406,10 +9548,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 # (unreadable backup on a struck active slot) — set no
                 # sentinel, see that scan's comment for why.
 
-        return {
-            num: with_sentinel(entries[num], sentinels.get(num))
-            for num in info_by_num
-        }
+        return {num: finish(entries[num], num) for num in info_by_num}
 
     def _adopt_stashed_login_for_slot(self, num: str, email: str) -> bool:
         """Adopt a login parked for this slot back when the slot was healthy.
@@ -10403,7 +10542,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     ),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=self._login_expires_at_iso(str(num), creds),
+                    login_kind=self._login_kind(str(num), creds),
                 )
             )
         payload = {
@@ -10473,7 +10613,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            login_expires_at = oauth.login_expires_at_epoch(creds)
+            login_expires_at = self._login_expires_at_epoch(str(num), creds)
             for line in _usage_entry_lines(entries[str(num)], login_expires_at):
                 print(f"     {line}")
 
@@ -10554,7 +10694,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         entry = self._collect_usage_entries(
             [info], sweep_stash=False, read_only=read_only
         )[str(account_num)]
-        return entry, oauth.login_expires_at_epoch(creds)
+        return entry, self._login_expires_at_epoch(str(account_num), creds)
 
     def _build_status_payload(self, *, read_only: bool = False) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""

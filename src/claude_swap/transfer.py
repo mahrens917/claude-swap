@@ -83,7 +83,9 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
     # Org/uuid/added must be strings (or absent). A list/dict here would
     # otherwise blow up downstream (unhashable in seen_keys, broken composite
     # key matching, garbage in sequence.json).
-    for field in ("organizationUuid", "organizationName", "uuid", "added", "alias"):
+    for field in (
+        "organizationUuid", "organizationName", "uuid", "added", "alias", "tokenAddedAt",
+    ):
         if field in account and account[field] is not None:
             if not isinstance(account[field], str):
                 raise TransferError(
@@ -322,6 +324,10 @@ def _export_accounts_locked(
             entry["kind"] = "api_key"
         if record.get("alias"):
             entry["alias"] = record["alias"]
+        if "tokenAddedAt" in record:
+            # A fact about the token itself (its one-year login started
+            # then), so it travels with the account, unlike `added`.
+            entry["tokenAddedAt"] = record["tokenAddedAt"]
         accounts_payload.append(entry)
 
     if not accounts_payload:
@@ -495,6 +501,7 @@ def _import_accounts_locked(
                 "added": raw.get("added") or get_timestamp(),
                 "kind": "api_key" if is_api_key else "oauth",
                 "alias": alias,
+                "token_added_at": raw.get("tokenAddedAt"),
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
             }
@@ -656,6 +663,10 @@ def _import_accounts_locked(
             new_record["kind"] = "api_key"
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
+        if entry["token_added_at"] is not None:
+            # Carried verbatim, unlike `added` above: it dates the token,
+            # not this roster's copy of it.
+            new_record["tokenAddedAt"] = entry["token_added_at"]
         data["accounts"][target_num] = new_record
         if int(target_num) not in data["sequence"]:
             data["sequence"].append(int(target_num))

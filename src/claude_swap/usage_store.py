@@ -470,6 +470,12 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # A ``claude setup-token`` account (``oauth.is_setup_token_credential``):
+    # its scope cannot read the usage endpoint, so its one measurement is the
+    # reply-header reading the owner proxy records while it is active. Set by
+    # the collector (``with_header_only``), never persisted. Its endpoint
+    # failure fields are not about this account and no gate reads them.
+    header_only: bool = False
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -607,6 +613,12 @@ class UsageEntry:
             return self.sentinel
         if self.walled:
             return _walled_decision_value(self.last_good, self.walled_until)
+        if self.header_only:
+            if self.fetched_at is None or self.age_s is None:
+                return None
+            return _header_only_decision_value(
+                self.last_good, self.fetched_at + self.age_s
+            )
         if (
             self.last_good is not None
             and self.age_s is not None
@@ -692,6 +704,8 @@ def due_candidate(
             continue
         if entry.sentinel is not None:
             continue
+        if entry.header_only:
+            continue  # measured from reply headers; the endpoint answers 403
         if entry.attempts_in_window >= ATTEMPTS_PER_HOUR_MAX:
             continue  # reserve() would refuse it too; don't waste the pass
         if entry.token_dead():
@@ -780,6 +794,41 @@ def _drop_rolled_windows(
         if len(kept) != len(scoped):
             result["scoped"] = kept
     return result if oauth.relevant_windows(result, models) else None
+
+
+def _header_only_decision_value(last_good: dict | None, now: float) -> dict | None:
+    """The decision value of a header-only (setup-token) account's reading.
+
+    Trusted at any age: nothing can refresh it except using the account, so
+    an age bar would drop every idle token account out of the rotation for
+    good (the `no candidate has readable usage` hold). On this box the
+    account is used only while active, and every reply then records a newer
+    reading, so an idle account's windows can only have fallen since.
+
+    A 5h or 7d window whose own reset has passed since the reading reads 0%
+    with no reset: the window restarted after the account's last use here.
+    Use of the same account from another machine is invisible to this
+    reading; the first reply after a switch onto it records the real figure.
+
+    Only the 5h and 7d windows survive. The reply headers carry no per-model
+    window, so a per-model (``scoped``) window is unmeasured for this account
+    and never gates it; a scoped figure left from an earlier endpoint reading
+    is dropped rather than trusted forever. None when no 5h/7d reading exists.
+    """
+    if not isinstance(last_good, dict):
+        return None
+    result: dict = {}
+    for key in ("five_hour", "seven_day"):
+        window = last_good.get(key)
+        if not isinstance(window, dict) or not isinstance(
+            window.get("pct"), (int, float)
+        ):
+            continue
+        reset = parse_reset_ts(window.get("resets_at"))
+        result[key] = (
+            {"pct": 0.0} if reset is not None and reset <= now else dict(window)
+        )
+    return result or None
 
 
 # The same 5h/7d rate-limit headers Claude Code itself reads off every
@@ -1611,6 +1660,8 @@ class UsageStore:
         num: str,
         identities: dict[str, Identity],
         headers: Mapping[str, str],
+        *,
+        header_only: bool = False,
     ) -> bool:
         """Record a 5h/7d reading straight off a ``/v1/messages`` reply's own
         rate-limit headers (see the ``USAGE_HEADER_*`` names above) — no
@@ -1653,6 +1704,15 @@ class UsageStore:
         ``last429At`` and ``backoffUntil`` are left untouched, so no
         endpoint poll is invited before the backoff itself clears.
 
+        ``header_only=True`` is a setup-token account
+        (``oauth.is_setup_token_credential``), whose scope the usage endpoint
+        refuses with a 403 every time: these headers are its ONLY
+        measurement, so the endpoint's failure and strike fields describe
+        asks that should never have been made and refuse nothing here. The
+        reading is recorded as a success is (``consecutiveFailures``,
+        ``lastError`` and ``backoffUntil`` cleared) and ``nextPollAt`` is
+        cleared, since no endpoint poll will ever follow it.
+
         Returns True when a reading was recorded (the 5h utilization header
         was present and the row was eligible); False, recording nothing,
         otherwise.
@@ -1667,9 +1727,12 @@ class UsageStore:
 
         def apply(_num: str, row: dict) -> None:
             nonlocal recorded
-            if int(row.get("authDeadStrikes") or 0) > 0 or (
-                int(row.get("consecutiveFailures") or 0) > 0
-                and row.get("lastError") != "http-429"
+            if not header_only and (
+                int(row.get("authDeadStrikes") or 0) > 0
+                or (
+                    int(row.get("consecutiveFailures") or 0) > 0
+                    and row.get("lastError") != "http-429"
+                )
             ):
                 return
             recorded = True
@@ -1686,6 +1749,12 @@ class UsageStore:
                 last_good["seven_day"] = seven_entry
             row["lastGood"] = last_good
             row["fetchedAt"] = now
+            if header_only:
+                row["consecutiveFailures"] = 0
+                row["lastError"] = None
+                row["backoffUntil"] = None
+                row["nextPollAt"] = None
+                return
             floor = (
                 _num_or_none(row.get("lastAttemptAt")) or now
             ) + CANDIDATE_MAX_INTERVAL_S
@@ -2099,6 +2168,11 @@ def _row_eligible(
     if repair_overslept:
         return poll_due or (stale and (next_poll_at is None or overslept))
     return poll_due or stale
+
+
+def with_header_only(entry: UsageEntry) -> UsageEntry:
+    """Mark a stored entry as a header-only account's (read model only)."""
+    return replace(entry, header_only=True)
 
 
 def with_sentinel(entry: UsageEntry, sentinel: str | None) -> UsageEntry:

@@ -522,9 +522,13 @@ def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
     alone (a backed-off peer is a fine target when the ACTIVE credential is
     the one failing).
     """
+    # A header-only (setup-token) entry is never refreshable by a fetch: its
+    # reading moves only while the account is in use, so its freshness is
+    # its decision value (``UsageEntry.decision_value``'s header-only arm),
+    # never a fetch age.
     return (
         entry is None
-        or not (entry.fresh(now) or entry.held(now))
+        or not (entry.fresh(now) or entry.held(now) or entry.header_only)
         or entry.token_dead()
     )
 
@@ -558,11 +562,14 @@ def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
     genuinely have no usable reading", not merely "polling is having a bad
     day".
     """
+    # A header-only (setup-token) entry's backoff and failure fields record
+    # endpoint asks that never describe it, so they are not its signature.
     return (
         entry is None
         or entry.token_dead()
         or (
-            (entry.in_backoff(now) or entry.consecutive_failures > 0)
+            not entry.header_only
+            and (entry.in_backoff(now) or entry.consecutive_failures > 0)
             and entry.decision_value() is None
         )
     )
@@ -1180,7 +1187,13 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     if entries is None:
         return True
     entry = entries.get(num)
-    return entry is not None and entry.fresh(now) and not entry.held(now)
+    # A header-only (setup-token) account learns its reset the only way it
+    # can, from the replies after the probe switch, so no fetch age applies.
+    return (
+        entry is not None
+        and (entry.fresh(now) or entry.header_only)
+        and not entry.held(now)
+    )
 
 
 def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
@@ -5965,6 +5978,7 @@ class AutoSwitchEngine:
                 entry.next_poll_at
                 for num, entry in entries.items()
                 if entry.next_poll_at is not None
+                and not entry.header_only
                 and num in votable
                 and (
                     num == current

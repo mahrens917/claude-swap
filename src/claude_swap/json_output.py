@@ -318,6 +318,7 @@ def account_row(
     alias: str = "",
     disabled: bool = False,
     login_expires_at: str | None = None,
+    login_kind: str,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold."""
@@ -343,6 +344,12 @@ def account_row(
     # ``relogin_required`` that follows; absent when the login carries none.
     if login_expires_at:
         row["loginExpiresAt"] = login_expires_at
+    # How the slot logs in, so a reader knows which renewal a near expiry
+    # needs: "oauth" (a browser login, renewed by /login), "setup-token" (a
+    # one-year `claude setup-token`, renewed by a new token through
+    # `cswap add-token`; its expiry is the recorded add time plus a year) or
+    # "api-key" (no login to expire).
+    row["loginKind"] = login_kind
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

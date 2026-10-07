@@ -395,6 +395,14 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
+Every row also carries `loginKind`: `"oauth"` (a browser login, renewed by `/login`), `"setup-token"` (a one-year `claude setup-token`, renewed by minting a new token and running `cswap add-token --email <email> --slot <n>`) or `"api-key"`. A setup-token carries no expiry of its own, so `add-token` records when it was added (`tokenAddedAt`, carried by `export`/`import`) and the row's `loginExpiresAt` is that time plus 365 days. For a token added before cswap recorded this, stamp the day by hand:
+
+```bash
+cswap token-added 2 2026-10-07
+```
+
+A setup-token's scope cannot read the usage endpoint (it answers 403), so cswap never asks it for one: the account is measured from the 5h/7d rate-limit headers on its own replies while it is active, and that last reading stays decision-trusted while the account sits idle (a window whose reset has passed since reads 0%). The headers carry no per-model window, so a model window such as `autoswitch.model Fable` is unmeasured for a token account and never blocks it.
+
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.

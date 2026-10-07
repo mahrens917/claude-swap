@@ -2450,6 +2450,7 @@ def _usage_row(email: str, org_uuid: str = "", pct: float = 42.0, age_s: float =
         {"five_hour": {"pct": pct, "resets_at": "2099-01-01T00:00:00+00:00"}},
         usage_fetched_at=time.time() - age_s,
         usage_age_s=age_s,
+        login_kind="oauth",
     )
 
 
