@@ -2706,6 +2706,19 @@ class AutoSwitchEngine:
                 trigger = settings.strategy
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+        elif (
+            usage.get(current) == USAGE_RELOGIN_REQUIRED
+            and entries.get(current) is not None
+            and entries[current].header_only
+        ):
+            # A SETUP-TOKEN ACTIVE THE API REFUSED (the owner proxy's strike,
+            # ``record_credential_refused``) is a verdict, not a read that may
+            # recover: the token has no refresh path, so the unhealthy-tick
+            # count below (a gate for TRANSIENT failure) would only keep every
+            # session failing for its extra ticks. Leave on this tick.
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "failover"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock

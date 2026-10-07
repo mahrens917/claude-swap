@@ -359,6 +359,16 @@ def _strike_is_suspected_race(
 # a credential with no refresh token cannot be healed by any retry.
 PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token"})
 
+# ``strikeSource`` of a strike the API itself handed down: the owner proxy saw
+# a ``/v1/messages`` refusal (401, or an auth-typed 403) on the bearer that IS
+# the slot's stored setup-token credential
+# (``UsageStore.strike_refused_credential``). Absent on a strike the refresh
+# endpoint produced. The race doubt (``_strike_is_suspected_race``) is about a
+# refresh grant consumed by a racing writer and never applies here: the
+# refused bytes were matched against the stored credential before the strike
+# was written, and a setup-token has no refresh to race.
+STRIKE_SOURCE_API_REFUSAL = "api-refusal"
+
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]
 
@@ -476,6 +486,10 @@ class UsageEntry:
     # the collector (``with_header_only``), never persisted. Its endpoint
     # failure fields are not about this account and no gate reads them.
     header_only: bool = False
+    # ``strikeSource`` of the stored strike (``STRIKE_SOURCE_API_REFUSAL``,
+    # or None for a refresh-endpoint strike). Appended for the same
+    # positional compatibility as ``claim_until``.
+    strike_source: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -543,8 +557,10 @@ class UsageEntry:
         """
         if self.auth_dead_strikes < threshold:
             return False
-        if _strike_is_suspected_race(
-            self.auth_dead_strikes, self.fetched_at, self.struck_at
+        if self.strike_source != STRIKE_SOURCE_API_REFUSAL and (
+            _strike_is_suspected_race(
+                self.auth_dead_strikes, self.fetched_at, self.struck_at
+            )
         ):
             return False
         if (
@@ -1348,6 +1364,7 @@ class UsageStore:
                 walled_until=walled_until,
                 attempts_in_window=len(_pruned_attempts(row, now)),
                 held_until=held_until,
+                strike_source=row.get("strikeSource"),
             )
         return out
 
@@ -1515,6 +1532,8 @@ class UsageStore:
                     # The strike's own time. `lastAttemptAt` moves on every
                     # attempt, so only this can bound the race doubt.
                     row["struckAt"] = now
+                    # A refresh-endpoint strike: the race doubt applies.
+                    row["strikeSource"] = None
                     # SAY SO. This is the only place that knows the slot, the
                     # identity and the verdict at the moment it binds, and at
                     # AUTH_DEAD_STRIKES=1 one line here is the whole
@@ -1654,6 +1673,50 @@ class UsageStore:
             )
 
         self._mutate(identities, [num], apply)
+
+    def strike_refused_credential(
+        self,
+        num: str,
+        identities: dict[str, Identity],
+        struck_fp: str,
+    ) -> bool:
+        """Quarantine slot ``num`` because the API refused its credential.
+
+        The same quarantine a dead refresh lineage gets (``authDeadStrikes``
+        at ``AUTH_DEAD_STRIKES``, bound to ``struck_fp``), so ``token_dead``,
+        the collector's ``relogin_required`` sentinel and every rotation gate
+        read it unchanged; marked ``strikeSource`` =
+        ``STRIKE_SOURCE_API_REFUSAL`` so the refresh race doubt does not
+        excuse it. The caller has already matched ``struck_fp`` against the
+        slot's stored credential. Cleared the way every strike is: a
+        credential write through ``clear_dead_token`` (``add-token``), or a
+        stored credential whose fingerprint moved off ``struck_fp``.
+
+        Returns True when this call put the strike on; False when the row
+        already carried this same strike (a burst of refused replies strikes
+        once and is announced once).
+        """
+        now = self.clock()
+        struck = False
+
+        def apply(_num: str, row: dict) -> None:
+            nonlocal struck
+            if (
+                int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES
+                and row.get("struckFingerprint") == struck_fp
+                and row.get("strikeSource") == STRIKE_SOURCE_API_REFUSAL
+            ):
+                return
+            struck = True
+            row["authDeadStrikes"] = max(
+                int(row.get("authDeadStrikes") or 0), AUTH_DEAD_STRIKES
+            )
+            row["struckAt"] = now
+            row["struckFingerprint"] = struck_fp
+            row["strikeSource"] = STRIKE_SOURCE_API_REFUSAL
+
+        self._mutate(identities, [num], apply)
+        return struck
 
     def record_header_reading(
         self,
@@ -2028,6 +2091,7 @@ class UsageStore:
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
             row["struckAt"] = None
+            row["strikeSource"] = None
             if not strike_only:
                 # A strike heal is evidence the FINGERPRINT no longer matches,
                 # not evidence the server's own 429 throttle lifted:
@@ -2056,6 +2120,7 @@ def _apply_success(row: dict, usage: dict | None, now: float) -> None:
     row["rejectedFingerprint"] = None
     row["authDeadStrikes"] = 0  # a success proves the token is alive
     row["struckAt"] = None
+    row["strikeSource"] = None
 
 
 def _apply_failure(

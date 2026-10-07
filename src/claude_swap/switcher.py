@@ -3495,6 +3495,81 @@ class ClaudeAccountSwitcher:
             num, {num: identity}, headers, header_only=header_only
         )
 
+    def record_credential_refused(
+        self, num: str, status: int, fingerprint: str
+    ) -> bool:
+        """Public entry point for the owner proxy: the API refused slot
+        ``num``'s credential (``status`` 401, or a 403 whose error type is
+        an authentication or permission error) on a ``/v1/messages`` reply
+        whose bearer was that slot's live token.
+
+        Strikes the slot out of rotation (``UsageStore.strike_refused_credential``,
+        the quarantine a dead browser login gets, read as
+        ``relogin_required``) when ``fingerprint``
+        (``oauth.credential_fingerprint`` of the refused credential) matches
+        one of the slot's stored credentials (the live login when ``num`` is
+        active, and its saved backup) AND that credential is a setup-token
+        (``oauth.is_setup_token_credential``). A setup-token has no refresh
+        path, so a refusal is the verdict, and one suffices: the recovery is
+        ``cswap add-token`` into the slot, whose ``clear_dead_token`` lifts
+        it. A browser login is never struck here (its refresh machinery owns
+        its verdict), and a fingerprint no stored credential carries (a
+        credential replaced since the request went out) strikes nothing.
+
+        Returns True when this call put the strike on, False otherwise
+        (including a repeat of a strike already in place).
+        """
+        data = self._get_sequence_data() or {}
+        info = data.get("accounts", {}).get(num)
+        if info is None or not fingerprint:
+            return False
+        email = info.get("email", "")
+        identity = (email, info.get("organizationUuid", "") or "")
+        sources: list[str] = []
+        if num == self.current_account_number():
+            active = self._store._read_active_credentials()
+            if active.value and not active.degraded:
+                sources.append(active.value)
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        if backup and not unreadable:
+            sources.append(backup)
+        matched = next(
+            (s for s in sources if oauth.credential_fingerprint(s) == fingerprint),
+            None,
+        )
+        if matched is None:
+            self._logger.info(
+                "Account %s (%s): a refusal (http-%s) named a credential no "
+                "stored source carries any more; nothing struck.",
+                num, email, status,
+            )
+            return False
+        if not oauth.is_setup_token_credential(matched):
+            return False
+        # The strike binds the generation every later `token_dead` reads,
+        # and those reads compare the slot's SAVED copy (the collector and
+        # the switch gates fingerprint the backup). When the refused bytes
+        # are the live file and the saved copy carries the same token in
+        # different bytes, binding the live fingerprint would read as
+        # "credential replaced" and lift the strike at once, so the saved
+        # copy's fingerprint is bound whenever it holds the refused token.
+        struck_fp = fingerprint
+        if backup and not unreadable and (
+            oauth.extract_access_token(backup) == oauth.extract_access_token(matched)
+        ):
+            struck_fp = oauth.credential_fingerprint(backup)
+        struck = self._usage_store.strike_refused_credential(
+            num, {num: identity}, struck_fp
+        )
+        if struck:
+            self._logger.warning(
+                "setup-token account %s (%s) refused by the API (http-%s); "
+                "out of rotation until its token is re-added with cswap "
+                "add-token",
+                num, email, status,
+            )
+        return struck
+
     def _slot_identity(self, num: str) -> tuple[str, str] | None:
         """``(email, organizationUuid)`` slot ``num`` maps to, or None for
         a slot the roster does not hold."""
