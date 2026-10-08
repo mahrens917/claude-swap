@@ -396,8 +396,10 @@ def _cooldown_yields_to_the_wall(
     """Whether the anti-flap cooldown must stand aside (adr/0010 R1).
 
     The land bar and the hold bar are the same number. `_rank_dynamic_
-    candidates` drops every candidate at `h <= SPENT_HEADROOM_PCT` and the
-    landing-healthy gate needs `h > SPENT_HEADROOM_PCT`, so the engine
+    candidates` drops every plain candidate at `h <= SPENT_HEADROOM_PCT`
+    (one holding its credit point is admitted down to its own bar, and as
+    the active it never departs in this band, `classify_dynamic_departure`,
+    so it adds no flap) and the landing-healthy gate needs `h > SPENT_HEADROOM_PCT`, so the engine
     REFUSES to land on an account down here — while
     `_classify_dynamic_trigger` still calls the whole band `proactive`,
     which is in `_COOLDOWN_GATED_TRIGGERS`, so a `dynamic` active sits
@@ -478,6 +480,7 @@ def _rank_dynamic_candidates(
     now: float,
     last_active_at: dict,
     cache_ttl_seconds: float,
+    bar_of: Callable[[str], float],
 ) -> tuple[list[str], list[str]]:
     """WARM-tiered candidates for a `dynamic` proactive/alternation switch
     (#375 item 3), each tier soonest-weekly-reset first (`dynamic`'s own
@@ -485,9 +488,14 @@ def _rank_dynamic_candidates(
     hysteresis-margin key `best` uses, since a wall is coming either way and
     the question is only which account serves it, same reasoning
     `_rank_candidates_pass`'s at-limit escape already applies. EVERY
-    candidate, warm or cold, is filtered here at ``SPENT_HEADROOM_PCT``
-    (the `peer_can_serve` idiom `_rank_candidates_pass` already uses for the
-    same question) — item 3b's floor (`cold_switch_cost_pct`) is a
+    candidate, warm or cold, is filtered here at its OWN bar, ``bar_of``
+    (the account's :func:`account_switch_bar_pct`, X3647): one at or past
+    it is left out. For a plain account under ``dynamic`` that bar is
+    ``100 - SPENT_HEADROOM_PCT`` (the `peer_can_serve` idiom
+    `_rank_candidates_pass` already uses for the same question); one
+    holding its credit point is blocked only at that point, since usage
+    credits answer past every window limit. Item 3b's floor
+    (`cold_switch_cost_pct`) is a
     separate, HIGHER bar the caller applies on top for an ORDINARY cold
     admission (a walled candidate against a still-healthy active, or an
     alternation partner). NOT true once `model_window_dropped` fires
@@ -508,7 +516,7 @@ def _rank_dynamic_candidates(
     cold: list[tuple[tuple, str]] = []
     for num in oauth_candidates:
         h = headroom.get(num)
-        if h is None or h <= SPENT_HEADROOM_PCT:
+        if h is None or h <= 100.0 - bar_of(num):
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
         key = (reset_ts if reset_ts is not None else float("inf"), -h)
@@ -1315,6 +1323,34 @@ def _first_out_of_probe_cooldown(
         if cooling.get(num, 0.0) <= now:
             return num
     return None
+
+
+def _unread_token_candidates(
+    oauth_candidates: Sequence[str],
+    usage: dict[str, dict | str | None],
+    entries: dict | None,
+    no_return: str | None,
+    overload_backoff: dict[str, float] | None,
+    now: float,
+) -> list[str]:
+    """The setup-token candidates with no reading at all (X3650), roster
+    order, behind the same no-return and overload bars every ranked
+    candidate clears. Unrankable, yet unreadable by anything but a switch
+    onto them, so each is a probe target. ``_rank_candidates_pass`` and
+    ``dynamic``'s own proactive and alternation arms both read this one
+    list, so the two never disagree about which accounts may be probed."""
+    backoff = overload_backoff or {}
+    return [
+        num
+        for num in oauth_candidates
+        if usage.get(num) is None
+        and _unread_header_only(entries, num)
+        and num != no_return
+        # default: EXTERNAL -- source: arithmetic, an account never backed
+        # off has no backoff running -- why: `_overload_backoff` holds only
+        # accounts an `overloaded` departure left (`_perform`).
+        and now >= (backoff.get(num) or 0)
+    ]
 
 
 def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
@@ -3073,6 +3109,25 @@ class AutoSwitchEngine:
         last_active_at = state.get("lastActiveAt")
         last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
 
+        # Each candidate is judged at its OWN bar (X3647): a plain account
+        # under `dynamic` at 97, one holding its credit point at that point.
+        def bar_of(num: str) -> float:
+            return _switch_bar(settings, entries, num)
+
+        # The unread setup-token probe (X3650) for `dynamic`'s own arms, which
+        # never enter `_rank_candidates_pass`: the same list and the same
+        # one-hour probe cooldown that pass reads, appended after every
+        # measured landing by each arm below.
+        def _unread_probe(no_return, at_now):
+            return _first_out_of_probe_cooldown(
+                _unread_token_candidates(
+                    oauth_candidates, usage, entries, no_return,
+                    overload_backoff, at_now,
+                ),
+                _numeric_probe_cooldown(state.get("probeCooldown")),
+                at_now,
+            )
+
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
@@ -3085,22 +3140,26 @@ class AutoSwitchEngine:
             barred = [n for n in cands if n != no_return]
             warm, cold = _rank_dynamic_candidates(
                 barred, hroom, usage, at_now, last_active_at,
-                settings.cache_ttl_seconds,
+                settings.cache_ttl_seconds, bar_of,
             )
             bar_active = no_return is not None
             if no_return is not None and not warm and not cold and recovered:
                 warm, cold = _rank_dynamic_candidates(
                     cands, hroom, usage, at_now, last_active_at,
-                    settings.cache_ttl_seconds,
+                    settings.cache_ttl_seconds, bar_of,
                 )
                 bar_active = False
-            return warm, cold, bar_active
+            return warm, cold, bar_active, (no_return if bar_active else None)
 
+        # Set again below whenever a dynamic arm admits a probe; cleared
+        # here so a pick an earlier tick's `_rank` left behind never names
+        # this tick's switch a probe.
+        self._last_probe_num = None
         dynamic_ordered: list[str] | None = None
         dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
             now = self.clock()
-            warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+            warm_ordered, cold_ordered, bar_active, barred_num = _dynamic_rank(
                 oauth_candidates, headroom, now, active_headroom,
             )
             floor_headroom = headroom
@@ -3122,11 +3181,15 @@ class AutoSwitchEngine:
                 # active included) makes dropping the model set the right
                 # call — retry once on the unmodeled (5h/7d only) axis.
                 unmodeled = _headroom_by_account(usage, ())
-                warm_ordered, cold_ordered, bar_active = _dynamic_rank(
+                warm_ordered, cold_ordered, bar_active, barred_num = _dynamic_rank(
                     oauth_candidates, unmodeled, now, unmodeled.get(current),
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
+            # The unread setup-token probe, after every measured landing:
+            # the walled active must leave, and an unread account may hold
+            # its whole window.
+            leave_probe = _unread_probe(barred_num, now)
             # Item 3c, corrected again (2026-09-23, #321 follow-up): on
             # THIS arm the `cold_switch_cost_pct` floor is a PREFERENCE,
             # never a veto (ADR 0010, "Why never-wall beats warm-cache":
@@ -3151,7 +3214,12 @@ class AutoSwitchEngine:
                     n for n in cold_ordered
                     if floor_headroom.get(n, 0.0) > cold_floor
                 ]
-                if not warm_ordered and not cold_clears_floor and cold_ordered:
+                if (
+                    not warm_ordered
+                    and not cold_clears_floor
+                    and cold_ordered
+                    and leave_probe is None
+                ):
                     self._emit(
                         NoSwitchEvent(
                             reason="below-floor",
@@ -3169,6 +3237,9 @@ class AutoSwitchEngine:
                     key=lambda n: floor_headroom.get(n, 0.0) < floor,
                 )
             dynamic_ordered = warm_ordered + cold_clears_floor
+            if leave_probe is not None:
+                dynamic_ordered.append(leave_probe)
+                self._last_probe_num = leave_probe
             if not dynamic_ordered and bar_active:
                 # The no-return bar (item 2) is holding this, not a
                 # genuinely viable-free fleet -- a deliberate hold pending
@@ -3196,7 +3267,7 @@ class AutoSwitchEngine:
             # unchanged accounts (never "recovered").
             warm_ordered, cold_ordered = _rank_dynamic_candidates(
                 oauth_candidates, headroom, usage, now, last_active_at,
-                settings.cache_ttl_seconds,
+                settings.cache_ttl_seconds, bar_of,
             )
             # Kept alongside `warm_ordered`/`cold_ordered` (which the
             # retry below may re-rank on the UNMODELED axis): the
@@ -3228,7 +3299,7 @@ class AutoSwitchEngine:
                 unmodeled = _headroom_by_account(usage, ())
                 warm_ordered, cold_ordered = _rank_dynamic_candidates(
                     oauth_candidates, unmodeled, usage, now, last_active_at,
-                    settings.cache_ttl_seconds,
+                    settings.cache_ttl_seconds, bar_of,
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
@@ -3297,7 +3368,10 @@ class AutoSwitchEngine:
             def _clears_the_landing_floor(n):
                 h = floor_headroom.get(n, 0.0)
                 if n in cold_set:
-                    return h - settings.cold_switch_cost_pct > SPENT_HEADROOM_PCT
+                    # Past the candidate's OWN bar after paying the cost
+                    # (X3647): 3 points for a plain account, 0 for one
+                    # holding its credit point.
+                    return h - settings.cold_switch_cost_pct > 100.0 - bar_of(n)
                 return h >= settings.cold_switch_cost_pct
             alternation_admissible = [
                 n for n in warm_ordered + cold_ordered
@@ -3353,6 +3427,11 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
             )
             walled_escape = None
+            # The unread setup-token probe (X3650), ranked after every
+            # measured landing on each exit below. No no-return bar, the
+            # same as this arm's own ranking.
+            leave_probe = _unread_probe(None, now)
+            probe_tail = [leave_probe] if leave_probe is not None else []
             # An active holding its credit point walls nowhere below that
             # point (usage credits answer past every window limit), so the
             # walled escape is not its departure; `classify_dynamic_departure`
@@ -3456,7 +3535,8 @@ class AutoSwitchEngine:
                 # admissible (the `proactive` arm's own `dynamic_ordered`
                 # is already `warm_ordered + [floor-clearing cold]` for the
                 # same reason).
-                dynamic_ordered = escapees
+                dynamic_ordered = escapees + probe_tail
+                self._last_probe_num = leave_probe
             elif (
                 partner is None
                 or since is None
@@ -3491,6 +3571,16 @@ class AutoSwitchEngine:
                 if probe_target is not None:
                     self._last_probe_num = probe_target
                     dynamic_ordered = [probe_target]
+                elif leave_probe is not None:
+                    # No measured landing is taken this tick, so the unread
+                    # account is the only move: a discretionary one from an
+                    # account not forced off, gated like alternation.
+                    if self._in_cooldown(state):
+                        self._emit(NoSwitchEvent(reason="cooldown"))
+                        return TickOutcome.NO_ACTION
+                    trigger = "alternation"
+                    self._last_probe_num = leave_probe
+                    dynamic_ordered = [leave_probe]
                 else:
                     # One label per story (item 5): a warm partner not yet
                     # dwelt on, or a cold one below the floor. T0758:
@@ -3531,7 +3621,8 @@ class AutoSwitchEngine:
                 # I1: the full admissible warm list, not just `partner`
                 # — an untrustworthy top pick must not strand the tick when
                 # a lower-ranked warm candidate is admissible.
-                dynamic_ordered = alternation_admissible
+                dynamic_ordered = alternation_admissible + probe_tail
+                self._last_probe_num = leave_probe
 
         if (
             trigger in CONSUME_FIRST_STRATEGIES
@@ -4925,19 +5016,14 @@ class AutoSwitchEngine:
         # as "unreadable" like every other None row left them unread forever.
         # Held for the probe pick after the loop, behind the same no-return
         # and overload bars every ranked candidate clears.
-        unread_tokens: list[str] = []
+        unread_tokens = _unread_token_candidates(
+            oauth_candidates, usage, entries, no_return, overload_backoff, now
+        )
         key_axis: dict[str, str] = {}  # per candidate, set alongside its key
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
-                if (
-                    usage.get(num) is None
-                    and _unread_header_only(entries, num)
-                    and num != no_return
-                    and now >= ((overload_backoff or {}).get(num) or 0)
-                ):
-                    unread_tokens.append(num)
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (

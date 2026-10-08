@@ -13,6 +13,8 @@ OAuth account with no reading keeps waiting for its fetch."""
 
 import logging
 
+import pytest
+
 from claude_swap.autoswitch import PROBE_COOLDOWN_S, NoSwitchEvent, SwitchEvent
 from claude_swap.usage_store import UsageEntry
 from tests.test_autoswitch import (
@@ -198,6 +200,107 @@ class TestTheUnreadTokenAccountIsProbed:
         })
         assert outcome is not TickOutcome.SWITCHED, h.kinds()
         assert h.active_number() == 1
+
+    def test_dynamic_walled_active_probes_the_unread_token_account(self, temp_home):
+        """Asserts: under `dynamic`, an active about to wall (98%, the
+        `proactive` arm that never enters `_rank_candidates_pass`) with the
+        only candidate an unread setup-token account switches onto it as a
+        probe and records its probe cooldown."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": _read(_usage7(98.0, 60.0, _R_LATER), now),
+            "2": _unread_token(),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+        assert _switch(h).trigger == "probe"
+        assert h.state()["probeCooldown"]["2"] == now + PROBE_COOLDOWN_S
+
+    def test_dynamic_walled_active_takes_a_measured_landing_first(self, temp_home):
+        """Asserts: under `dynamic` the unread account ranks after every
+        measured landing: with a healthy measured candidate the walled
+        active lands there under `proactive`, never on the probe."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        h.seed(3, "c@example.com")
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": _read(_usage7(98.0, 60.0, _R_LATER), now),
+            "2": _unread_token(),
+            "3": _read(_usage7(10.0, 10.0, _R_SOON), now),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 3
+        assert _switch(h).trigger == "proactive"
+
+    def test_dynamic_healthy_active_probes_the_unread_token_account(self, temp_home):
+        """Asserts: under `dynamic`, a healthy active (40%, the alternation
+        arm) with no alternation partner probes the unread setup-token
+        account instead of holding it unread."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        now = h.clock.now
+        outcome = h.tick_with_entries({
+            "1": _read(_usage7(40.0, 60.0, _R_LATER), now),
+            "2": _unread_token(),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+        assert _switch(h).trigger == "probe"
+
+    @pytest.mark.parametrize("active_pct", [98.0, 40.0], ids=["walled", "healthy"])
+    def test_dynamic_probe_cooldown_keeps_it_from_being_reprobed(
+        self, temp_home, active_pct
+    ):
+        """Asserts: under `dynamic`, on both its own arms, an unread
+        setup-token account inside its probe cooldown is not switched onto."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        now = h.clock.now
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"probeCooldown": {"2": now + PROBE_COOLDOWN_S - 1}},
+        )
+        h.tick_with_entries({
+            "1": _read(_usage7(active_pct, 60.0, _R_LATER), now),
+            "2": _unread_token(),
+        })
+        assert h.active_number() == 1, h.kinds()
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+
+    def test_dynamic_healthy_probe_respects_the_switch_cooldown(self, temp_home):
+        """Asserts: the healthy-arm probe is a discretionary move, held by
+        the anti-flap switch cooldown the way alternation is."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        now = h.clock.now
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"lastSwitchAt": now - 10.0},
+        )
+        outcome = h.tick_with_entries({
+            "1": _read(_usage7(40.0, 60.0, _R_LATER), now),
+            "2": _unread_token(),
+        })
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        hold = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert hold.reason == "cooldown"
+
+    def test_a_stale_probe_pick_does_not_label_a_dynamic_switch(self, temp_home):
+        """Asserts: a probe pick an earlier tick's ranking left behind never
+        names a later `dynamic` arm's switch a probe: the walled active's
+        landing on a measured candidate is `proactive`, and no probe
+        cooldown is written for it."""
+        h = _harness(temp_home, strategy="dynamic", threshold=90.0)
+        now = h.clock.now
+        h.engine._last_probe_num = "2"
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json", {}
+        )
+        outcome = h.tick_with_entries({
+            "1": _read(_usage7(98.0, 60.0, _R_LATER), now),
+            "2": _read(_usage7(10.0, 10.0, _R_SOON), now),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert _switch(h).trigger == "proactive"
+        assert "2" not in (h.state().get("probeCooldown") or {})
 
     def test_the_collector_marks_a_rowless_token_slot_header_only(self, temp_home):
         """Asserts: the header-only mark the probe keys on comes from the

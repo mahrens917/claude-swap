@@ -695,3 +695,40 @@ class TestDynamicBarReadsTheCreditPoint:
         assert h.active_number() == want_active, h.kinds()
         switched = [e for e in h.events if isinstance(e, SwitchEvent)]
         assert bool(switched) is not with_credits, h.kinds()
+
+
+class TestDynamicCandidatesAtTheirOwnBar:
+    """X3647 U8: `dynamic`'s own proactive and alternation lists judge each
+    candidate at its own bar, so a candidate holding its credit point is
+    not dropped at the fixed 97 line."""
+
+    def test_the_ranking_keeps_a_credit_candidate_at_98(self):
+        """Asserts: `_rank_dynamic_candidates` keeps a candidate at 98%
+        whose bar is its credit point of 100, and drops a plain one at 98%
+        whose bar is 97."""
+        from claude_swap.autoswitch import _rank_dynamic_candidates
+
+        bars = {"2": 100.0, "3": 97.0}
+        warm, cold = _rank_dynamic_candidates(
+            ["2", "3"], {"2": 2.0, "3": 2.0}, {"2": None, "3": None},
+            0.0, {}, 3600.0, bars.__getitem__,
+        )
+        assert warm == []
+        assert cold == ["2"]
+
+    def test_a_walled_active_lands_on_the_credit_candidate_at_98(self, temp_home):
+        """Asserts: under `dynamic` an active at 98% without credits (about
+        to wall, the `proactive` trigger) switches to the only candidate,
+        itself at 98% but holding usage credits (credit point 100)."""
+        h = EngineHarness(
+            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
+        outcome = h.tick_with_usage({"1": hot, "2": {**hot, "spend": _spend(20.0)}})
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"

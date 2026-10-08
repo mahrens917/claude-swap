@@ -3745,6 +3745,55 @@ class TestUnswitchableRowsAreListed:
         )
         assert ordered == ["3", "2"], ordered
 
+    def test_the_panel_keeps_a_credit_candidate_at_98_under_dynamic(self):
+        """Asserts: the panel judges each `dynamic` candidate at its own bar
+        (X3647), as the engine does: a candidate at 98% holding usage
+        credits (credit point 100) is listed, a plain one at 98% is not."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(
+            strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
+        spend = {
+            "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
+            "currency": "USD", "limit_reached": False,
+        }
+        snap = self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=hot),
+            self._acct("2", "b@x.com", switchable=True, last_good={**hot, "spend": spend}),
+            self._acct("3", "c@x.com", switchable=True, last_good=hot),
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1"
+        )
+        assert ordered == ["2"], ordered
+
+    def test_the_panel_lists_the_unread_token_probe_after_measured_under_dynamic(
+        self,
+    ):
+        """Asserts: under `dynamic` the panel lists an unread setup-token
+        account after every measured candidate, as the engine's own arms
+        rank it (X3650), and leaves it out while its probe cooldown runs."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
+        snap = self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=hot),
+            self._acct("2", "tok@x.com", switchable=True,
+                       usage=UsageEntry(header_only=True)),
+            self._acct("3", "c@x.com", switchable=True,
+                       last_good={"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}),
+        )
+        now = time.time()
+        ordered, *_ = tui_data.rank_switch_candidates(snap, settings, now, "1")
+        assert ordered == ["3", "2"], ordered
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, settings, now, "1", probe_cooldown={"2": now + 60.0}
+        )
+        assert ordered == ["3"], ordered
+
     def test_the_panel_admits_a_headroom_candidate_with_hours_to_reset_under_dynamic(
         self,
     ):

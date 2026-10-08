@@ -1422,6 +1422,59 @@ class TestAutoCommand:
         assert "threshold " not in out, f"a non-default threshold leaked: {out!r}"
         assert "switch at 97%" in out
 
+    @pytest.mark.parametrize(
+        "with_credits,bar", [(True, "100%"), (False, "97%")], ids=["credits", "plain"]
+    )
+    def test_the_banner_prints_the_active_accounts_own_bar(
+        self, temp_home, capsys, with_credits, bar
+    ):
+        """Asserts: the banner prints the ACTIVE account's own bar
+        (`account_switch_bar_pct`, X3647), naming the account: under
+        `dynamic` with creditThreshold 100, an active holding usage credits
+        switches at 100%, one without at 97%."""
+        from claude_swap.paths import get_backup_root
+        from claude_swap.usage_store import UsageEntry
+
+        backup_dir = get_backup_root()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "settings.json").write_text(
+            json.dumps({
+                "schemaVersion": 1,
+                "autoswitch": {
+                    "threshold": 90, "strategy": "dynamic", "creditThreshold": 100,
+                },
+            })
+        )
+        reading: dict = {"five_hour": {"pct": 50.0}, "seven_day": {"pct": 10.0}}
+        if with_credits:
+            reading["spend"] = {
+                "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
+                "currency": "USD", "limit_reached": False,
+            }
+        entry = UsageEntry(last_good=reading, fetched_at=0.0, age_s=0.0)
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(ClaudeAccountSwitcher, "current_account_number",
+                             return_value="1"), \
+                patch.object(ClaudeAccountSwitcher, "usage_entries_by_account",
+                             return_value={"1": entry}), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert f"switch at {bar} on Account-1" in out, out
+
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.
 

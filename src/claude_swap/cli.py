@@ -923,8 +923,8 @@ Defaults live in settings.json in the backup root; flags override them.
     from claude_swap.autoswitch import (
         AutoSwitchEngine,
         AutoSwitchEvent,
+        account_switch_bar_pct,
         pct_label,
-        proactive_switch_bar_pct,
     )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
@@ -984,9 +984,18 @@ Defaults live in settings.json in the backup root; flags override them.
             sys.exit(engine.tick().value)
 
         if not args.json:
-            switch_bar = proactive_switch_bar_pct(
-                settings.strategy, settings.threshold
+            # THE ACTIVE ACCOUNT'S OWN BAR (X3647), never one fleet number:
+            # an active holding its credit point departs at that point
+            # under every strategy, `dynamic` included. Read from the store
+            # with no fetch; with no active login the bar is the plain one
+            # every account without credit room has (`entry` None).
+            active_number = switcher.current_account_number()
+            active_entry = (
+                switcher.usage_entries_by_account(fetch=set()).get(active_number)
+                if active_number is not None
+                else None
             )
+            switch_bar = account_switch_bar_pct(settings, active_entry)
             # The lead prints only the bar in force: `threshold <n>%` when
             # the configured threshold IS that bar (`switch_bar ==
             # settings.threshold`), else just `switch at <bar>%`.
@@ -996,6 +1005,8 @@ Defaults live in settings.json in the backup root; flags override them.
                 parts.append(f"threshold {pct_label(settings.threshold)}%")
             if switch_bar != settings.threshold:
                 parts.append(f"switch at {pct_label(switch_bar)}%")
+            if active_number is not None:
+                parts[-1] += f" on Account-{active_number}"
             lead = ", ".join(parts)
             print(
                 dimmed(

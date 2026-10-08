@@ -29,10 +29,13 @@ from claude_swap.autoswitch import (
     STATE_FILENAME,
     _binding_recovery_ts,
     _dynamic_active_headroom,
+    _first_out_of_probe_cooldown,
     _headroom_by_account,
     _model_window_binds_everywhere,
     _rank_dynamic_candidates,
+    _switch_bar,
     _switch_point,
+    _unread_token_candidates,
     classify_dynamic_departure,
     rank_candidates_pass,
 )
@@ -456,6 +459,7 @@ def rank_switch_candidates(
         warm, cold = _rank_dynamic_candidates(
             oauth_candidates, headroom, usage, now, last_active_at or {},
             settings.cache_ttl_seconds,
+            lambda num: _switch_bar(settings, entries, num),
         )
         if trigger == "proactive":
             cold_floor = settings.cold_switch_cost_pct
@@ -513,6 +517,18 @@ def rank_switch_candidates(
         and _model_window_binds_everywhere(usage, models, settings, entries, rotation)
     ):
         ordered, rank_axis = _rank_on((), trigger)
+    if settings.strategy == "dynamic" and trigger in ("proactive", "dynamic-healthy"):
+        # The engine's dynamic arms rank an unread setup-token account
+        # after every measured landing (X3650), behind the same list and
+        # probe cooldown; `rank_candidates_pass` does it for every other
+        # trigger, so the panel names the same account the tick probes.
+        leave_probe = _first_out_of_probe_cooldown(
+            _unread_token_candidates(oauth_candidates, usage, entries, None, None, now),
+            probe_cooldown,
+            now,
+        )
+        if leave_probe is not None:
+            ordered = [*ordered, leave_probe]
     if (
         not ordered
         and api_key_candidates
