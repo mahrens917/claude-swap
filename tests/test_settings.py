@@ -47,12 +47,36 @@ class TestLoadSettings:
     def test_missing_file_gives_defaults(self, tmp_path: Path):
         assert load_settings(tmp_path) == AutoSwitchSettings()
 
-    def test_corrupt_file_gives_defaults(self, tmp_path: Path):
-        settings_path(tmp_path).write_text("{not json")
-        assert load_settings(tmp_path) == AutoSwitchSettings()
+    def test_corrupt_file_raises_naming_it(self, tmp_path: Path):
+        """Asserts: a settings file that is not JSON raises ConfigError
+        naming the file, never reads as defaults."""
+        path = settings_path(tmp_path)
+        path.write_text("{not json")
+        with pytest.raises(ConfigError, match=f"{path} is not valid JSON"):
+            load_settings(tmp_path)
+        with pytest.raises(ConfigError, match="not valid JSON"):
+            load_ui_settings(tmp_path)
 
-    def test_non_object_gives_defaults(self, tmp_path: Path):
-        settings_path(tmp_path).write_text("[1, 2]")
+    def test_non_object_raises_naming_it(self, tmp_path: Path):
+        """Asserts: a settings file holding a JSON array raises ConfigError
+        naming the file."""
+        path = settings_path(tmp_path)
+        path.write_text("[1, 2]")
+        with pytest.raises(ConfigError, match=f"{path} is not a JSON object"):
+            load_settings(tmp_path)
+
+    def test_non_object_section_raises_naming_it(self, tmp_path: Path):
+        """Asserts: an `autoswitch` section that is not an object raises
+        ConfigError naming the file and the section."""
+        path = settings_path(tmp_path)
+        path.write_text(json.dumps({"autoswitch": [90]}))
+        with pytest.raises(ConfigError, match=f"{path}: autoswitch is"):
+            load_settings(tmp_path)
+
+    def test_an_absent_section_reads_as_defaults(self, tmp_path: Path):
+        """Asserts: a file with only a `ui` section (what `config set
+        ui.theme` writes) reads every autoswitch key at its default."""
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "light"}}))
         assert load_settings(tmp_path) == AutoSwitchSettings()
 
     def test_partial_section_fills_defaults(self, tmp_path: Path):
@@ -63,34 +87,30 @@ class TestLoadSettings:
         assert loaded.threshold == 80.0
         assert loaded.interval_seconds == AutoSwitchSettings().interval_seconds
 
-    def test_values_are_clamped(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "autoswitch": {
-                "threshold": 200,
-                "intervalSeconds": 1,
-                "hysteresisPct": -5,
-                "unhealthyTicks": 0,
-            }
-        }))
-        loaded = load_settings(tmp_path)
-        assert loaded.threshold == 99.9
-        assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
-        assert loaded.hysteresis_pct == 0.0
-        assert loaded.unhealthy_ticks == 1
-
-    def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({
-            "autoswitch": {"threshold": "high", "includeApiKeyAccounts": 1}
-        }))
-        loaded = load_settings(tmp_path)
-        assert loaded.threshold == AutoSwitchSettings().threshold
-        assert loaded.include_api_key_accounts is True
-
-    def test_unsupported_strategy_falls_back_to_the_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"strategy": "chaos"}})
-        )
-        assert load_settings(tmp_path).strategy == "consume-first"
+    @pytest.mark.parametrize("key,value,why", [
+        ("threshold", 200, "outside 50 to 99.9"),
+        ("intervalSeconds", 1, "outside"),
+        ("unhealthyTicks", 0, "outside"),
+        ("threshold", "high", "is not a number"),
+        ("includeApiKeyAccounts", 1, "is not true or false"),
+        ("unhealthyTicks", 2.5, "is not an integer"),
+        ("strategy", "chaos", "is not one of"),
+        ("model", 123, "is not a non-empty string"),
+        ("model", "", "is not a non-empty string"),
+    ])
+    def test_a_value_config_set_refuses_raises_naming_the_key(
+        self, tmp_path: Path, key, value, why
+    ):
+        """Asserts: a stored value `cswap config set` would refuse (out of
+        range, wrong type, unsupported choice) raises ConfigError naming the
+        file and the key, never a clamp or a default."""
+        path = settings_path(tmp_path)
+        path.write_text(json.dumps({"autoswitch": {key: value}}))
+        with pytest.raises(ConfigError) as caught:
+            load_settings(tmp_path)
+        message = str(caught.value)
+        assert f"{path}: autoswitch.{key} = {value!r}" in message
+        assert why in message
 
     def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
@@ -248,9 +268,13 @@ class TestUiSettings:
         settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "light"}}))
         assert load_ui_settings(tmp_path).theme == "light"
 
-    def test_unknown_theme_clamps_to_default(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
-        assert load_ui_settings(tmp_path).theme == "auto"
+    def test_unknown_theme_raises_naming_the_key(self, tmp_path: Path):
+        """Asserts: an unsupported ui.theme raises ConfigError naming the
+        file and the key."""
+        path = settings_path(tmp_path)
+        path.write_text(json.dumps({"ui": {"theme": "purple"}}))
+        with pytest.raises(ConfigError, match=f"{path}: ui.theme = 'purple'"):
+            load_ui_settings(tmp_path)
 
     def test_set_and_unset_ui_theme(self, tmp_path: Path):
         assert set_setting(tmp_path, "ui.theme", "light") == "light"
@@ -314,9 +338,11 @@ class TestSetUnsetSetting:
             set_setting(tmp_path, "autoswitch.model", "   ")
         assert not settings_path(tmp_path).exists()
 
-    def test_garbage_model_value_falls_back_to_none(self, tmp_path: Path):
+    def test_a_null_model_reads_as_unset(self, tmp_path: Path):
+        """Asserts: an explicit JSON null on `model` (default None) is the
+        documented unset value, not a rejection."""
         settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"model": 123}})
+            json.dumps({"autoswitch": {"model": None}})
         )
         assert load_settings(tmp_path).model is None
 
@@ -555,12 +581,13 @@ class TestCreditThreshold:
                 set_setting(tmp_path, "autoswitch.creditThreshold", raw)
         assert not settings_path(tmp_path).exists()
 
-    def test_load_clamps_and_keeps_null(self, tmp_path: Path):
-        """Asserts: a hand-written 120 clamps to 100 and an explicit null
-        reads as unset."""
+    def test_load_refuses_out_of_range_and_keeps_null(self, tmp_path: Path):
+        """Asserts: a hand-written 120 raises ConfigError naming the key and
+        an explicit null reads as unset."""
         path = settings_path(tmp_path)
         path.write_text(json.dumps({"autoswitch": {"creditThreshold": 120}}))
-        assert load_settings(tmp_path).credit_threshold == 100.0
+        with pytest.raises(ConfigError, match="autoswitch.creditThreshold = 120"):
+            load_settings(tmp_path)
         path.write_text(json.dumps({"autoswitch": {"creditThreshold": None}}))
         assert load_settings(tmp_path).credit_threshold is None
 

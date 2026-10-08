@@ -80,10 +80,7 @@ class CswapApp(App):
         # switch bar (`account_switch_bar_pct`). The auto view replaces it
         # with its session copy while open. A load error propagates.
         self.auto_settings: AutoSwitchSettings = load_settings(switcher.backup_dir)
-        try:
-            self._theme_name = load_ui_settings(switcher.backup_dir).theme
-        except Exception:
-            self._theme_name = "auto"
+        self._theme_name = load_ui_settings(switcher.backup_dir).theme
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)

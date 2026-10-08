@@ -287,6 +287,36 @@ def _format_usage_lines(
 _COUNTDOWN_COLUMN = len(f"{0:>3.0f}%   resets {'':<12}  in ")
 
 
+class EngineStateError(ClaudeSwitchError):
+    """The auto-switch engine's state file is there but cannot be read."""
+
+
+def read_engine_state(path: Path) -> dict:
+    """The auto-switch engine's state file (``autoswitch_state.json``) as a
+    dict: THE one reader of that file, for the engine's own
+    ``_read_state`` and :meth:`ClaudeAccountSwitcher.engine_quarantine_ledger`.
+    A file that is there but unreadable, not JSON or not a JSON object
+    raises :class:`EngineStateError` naming it: reading it as empty would
+    release every quarantine and forget the cooldown and the no-return bar."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # default: EXTERNAL -- source: the engine's first run, before its
+        # first state write (`_mutate_state`) -- why: no quarantine, no
+        # cooldown and no switch history is the true state of a fleet the
+        # engine has never acted on.
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise EngineStateError(f"could not read {path}: {e}") from e
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise EngineStateError(f"{path} is not valid JSON ({e})") from e
+    if not isinstance(raw, dict):
+        raise EngineStateError(f"{path} is not a JSON object")
+    return raw
+
+
 def quarantine_ledger(state: object) -> dict:
     """The ``quarantine`` map of an auto-switch state dict (slot number ->
     entry), or an empty map when the state carries none. The engine's tick
@@ -3477,7 +3507,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
-                    quarantined=n in quarantined,
+                    engine_quarantined=n in quarantined,
                     access_token_fp=oauth.access_token_fingerprint(creds),
                     login_expires_at=self._login_expires_at_epoch(n, creds),
                 )
@@ -8842,22 +8872,15 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
 
     def engine_quarantine_ledger(self) -> dict:
         """The auto-switch engine's quarantine ledger (slot number -> entry)
-        as its state file holds it now: THE one reader of that file outside
-        the engine, for :meth:`_engine_quarantined` and the snapshot's
-        ``quarantined`` flag. The file is read under the engine's own rule
-        (``AutoSwitchEngine._read_state``): a missing or unparseable file is
-        no state, so no slot is quarantined, the same answer the engine's
-        next tick acts on. The keys are what the engine excludes from its
-        candidates (:func:`quarantine_ledger`)."""
-        try:
-            raw = json.loads(
-                (self.backup_dir / "autoswitch_state.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        return quarantine_ledger(raw)
+        as its state file holds it now, for :meth:`_engine_quarantined` and
+        the snapshot's ``engine_quarantined`` flag. Read through
+        :func:`read_engine_state`, the reader the engine's own
+        ``_read_state`` uses: a missing file is no quarantine, an unreadable
+        one raises :class:`EngineStateError`. The keys are what the engine
+        excludes from its candidates (:func:`quarantine_ledger`)."""
+        return quarantine_ledger(
+            read_engine_state(self.backup_dir / "autoswitch_state.json")
+        )
 
     def _engine_quarantined(self, num: str, fingerprint: str | None) -> bool:
         """Is slot ``num`` in the auto-switch engine's own quarantine ledger

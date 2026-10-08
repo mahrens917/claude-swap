@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import re
 import sys
 import time
@@ -44,7 +43,7 @@ from claude_swap.models import AccountsSnapshot
 from claude_swap.poll_policy import binding_pct
 from claude_swap.settings import parse_model_names
 from claude_swap.snapshot_source import SnapshotSource
-from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+from claude_swap.switcher import SENTINEL_NOTES, last_seen_note, read_engine_state
 
 if TYPE_CHECKING:
     from claude_swap.settings import AutoSwitchSettings
@@ -347,17 +346,12 @@ def read_last_active_at(backup_dir: Path) -> dict:
     """Read-only ``lastActiveAt`` off the engine's own state file
     (``<backup_dir>/autoswitch_state.json``).
 
-    ``AutoSwitchEngine._read_state`` is a bound method needing a live
-    engine (state_path, a lock file), so it is not importable as a pure
-    function here -- this mirrors its exact safety contract instead: a
-    missing or garbled file reads as no cached warm context, never raises.
+    Read through ``read_engine_state``, the reader the engine's own
+    ``_read_state`` uses: a missing file (first run) is no cached warm
+    context, an unreadable or corrupt one raises ``EngineStateError``
+    naming it.
     """
-    try:
-        raw = json.loads((backup_dir / STATE_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
+    raw = read_engine_state(backup_dir / STATE_FILENAME)
     last_active_at = raw.get("lastActiveAt")
     return last_active_at if isinstance(last_active_at, dict) else {}
 
@@ -387,7 +381,7 @@ def rank_switch_candidates(
         if acc.number != active_number
         and acc.switchable
         and not acc.disabled
-        and not acc.quarantined
+        and not acc.engine_quarantined
     ]
     oauth_candidates = [acc.number for acc in rotation_pool if acc.kind != "api_key"]
     api_key_candidates = (
@@ -592,7 +586,7 @@ def ordered_accounts(
             # sentinel-like tier above, or the two screens disagree on the
             # same snapshot.
             return (3,)
-        if acc.disabled or acc.quarantined:
+        if acc.disabled or acc.engine_quarantined:
             return (2,)
         # Soonest BINDING-window recovery first, unknown last -- matches
         # the auto view's own fallback key for a row its admission pass

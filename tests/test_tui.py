@@ -98,7 +98,7 @@ def make_account(
     # `pin.account_is_pinned` -- so nothing rendered that pair.
     org_uuid: str = "",
     access_token_fp: str | None = None,
-    quarantined: bool = False,
+    engine_quarantined: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -111,7 +111,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
-        quarantined=quarantined,
+        engine_quarantined=engine_quarantined,
         access_token_fp=access_token_fp,
     )
 
@@ -1926,17 +1926,22 @@ def _autoview_order(snap, active, settings, last_active_at=None):
 
 
 class TestReadLastActiveAt:
-    """Mirrors `AutoSwitchEngine._read_state`'s own safety contract: a
-    missing or garbled state file reads as no cached warm context, never
-    raises -- the file being unreadable is no different from the engine's
-    own read of it."""
+    """Reads through the engine's own state reader (`read_engine_state`):
+    a missing state file is no cached warm context, a corrupt one raises."""
 
     def test_no_file_returns_empty(self, tmp_path):
+        """Asserts: with no state file (first run) the read is empty."""
         assert tui_data.read_last_active_at(tmp_path) == {}
 
-    def test_non_json_file_returns_empty(self, tmp_path):
-        (tmp_path / "autoswitch_state.json").write_text("not json{")
-        assert tui_data.read_last_active_at(tmp_path) == {}
+    def test_non_json_file_raises_naming_it(self, tmp_path):
+        """Asserts: a corrupt state file raises EngineStateError naming the
+        file, the same as the engine's own read of it."""
+        from claude_swap.switcher import EngineStateError
+
+        path = tmp_path / "autoswitch_state.json"
+        path.write_text("not json{")
+        with pytest.raises(EngineStateError, match=f"{path} is not valid JSON"):
+            tui_data.read_last_active_at(tmp_path)
 
 
 class TestOrderedAccounts:
@@ -2605,6 +2610,19 @@ class TestAutoScreen:
         with pytest.raises(OSError, match="settings unreadable"):
             make_app(fake)
 
+    async def test_a_bad_theme_setting_propagates(self, tmp_path):
+        """Asserts: an unsupported ui.theme in settings.json reaches the
+        caller as the loader's ConfigError, naming the key, instead of the
+        app quietly drawing the default theme."""
+        from claude_swap.exceptions import ConfigError
+
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "ui": {"theme": "purple"}})
+        )
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        with pytest.raises(ConfigError, match="ui.theme = 'purple'"):
+            make_app(fake)
+
     async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path
@@ -3113,14 +3131,26 @@ class TestAccountsSnapshot:
         switcher._write_json(switcher.sequence_file, data)
 
         snap = switcher.accounts_snapshot(fetch=set())
-        assert [acc.quarantined for acc in snap.accounts] == [False, False]
+        assert [acc.engine_quarantined for acc in snap.accounts] == [False, False]
+        # The login-needs-relogin meaning keeps the bare word; the snapshot
+        # carries only the engine's ledger, under its purpose name.
+        assert not hasattr(snap.accounts[0], "quarantined")
 
         switcher._write_json(
             switcher.backup_dir / "autoswitch_state.json",
             {"quarantine": {"2": {"email": "other@example.com", "reason": "x"}}},
         )
         snap = switcher.accounts_snapshot(fetch=set())
-        assert [acc.quarantined for acc in snap.accounts] == [False, True]
+        assert [acc.engine_quarantined for acc in snap.accounts] == [False, True]
+
+        # A corrupt state file raises naming it, never reads as "nothing
+        # quarantined" (which would offer the slot again).
+        from claude_swap.switcher import EngineStateError
+
+        state = switcher.backup_dir / "autoswitch_state.json"
+        state.write_text('{"quarantine": {"2": ')
+        with pytest.raises(EngineStateError, match=f"{state} is not valid JSON"):
+            switcher.accounts_snapshot(fetch=set())
 
 
 # ---------------------------------------------------------------------------
@@ -3390,12 +3420,12 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None, disabled=False, usage=None, quarantined=False):
+              sentinel=None, disabled=False, usage=None, engine_quarantined=False):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
-        a.quarantined = quarantined
+        a.engine_quarantined = engine_quarantined
         a.login_expires_at = None
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked
@@ -3867,7 +3897,7 @@ class TestUnswitchableRowsAreListed:
             active_number="1",
             accounts=(
                 make_account(1, active=True, entry=make_entry(98.0, 10.0)),
-                make_account(2, entry=make_entry(0.0, 0.0), quarantined=True),
+                make_account(2, entry=make_entry(0.0, 0.0), engine_quarantined=True),
                 make_account(3, entry=make_entry(30.0, 10.0)),
             ),
             taken_at=time.time(),

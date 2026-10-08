@@ -5,8 +5,10 @@ atomically with the backup dir's 0600/0700 modes. v1 carries the
 ``autoswitch`` and ``ui`` sections; other sections can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
-Reading is forgiving — a missing or corrupt file yields defaults with a logged
-warning, never a crash — so a bad hand edit degrades to default behavior.
+Reading is strict: a missing file, section or key reads as its default, but
+a corrupt file, a section that is not an object, or a stored value `cswap
+config set` would refuse raises ``ConfigError`` naming the file and the key,
+so a bad hand edit is reported rather than run on a default nobody chose.
 """
 
 from __future__ import annotations
@@ -98,9 +100,10 @@ _SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
 class SettingSpec:
     """Metadata for one user-tunable settings.json key.
 
-    Single source of truth for bounds/choices: both the lenient clamp on load
-    (`_clamped`) and the strict validation in `cswap config set`
-    (`parse_setting_value`) read from here, so the two can't drift.
+    Single source of truth for bounds/choices: the check on load
+    (`_stored_value`), the strict validation in `cswap config set`
+    (`parse_setting_value`) and the clamp of `cswap auto`'s command-line
+    overrides (`_clamped`) read from here, so they can't drift.
     """
 
     section: str  # top-level JSON section ("autoswitch", "ui")
@@ -247,7 +250,9 @@ def holds_credit_point(settings: AutoSwitchSettings, entry) -> bool:
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+    """Clamp `cswap auto`'s command-line overrides (`merged_with_cli`) into
+    the SETTING_SPECS ranges; bad types -> the default. Never applied to a
+    loaded file, which `_stored_value` checks instead."""
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -280,52 +285,102 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
 
 def _read_raw(path: Path) -> dict:
-    """Lenient parse: bad/missing file -> {}, with a logged warning."""
+    """The settings file as a dict. A file that is there but unreadable,
+    not JSON, or not a JSON object raises ``ConfigError`` naming the file:
+    every setting would otherwise run on a default nobody chose."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
+        # default: EXTERNAL -- source: a fresh install, where nothing has
+        # written settings.json yet -- why: every key then holds its
+        # documented default, the same as a file that sets none of them.
         return {}
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        _logger.warning("Could not read %s (%s); using defaults", path, e)
-        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"could not read {path}: {e}") from e
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{path} is not valid JSON ({e})") from e
     if not isinstance(raw, dict):
-        _logger.warning("%s is not a JSON object; using defaults", path)
-        return {}
+        raise ConfigError(f"{path} is not a JSON object")
     return raw
 
 
-def load_settings(backup_root: Path) -> AutoSwitchSettings:
-    """Load the autoswitch section; missing/corrupt file or fields → defaults."""
-    raw = _read_raw(settings_path(backup_root))
-    section = raw.get("autoswitch")
+def _section(path: Path, raw: dict, name: str) -> dict:
+    """``raw[name]`` as a dict. A section that is there but not an object
+    raises ``ConfigError`` naming the file and the section."""
+    if name not in raw:
+        # default: EXTERNAL -- source: `cswap config set` writes only the
+        # section it is given, so a file can hold `ui` and no `autoswitch`
+        # -- why: an absent section sets no key, and every key keeps its
+        # documented default.
+        return {}
+    section = raw[name]
     if not isinstance(section, dict):
-        return AutoSwitchSettings()
+        raise ConfigError(f"{path}: {name} is {section!r}, not a JSON object")
+    return section
+
+
+def _stored_value(path: Path, spec: SettingSpec, value):
+    """A stored settings value, checked by the rule `cswap config set`
+    applies on write (``parse_setting_value``). One the engine would
+    otherwise replace with a default or clamp raises ``ConfigError``
+    naming the file and the key."""
+    where = f"{path}: {spec.dotted} = {value!r}"
+    if value is None and spec.default is None:
+        # A JSON null on a key whose default is None (`model`,
+        # `creditThreshold`) is that documented "unset" value, the one
+        # `save_settings` itself writes for it.
+        return None
+    if spec.kind == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(f"{where} is not true or false")
+        return value
+    if spec.kind == "choice":
+        if value not in spec.choices:
+            raise ConfigError(f"{where} is not one of: {', '.join(spec.choices)}")
+        return value
+    if spec.kind == "string":
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{where} is not a non-empty string")
+        return value
+    number_types = (int,) if spec.kind == "int" else (int, float)
+    if isinstance(value, bool) or not isinstance(value, number_types):
+        noun = "an integer" if spec.kind == "int" else "a number"
+        raise ConfigError(f"{where} is not {noun}")
+    if not spec.lo <= value <= spec.hi:
+        raise ConfigError(
+            f"{where} is outside {format_setting_value(spec.lo)} to "
+            f"{format_setting_value(spec.hi)}"
+        )
+    return int(value) if spec.kind == "int" else float(value)
+
+
+def load_settings(backup_root: Path) -> AutoSwitchSettings:
+    """Load the autoswitch section. A missing file or section, or a key it
+    does not set, reads as that key's default; a corrupt file, a section
+    that is not an object, or a value `cswap config set` would refuse
+    raises ``ConfigError`` naming the file and the key."""
+    path = settings_path(backup_root)
+    section = _section(path, _read_raw(path), "autoswitch")
     kwargs = {}
-    for field, json_key in _AUTOSWITCH_KEYS.items():
-        if json_key in section:
-            kwargs[field] = section[json_key]
-    try:
-        settings = AutoSwitchSettings(**kwargs)
-    except TypeError:
-        settings = AutoSwitchSettings()
-    return _clamped(settings)
+    for spec in SETTING_SPECS.values():
+        if spec.section == "autoswitch" and spec.json_key in section:
+            kwargs[spec.field] = _stored_value(path, spec, section[spec.json_key])
+    return AutoSwitchSettings(**kwargs)
 
 
 def load_ui_settings(backup_root: Path) -> UiSettings:
-    """Load the ui section; missing/corrupt file or unknown theme → default."""
-    raw = _read_raw(settings_path(backup_root))
-    section = raw.get("ui")
-    default = UiSettings()
-    if not isinstance(section, dict):
-        return default
-    theme = section.get("theme", default.theme)
-    if theme not in SETTING_SPECS["ui.theme"].choices:
-        _logger.warning(
-            "settings.json: unsupported ui.theme %r; using %r",
-            theme, default.theme,
-        )
-        return default
-    return UiSettings(theme=theme)
+    """Load the ui section: a missing file, section or key reads as the
+    default theme; an unsupported theme raises ``ConfigError`` naming the
+    file and the key."""
+    path = settings_path(backup_root)
+    section = _section(path, _read_raw(path), "ui")
+    if "theme" not in section:
+        return UiSettings()
+    return UiSettings(
+        theme=_stored_value(path, SETTING_SPECS["ui.theme"], section["theme"])
+    )
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -333,9 +388,7 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     path = settings_path(backup_root)
     raw = _read_raw(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get("autoswitch")
-    if not isinstance(section, dict):
-        section = {}
+    section = _section(path, raw, "autoswitch")
     for field, json_key in _AUTOSWITCH_KEYS.items():
         section[json_key] = getattr(settings, field)
     raw["autoswitch"] = section
@@ -362,9 +415,9 @@ _BOOL_WORDS = {
 def parse_setting_value(spec: SettingSpec, raw_value: str):
     """Strictly parse a CLI-provided string for `cswap config set`.
 
-    Unlike the forgiving clamp on load, out-of-range or mistyped values raise
-    ConfigError so the user learns about the problem when setting the value,
-    not by silently degraded behavior at `cswap auto` time.
+    Out-of-range or mistyped values raise ConfigError so the user learns
+    about the problem when setting the value; the load check
+    (`_stored_value`) refuses the same values in a hand-edited file.
     """
     if spec.kind == "bool":
         # Never bool(str): bool("false") is True.
@@ -418,9 +471,9 @@ def format_setting_value(value) -> str:
 def _read_raw_for_write(path: Path) -> dict:
     """Raw read for the config write path: a corrupt file errors, never {}.
 
-    ``_read_raw``'s degrade-to-defaults is right for reads, but a
-    read-modify-write starting from ``{}`` would replace a malformed (and
-    maybe hand-recoverable) file with a near-empty one.
+    A read-modify-write starting from ``{}`` would replace a malformed (and
+    maybe hand-recoverable) file with a near-empty one. Same refusals as
+    ``_read_raw``, with the write path's remedy in the message.
     """
     try:
         text = path.read_text(encoding="utf-8")

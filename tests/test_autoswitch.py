@@ -19959,6 +19959,52 @@ class TestT1313SettleWiring:
         assert delay > 0
 
 
+class TestACorruptStateFileRaises:
+    """X3647 U8: the engine's state file read raises on a corrupt file
+    instead of reading as empty state (which released every quarantine);
+    a missing file (first run) stays empty state."""
+
+    @pytest.mark.parametrize("body,why", [
+        ("{not json", "is not valid JSON"),
+        ("[1, 2]", "is not a JSON object"),
+    ], ids=["not-json", "not-object"])
+    def test_read_state_raises_naming_the_file(self, temp_home, body, why):
+        """Asserts: `_read_state` raises EngineStateError naming the file."""
+        from claude_swap.switcher import EngineStateError
+
+        h = EngineHarness(temp_home)
+        h.engine.state_path.write_text(body)
+        with pytest.raises(EngineStateError, match=why) as caught:
+            h.engine._read_state()
+        assert str(h.engine.state_path) in str(caught.value)
+
+    def test_a_tick_on_a_corrupt_state_file_reports_it_and_never_switches(
+        self, temp_home
+    ):
+        """Asserts: a tick over a corrupt state file holding a quarantine
+        returns ERROR with an error event naming the file, and never lands
+        on the account the unreadable ledger held out."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.state_path.write_text('{"quarantine": {"2": ')
+        outcome = h.tick_with_usage({
+            "1": _usage7(100.0, 60.0, _R_LATER),
+            "2": _usage7(10.0, 10.0, _R_SOON),
+        })
+        assert outcome is TickOutcome.ERROR, h.kinds()
+        assert h.active_number() == 1
+        error = next(e for e in h.events if e.kind == "error")
+        assert str(h.engine.state_path) in error.message
+
+    def test_a_missing_state_file_is_empty_state(self, temp_home):
+        """Asserts: with no state file (first run) `_read_state` is empty."""
+        h = EngineHarness(temp_home)
+        assert not h.engine.state_path.exists()
+        assert h.engine._read_state() == {}
+
+
 class TestDynamicArmsReadTheOverloadBackoff:
     """X3647 U8: `dynamic`'s own proactive and alternation arms bar a
     measured candidate inside its overload back-off, the way
