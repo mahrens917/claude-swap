@@ -62,6 +62,7 @@ from claude_swap.settings import (
     AutoSwitchSettings,
     account_switch_point,
     atomic_write_json,
+    holds_credit_point,
     parse_model_names,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, spend_row_body
@@ -1510,6 +1511,7 @@ def _dynamic_active_headroom(
     usage: dict[str, dict | str | None],
     current: str,
     active_headroom: float | None,
+    entries: dict[str, UsageEntry] | None,
 ) -> float | None:
     """Widen ``active_headroom`` to the unmodeled 5h/7d value under
     ``dynamic``, so the trigger classification and every re-rank this tick
@@ -1532,7 +1534,7 @@ def _dynamic_active_headroom(
     """
     if settings.strategy != "dynamic" or not models or active_headroom is None:
         return active_headroom
-    if not _model_window_binds_everywhere(usage, models, settings.threshold):
+    if not _model_window_binds_everywhere(usage, models, settings, entries):
         return active_headroom
     unmodeled = _headroom_by_account(usage, ()).get(current)
     if unmodeled is not None and unmodeled > active_headroom:
@@ -1590,7 +1592,10 @@ def model_block_label(model: str) -> str:
 
 
 def _model_window_binds_everywhere(
-    usage: dict[str, dict | str | None], models: tuple[str, ...], threshold: float
+    usage: dict[str, dict | str | None],
+    models: tuple[str, ...],
+    settings: AutoSwitchSettings,
+    entries: dict[str, UsageEntry] | None,
 ) -> bool:
     """True only when the model window blocks every account in ``usage``
     (model-gated) and at least one of them is blocked ONLY by that window
@@ -1616,11 +1621,21 @@ def _model_window_binds_everywhere(
     every genuinely model-only-walled account (measured 2026-09-08: a
     spend-only slot #8 held `all accounts exhausted` while a real Fable
     candidate's 5h/7d sat open).
+
+    Each account is read at its OWN switch point (:func:`_switch_point`,
+    X3647), and an account that holds the credit point
+    (:func:`holds_credit_point`) ends the question: its model window is no
+    wall, because usage credits pay for that model's work past 100 (operator,
+    2026-10-08: "With credits we can run Fable even if Fable and weekly are
+    at 100"). Dropping ``models`` is then never the rescue; the at-limit
+    usage-credit move is. ``entries`` None (ranking on usage alone) reads
+    every account at the plain threshold with no credit room, as does an
+    unset ``credit_threshold``, so the pre-credit verdict holds there.
     """
     if not models:
         return False
     saw_model_only_wall = False
-    for value in usage.values():
+    for num, value in usage.items():
         windows = [
             (label, pct)
             for label, pct, _ in oauth.relevant_windows(
@@ -1629,7 +1644,10 @@ def _model_window_binds_everywhere(
         ]
         if not windows:
             continue
-        outcome, _ = classify_candidate_block(windows, threshold)
+        entry = entries.get(num) if entries is not None else None
+        if holds_credit_point(settings, entry):
+            return False
+        outcome, _ = classify_candidate_block(windows, _switch_point(settings, entries, num))
         if outcome == "open":
             return False
         if outcome == "model":
@@ -2747,7 +2765,7 @@ class AutoSwitchEngine:
         # below re-derives `active_headroom` from a fresh `headroom` too —
         # calling the same helper there is what keeps them on one axis.
         active_headroom = _dynamic_active_headroom(
-            settings, self._models, usage, current, active_headroom
+            settings, self._models, usage, current, active_headroom, entries
         )
         # adr/0010 R2: two margins of the bar, on the SAME widened reading
         # the trigger is classified from. `dynamic` only, so `best` and
@@ -2989,7 +3007,7 @@ class AutoSwitchEngine:
                 not warm_ordered
                 and not cold_ordered
                 and self._models
-                and _model_window_binds_everywhere(usage, self._models, settings.threshold)
+                and _model_window_binds_everywhere(usage, self._models, settings, entries)
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321) — ONLY where it
                 # binds everywhere (`_model_window_binds_everywhere`, the
@@ -3092,7 +3110,7 @@ class AutoSwitchEngine:
                 not warm_ordered
                 and not cold_ordered
                 and self._models
-                and _model_window_binds_everywhere(usage, self._models, settings.threshold)
+                and _model_window_binds_everywhere(usage, self._models, settings, entries)
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321), same retry as the
                 # `proactive` arm above: `_dynamic_active_headroom` widens a
@@ -3354,7 +3372,7 @@ class AutoSwitchEngine:
                     )
                     if self._models
                     and _model_window_binds_everywhere(
-                        usage, self._models, settings.threshold
+                        usage, self._models, settings, entries
                     )
                     else None
                 )
@@ -3587,7 +3605,7 @@ class AutoSwitchEngine:
             }
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
-                settings, self._models, usage, current, headroom.get(current)
+                settings, self._models, usage, current, headroom.get(current), entries
             )
             decided_now = self.clock()
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
@@ -4518,7 +4536,7 @@ class AutoSwitchEngine:
         if (
             ordered
             or not self._models
-            or not _model_window_binds_everywhere(usage, self._models, settings.threshold)
+            or not _model_window_binds_everywhere(usage, self._models, settings, entries)
         ):
             self._last_probe_num = probe_num
             return ordered, any_known, active_reset_ts, waiting

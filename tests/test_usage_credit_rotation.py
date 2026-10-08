@@ -445,3 +445,180 @@ class TestLostCreditRoomAlarm:
                 "2": _open(), "3": _open(),
             })
         assert _warnings(caplog, _LOST_ROOM_LINE) == []
+
+
+def _fable(pct: float, spend: dict | None = None) -> dict:
+    """An account whose 5h/7d are open and whose Fable weekly window reads
+    ``pct``."""
+    usage: dict = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 10.0},
+        "scoped": [{"name": "Fable", "pct": pct}],
+    }
+    if spend is not None:
+        usage["spend"] = spend
+    return usage
+
+
+def _fable_harness(temp_home, **settings) -> EngineHarness:
+    h = EngineHarness(temp_home, model="Fable", **settings)
+    h.seed(1, "a@example.com")
+    h.seed(2, "b@example.com")
+    h.seed(3, "c@example.com")
+    h.make_live("a@example.com", 1)
+    return h
+
+
+class TestCreditPointOnTheModelWindow:
+    """X3647: the credit switch point covers the per-model weekly window
+    (Fable) exactly as it covers the 5h/7d windows."""
+
+    def test_a_credit_account_at_fable_99_5_stays(self, temp_home):
+        """Asserts: threshold 99, creditThreshold 100, the active's Fable
+        window at 99.5 (5h/7d at 10) with money left: no switch, and the
+        below-threshold line names its own point of 100."""
+        h = _fable_harness(
+            temp_home, strategy="best", threshold=99.0, credit_threshold=100.0
+        )
+        outcome = h.tick_with_usage({
+            "1": _fable(99.5, _spend(50.0)), "2": _fable(10.0), "3": _fable(10.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        assert h.active_number() == 1
+        no_switch = next(e for e in h.events if e.kind == "no-switch")
+        assert no_switch.reason == "below-threshold"
+        assert no_switch.detail == "99.5% < 100%"
+
+    def test_an_account_without_credits_at_fable_99_5_leaves(self, temp_home):
+        """Asserts: the same Fable 99.5 with no usage credits is past the
+        plain threshold of 99, so the engine switches proactively."""
+        h = _fable_harness(
+            temp_home, strategy="best", threshold=99.0, credit_threshold=100.0
+        )
+        outcome = h.tick_with_usage({
+            "1": _fable(99.5), "2": _fable(10.0), "3": _fable(10.0),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_unset_credit_threshold_leaves_a_credit_account_at_fable_99_5(
+        self, temp_home
+    ):
+        """Asserts: with creditThreshold unset, an active holding credits at
+        Fable 99.5 switches at threshold 99 as before."""
+        h = _fable_harness(temp_home, strategy="best", threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": _fable(99.5, _spend(50.0)), "2": _fable(10.0), "3": _fable(10.0),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+
+
+class TestFleetFableWallWithCredits:
+    """X3647: every account's Fable window full and some account with credit
+    room is the usage-credit move, never the fleet-wide model wall."""
+
+    def test_dynamic_moves_onto_the_credit_account(self, temp_home, caplog):
+        """Asserts: under `dynamic`, every Fable window at 100 and only #2
+        holding credits, the engine switches to #2 under `usage-credits`
+        and emits the spending event, instead of reading a fleet-wide model
+        wall and ranking on 5h/7d alone."""
+        h = _fable_harness(
+            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = h.tick_with_usage({
+                "1": _fable(100.0), "2": _fable(100.0, _spend(80.0)),
+                "3": _fable(100.0),
+            })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "usage-credits"
+        assert any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
+        assert len(_warnings(caplog, _CREDITS_LINE)) == 1
+
+    def test_dynamic_active_with_credits_keeps_the_sessions(self, temp_home):
+        """Asserts: the active itself holding credits with every Fable
+        window full stays put on its credits (NO_ACTION, no reset sleep)."""
+        h = _fable_harness(
+            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        outcome = h.tick_with_usage({
+            "1": _fable(100.0, _spend(80.0)), "2": _fable(100.0), "3": _fable(100.0),
+        })
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        assert h.active_number() == 1
+        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
+        assert credits.switched is False
+        assert h.engine._blocked_wait_long is False
+
+    def test_unset_credit_threshold_keeps_the_model_wall_verdict(self, temp_home):
+        """Asserts: with creditThreshold unset the same fleet takes no
+        usage-credit move: the fleet-wide model wall stands as before."""
+        h = _fable_harness(temp_home, strategy="dynamic", threshold=90.0)
+        h.tick_with_usage({
+            "1": _fable(100.0), "2": _fable(100.0, _spend(80.0)), "3": _fable(100.0),
+        })
+        assert not any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
+        assert not any(
+            isinstance(e, SwitchEvent) and e.trigger == "usage-credits"
+            for e in h.events
+        )
+
+    def test_detector_fires_when_the_credit_account_is_quarantined(
+        self, temp_home, caplog
+    ):
+        """Asserts: every Fable window full and the only credit account (#3)
+        quarantined, so outside the candidate set: the engine enters the
+        all-exhausted wait and logs the X3586 detector WARNING naming #3."""
+        h = _fable_harness(
+            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        h.engine._quarantine("3", "c@example.com", "invalid_grant")
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = h.tick_with_usage({
+                "1": _fable(100.0), "2": _fable(100.0),
+                "3": _fable(100.0, _spend(42.0)),
+            })
+        assert outcome is TickOutcome.BLOCKED, h.kinds()
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert _warnings(caplog, _DETECTOR_LINE) == [
+            "All accounts exhausted while Account-3 holds usage-credit room "
+            "($42.00 left) the rotation did not use"
+        ]
+
+
+class TestModelWallPredicateReadsCreditPoints:
+    """X3647: `_model_window_binds_everywhere` reads each account at its own
+    switch point."""
+
+    def _entries(self, usage: dict) -> dict[str, UsageEntry]:
+        return {
+            num: UsageEntry(last_good=value, fetched_at=0.0, age_s=0.0)
+            for num, value in usage.items()
+        }
+
+    def test_a_credit_account_ends_the_fleet_wall(self):
+        """Asserts: two accounts model-walled at Fable 100 and one holding
+        credits at Fable 100: no fleet-wide wall when creditThreshold is
+        set; the plain rule (unset) still reads one."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = {"1": _fable(100.0), "2": _fable(100.0, _spend(5.0)), "3": _fable(100.0)}
+        entries = self._entries(usage)
+        held = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
+        plain = AutoSwitchSettings(threshold=90.0)
+        assert _model_window_binds_everywhere(usage, ("Fable",), held, entries) is False
+        assert _model_window_binds_everywhere(usage, ("Fable",), plain, entries) is True
+
+    def test_without_credit_room_the_wall_stands(self):
+        """Asserts: creditThreshold set but no account with credit room:
+        every account is read at the plain threshold and the wall binds."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = {"1": _fable(95.0), "2": _fable(100.0, _spend(0.0, reached=True))}
+        settings = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), settings, self._entries(usage)
+        ) is True

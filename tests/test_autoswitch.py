@@ -7200,7 +7200,7 @@ class TestDynamicStrategy:
         # account 5's reading alone rather than widening it to the
         # unmodeled 38.
         widened = _dynamic_active_headroom(
-            h.engine.settings, h.engine._models, fleet_usage, "5", 10.0,
+            h.engine.settings, h.engine._models, fleet_usage, "5", 10.0, None,
         )
         assert widened == 10.0, (
             f"got {widened!r} — account 7 is open on the model-gated axis, "
@@ -19349,9 +19349,12 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         from claude_swap.autoswitch import _model_window_binds_everywhere
 
         usage = self._specimen_usage()
-        with_8 = _model_window_binds_everywhere(usage, ("Fable",), 90.0)
+        with_8 = _model_window_binds_everywhere(usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None)
         without_8 = _model_window_binds_everywhere(
-            {k: v for k, v in usage.items() if k != "8"}, ("Fable",), 90.0
+            {k: v for k, v in usage.items() if k != "8"},
+            ("Fable",),
+            AutoSwitchSettings(threshold=90.0),
+            None,
         )
         assert with_8 is True, (
             "a spend-only account (#8) must not disarm the predicate — "
@@ -19369,7 +19372,7 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         from claude_swap.autoswitch import _model_window_binds_everywhere
 
         usage = self._specimen_usage(account_3_seven_day=100)
-        assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False, (
+        assert _model_window_binds_everywhere(usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None) is False, (
             "no account in this roster is model-only-walled once #3's 7d "
             "is spent too — the predicate must not fire"
         )
@@ -19386,7 +19389,7 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         # wall -- is this class's `test_a_spend_only_account_cannot_
         # disarm_the_predicate`'s `with_8 is True` assertion.
         without_8 = {k: v for k, v in usage.items() if k != "8"}
-        assert _model_window_binds_everywhere(without_8, ("Fable",), 90.0) is False, (
+        assert _model_window_binds_everywhere(without_8, ("Fable",), AutoSwitchSettings(threshold=90.0), None) is False, (
             "dropping #8 from an already-open roster must not change the "
             "verdict"
         )

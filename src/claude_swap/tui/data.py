@@ -485,9 +485,11 @@ def rank_switch_candidates(
     active_disabled = next(
         (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )
+    entries = {acc.number: acc.usage for acc in snap.accounts}
     trigger = _trigger_for(
         _dynamic_active_headroom(
-            settings, models, usage, active_number, model_headroom.get(active_number)
+            settings, models, usage, active_number,
+            model_headroom.get(active_number), entries,
         ),
         active_disabled,
     )
@@ -497,7 +499,7 @@ def rank_switch_candidates(
         not ordered
         and models
         and settings.strategy == "dynamic"
-        and _model_window_binds_everywhere(usage, models, settings.threshold)
+        and _model_window_binds_everywhere(usage, models, settings, entries)
     ):
         ordered, rank_axis = _rank_on((), trigger)
     if (

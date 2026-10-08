@@ -222,12 +222,28 @@ def account_switch_point(settings: AutoSwitchSettings, entry) -> float:
     ``entry`` is the account's ``UsageEntry`` (None when it has none, which
     holds no credit room). The auto engine and ``cswap list --json``'s
     ``switchThreshold`` both read it here, so the two cannot disagree.
+    The point covers every window the account is measured on, the per-model
+    weekly windows (``autoswitch.model``, e.g. Fable) included.
     """
-    if settings.credit_threshold is None:
-        return settings.threshold
-    if oauth.entry_credit_room(entry) is None:
-        return settings.threshold
-    return settings.credit_threshold
+    credit_point = settings.credit_threshold
+    if credit_point is not None and holds_credit_point(settings, entry):
+        return credit_point
+    return settings.threshold
+
+
+def holds_credit_point(settings: AutoSwitchSettings, entry) -> bool:
+    """Whether this account switches at ``credit_threshold``: it is set and
+    the account's stored reading has usage-credit room.
+
+    Such an account keeps answering past any window limit, a per-model
+    weekly window (Fable) at 100 included, on paid credits. False for every
+    account while ``credit_threshold`` is unset, so the pre-credit rules
+    hold unchanged.
+    """
+    return (
+        settings.credit_threshold is not None
+        and oauth.entry_credit_room(entry) is not None
+    )
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
