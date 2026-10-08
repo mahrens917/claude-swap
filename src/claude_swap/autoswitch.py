@@ -59,7 +59,7 @@ from claude_swap.poll_policy import (
     binding_pct,
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
-from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome
+from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, spend_row_body
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -863,10 +863,7 @@ class PollEvent(AutoSwitchEvent):
             return f"{100 - h:.0f}%"
         spend = self.spend.get(num)
         if spend is not None:
-            return (
-                f"$$ {spend['pct']:.0f}% "
-                f"(${spend['used']:,.2f}/${spend['limit']:,.2f})"
-            )
+            return f"$$ {spend_row_body(spend)}"
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
@@ -1016,6 +1013,36 @@ class AllExhaustedEvent(AutoSwitchEvent):
         if self.earliest_reset_at:
             return f"{what}; earliest reset {self.earliest_reset_at}{who}"
         return f"{what}; no reset time known"
+
+
+@dataclass(frozen=True)
+class SpendingUsageCreditsEvent(AutoSwitchEvent):
+    """Every account's windows are full, so work runs on paid usage credits.
+
+    ``account`` (an ``_ref`` shape) is the account the sessions run on from
+    this tick, ``remaining`` its dollars left under the monthly cap (None:
+    no cap), and ``switched`` whether the engine moved onto it this tick
+    rather than staying on the active."""
+
+    kind: ClassVar[str] = "spending-usage-credits"
+    account: dict
+    remaining: float | None
+    switched: bool
+
+    def _fields(self) -> dict:
+        return {
+            "account": self.account,
+            "remaining": self.remaining,
+            "switched": self.switched,
+        }
+
+    def human(self) -> str:
+        money = _credit_money(oauth.UsageCreditRoom(remaining=self.remaining))
+        verb = "switching to" if self.switched else "staying on"
+        return (
+            "all windows full; spending usage credits, "
+            f"{verb} Account-{self.account['number']} ({money})"
+        )
 
 
 @dataclass(frozen=True)
@@ -1396,6 +1423,55 @@ def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
 
+def _entry_credit_room(entry: UsageEntry | None) -> oauth.UsageCreditRoom | None:
+    """Usage-credit room from an account's stored measurement.
+
+    Read off ``last_good``, not the decision value: a walled or header-only
+    row's decision value is rebuilt from its windows alone and carries no
+    ``spend`` object, and the walled row is exactly the at-limit account
+    whose credits matter here. A sentinel row (expired, relogin) cannot run
+    sessions, so it has no room.
+    """
+    if entry is None or entry.sentinel is not None:
+        return None
+    return oauth.usage_credit_room(entry.last_good)
+
+
+def _usage_credit_pick(
+    current: str,
+    candidates: Sequence[str],
+    entries: dict[str, UsageEntry],
+) -> tuple[str, oauth.UsageCreditRoom] | None:
+    """The account sessions should spend usage credits on, or None when no
+    account among the active and ``candidates`` has credit room.
+
+    The active keeps the sessions while it has any room at all: moving to a
+    peer with more money left spends the same dollars and costs a switch,
+    and ranking on the larger remainder would flip between two accounts
+    every time the active's spend crossed the peer's. Once the active has
+    none, the peer with the most room takes them (no cap ranks first).
+    """
+    current_room = _entry_credit_room(entries.get(current))
+    if current_room is not None:
+        return current, current_room
+    rooms = {
+        num: room
+        for num in candidates
+        if (room := _entry_credit_room(entries.get(num))) is not None
+    }
+    if not rooms:
+        return None
+    best = max(rooms, key=lambda num: rooms[num].rank_key())
+    return best, rooms[best]
+
+
+def _credit_money(room: oauth.UsageCreditRoom) -> str:
+    """Dollars left in words, for the switch detail and the WARNING line."""
+    if room.remaining is None:
+        return "no cap"
+    return f"${room.remaining:,.2f} left"
+
+
 def _headroom_by_account(
     usage: dict[str, dict | str | None], models: tuple[str, ...]
 ) -> dict[str, float | None]:
@@ -1660,6 +1736,12 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # The account the sessions ran on usage credits this tick and the
+        # last one (None: not on credits). The WARNING for credit spending
+        # fires when the account changes, entering credits included, so a
+        # long stretch on one account logs it once rather than every tick.
+        self._credits_account_now: str | None = None
+        self._credits_account_before: str | None = None
         # Byte offset into the pin's trace the last tick read up to. None
         # until the first successful read takes its baseline; see
         # `_message_error_burst`.
@@ -2415,6 +2497,8 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         self._settle_wait_until = None
+        self._credits_account_before = self._credits_account_now
+        self._credits_account_now = None
         # T1313 (correctness-pass item 4): a demoted engine forces
         # `dry_run` True the same way an explicit one does, so this one
         # flag covers both -- every settle call this tick and every one
@@ -3504,6 +3588,30 @@ class AutoSwitchEngine:
             if not ordered and _overload_bar_releases(trigger):
                 ordered = api_key_candidates
 
+        # Every candidate's usage known and at its limit: the fleet has no
+        # window room anywhere it could move to.
+        candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
+        truly_exhausted = all(
+            h is not None and h <= 0 for h in candidate_headrooms
+        )
+        if not ordered and truly_exhausted and trigger == "at-limit":
+            # THE ACTIVE IS FULL TOO (`at-limit` is `active_headroom <= 0`,
+            # measured), so the only way work continues before a reset is
+            # paid usage credits. The account that holds them carries the
+            # sessions. Staying on the active keeps the ordinary cadence,
+            # never the long reset sleep, so a window that reopens is ranked
+            # by the at-limit path above as soon as its reading lands.
+            credit_pick = _usage_credit_pick(current, oauth_candidates, entries)
+            if credit_pick is not None:
+                credit_num, credit_room = credit_pick
+                switched = credit_num != current
+                self._announce_usage_credits(credit_num, credit_room, switched)
+                if not switched:
+                    return TickOutcome.NO_ACTION
+                ordered = [credit_num]
+                trigger = "usage-credits"
+                overload_detail = _credit_money(credit_room)
+
         if not ordered:
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
@@ -3551,10 +3659,8 @@ class AutoSwitchEngine:
             # gate, or one whose usage is unreadable this tick, can become
             # viable at any moment — and the active account can hit 100% and
             # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
-            )
+            # `truly_exhausted` is computed above, where the usage-credit
+            # move reads it first.
             if not truly_exhausted and not waiting_for_recovery:
                 self._emit(
                     NoSwitchEvent(
@@ -3637,6 +3743,8 @@ class AutoSwitchEngine:
                         NoSwitchEvent(reason="active-usage-unknown", detail=detail)
                     )
                     return TickOutcome.BLOCKED
+            if truly_exhausted:
+                self._warn_unused_usage_credits(entries)
             self._emit(
                 AllExhaustedEvent(
                     earliest_reset_at=(
@@ -5607,6 +5715,54 @@ class AutoSwitchEngine:
                     )
                 )
             )
+
+    def _announce_usage_credits(
+        self, number: str, room: oauth.UsageCreditRoom, switched: bool
+    ) -> None:
+        """Report that sessions run on ``number``'s usage credits this tick.
+
+        The event goes out every tick (the panel and ``--json`` stream show
+        the state); the WARNING fires when the credit account changes, which
+        includes entering credits from window quota.
+        """
+        self._credits_account_now = number
+        email = self.switcher.account_email(number)
+        if self._credits_account_before != number:
+            _logger.warning(
+                "Every account's usage windows are full; sessions run on "
+                "Account-%s usage credits (%s)%s",
+                number,
+                _credit_money(room),
+                ", switching to it" if switched else "",
+            )
+        self._emit(
+            SpendingUsageCreditsEvent(
+                account=_ref(number, email),
+                remaining=room.remaining,
+                switched=switched,
+            )
+        )
+
+    def _warn_unused_usage_credits(self, entries: dict[str, UsageEntry]) -> None:
+        """Detector: the engine is entering the all-exhausted wait while an
+        account still holds usage-credit room.
+
+        The usage-credit move takes every such account it may (the active or
+        a rotation candidate, on an at-limit tick), so a hit here is an
+        account outside that set (quarantined, no usable stored login) or a
+        tick whose active was not measured at its limit. An account the user
+        disabled is skipped: holding it out of rotation is their order, not
+        a fault. Zero on a healthy pool.
+        """
+        for number, entry in sorted(entries.items()):
+            room = _entry_credit_room(entry)
+            if room is not None and not self.switcher.is_account_disabled(number):
+                _logger.warning(
+                    "All accounts exhausted while Account-%s holds usage-credit "
+                    "room (%s) the rotation did not use",
+                    number,
+                    _credit_money(room),
+                )
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]

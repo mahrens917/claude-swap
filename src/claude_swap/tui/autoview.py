@@ -59,6 +59,9 @@ _EVENT_ROLES = {
     "error": "sev_warn",
     "account-quarantined": "sev_warn",
     "all-exhausted": "sev_crit",
+    # Paid money is being spent because every window is full: degraded,
+    # not broken, the same colour as a quarantine or a transient error.
+    "spending-usage-credits": "sev_warn",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 
@@ -549,9 +552,11 @@ class AutoScreen(Screen):
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
                     entry.append("  $$ ", style=palette.muted)
-                    entry.append(f"{spend_pct:.0f}%",
-                                 style=palette.severity(spend_pct))
-                    entry.append(f" · {spend_suffix}", style=palette.muted)
+                    if spend_pct is not None:
+                        entry.append(f"{spend_pct:.0f}%",
+                                     style=palette.severity(spend_pct))
+                        entry.append(" · ", style=palette.muted)
+                    entry.append(spend_suffix, style=palette.muted)
                 else:
                     entry.append("  usage unknown", style=palette.muted)
                 # A spend-axis account is never a ranking target regardless

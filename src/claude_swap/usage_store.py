@@ -1,7 +1,7 @@
 """Per-account usage table: last-known-good measurements + fetch/backoff state.
 
 Replaces the all-or-nothing 15s snapshot that previously lived in
-``cache/usage.json`` (now ``schemaVersion: 2``; a version-less legacy file is
+``cache/usage.json`` (now ``schemaVersion: 3``; a version-less legacy file is
 treated as empty — its data had a 15s shelf life anyway). One failed round
 trip no longer blanks every account: a failure updates the error/backoff
 fields and never touches the last-good measurement (stale-on-error). The
@@ -57,7 +57,10 @@ from claude_swap.settings import atomic_write_json
 
 _logger = logging.getLogger("claude-swap")
 
-SCHEMA_VERSION = 2
+# 3: a stored ``spend`` carries ``remaining`` and ``limit_reached`` and may
+# have a null ``limit`` (uncapped). A version-2 file has spend objects the
+# readers cannot read, so it is discarded and every account refetched.
+SCHEMA_VERSION = 3
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve

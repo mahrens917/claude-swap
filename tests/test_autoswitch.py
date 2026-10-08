@@ -5255,7 +5255,7 @@ class TestLoopObeysThePollPlan:
         path = harness.switcher._usage_store.path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "accounts": {
                 quarantined: {
                     "email": f"{'b' if quarantined == '2' else 'c'}@example.com",
@@ -5293,7 +5293,7 @@ class TestLoopObeysThePollPlan:
         path.parent.mkdir(parents=True, exist_ok=True)
         now = harness.clock.now
         path.write_text(json.dumps({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "accounts": {
                 capped: {
                     "email": f"{'b' if capped == '2' else 'c'}@example.com",
@@ -6328,11 +6328,13 @@ class TestAModelWindowIsNotABlackout:
             active={"number": 6, "email": "a@example.com"},
             headroom={"6": 28.0, "8": None},
             threshold=90.0,
-            spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0}},
+            spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0,
+                         "remaining": 258.31, "currency": "USD",
+                         "limit_reached": False}},
         )
         text = event.human()
         assert "#8: ?" not in text, text
-        assert "#8: $$ 45% ($207.69/$466.00)" in text, text
+        assert "#8: $$  45%   $258.31 left of $466.00" in text, text
 
     def test_a_genuinely_unreadable_account_still_prints_a_bare_mark(self):
         """The discrimination must survive: an account with no windows, no
@@ -14992,7 +14994,7 @@ def _seed_healed_strike(h: EngineHarness, num: str, email: str, *, stale: bool =
     path = h.switcher._usage_store.path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "accounts": {
             num: {
                 "email": email,
@@ -15036,7 +15038,7 @@ def _run_write_probe(harness: EngineHarness, *, with_strike: bool):
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "accounts": {
                 "2": {
                     "email": "b@example.com",
@@ -15659,6 +15661,11 @@ class TestStoppedEngineDoesNotAct:
             m.QuarantineEvent(number="2", email="b@example.com", reason="x"),
             m.UnquarantineEvent(number="2", email="b@example.com"),
             m.AllExhaustedEvent(earliest_reset_at=None),
+            m.SpendingUsageCreditsEvent(
+                account={"number": 2, "email": "b@example.com"},
+                remaining=None,
+                switched=False,
+            ),
             m.SleepEvent(seconds=1.0, until="2024-01-01T00:00:00Z"),
             m.ErrorEvent(message="two engines may act once"),
             m.ConfigWarningEvent(message="now LIVE"),

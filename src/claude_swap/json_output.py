@@ -119,8 +119,10 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         spend_out: dict = {
             "used": spend["used"],
             "limit": spend["limit"],
+            "remaining": spend["remaining"],
             "pct": spend["pct"],
             "currency": spend["currency"],
+            "limitReached": spend["limit_reached"],
         }
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
@@ -161,6 +163,63 @@ def _window_from_json(window: object, label: str) -> dict:
     return out
 
 
+def _spend_from_json(spend: object) -> dict:
+    """The ``spend`` JSON object back to the internal shape.
+
+    ``limit`` and ``remaining`` are null together for an account with no
+    monthly cap and numbers otherwise, and ``remaining`` must equal
+    ``limit - used`` so an edited document cannot claim money the cap does
+    not leave. ``pct`` is null when the API sent no utilization (always so
+    for an uncapped account).
+    """
+    if not isinstance(spend, dict):
+        raise ValueError("spend must be an object")
+    used = spend.get("used")
+    if not _is_number(used) or used < 0:
+        raise ValueError("spend.used must be a non-negative number")
+    for key in ("limit", "remaining", "pct"):
+        if key not in spend:
+            raise ValueError(f"spend.{key} is missing (null means no cap or no figure)")
+    limit, remaining, pct = spend["limit"], spend["remaining"], spend["pct"]
+    if limit is None:
+        if remaining is not None:
+            raise ValueError("spend.remaining must be null when spend.limit is null")
+    else:
+        for key, value in (("limit", limit), ("remaining", remaining)):
+            if not _is_number(value):
+                raise ValueError(f"spend.{key} must be a number when spend.limit is set")
+        if limit < 0:
+            raise ValueError("spend.limit must be non-negative")
+        if not math.isclose(remaining, limit - used, abs_tol=0.005):
+            raise ValueError(
+                f"spend.remaining {remaining!r} is not spend.limit - spend.used"
+            )
+    if pct is not None and (not _is_number(pct) or pct < 0):
+        raise ValueError("spend.pct must be a non-negative number or null")
+    if not isinstance(spend.get("currency"), str):
+        raise ValueError("spend.currency must be a string")
+    if not isinstance(spend.get("limitReached"), bool):
+        raise ValueError("spend.limitReached must be a boolean")
+    out: dict = {
+        "used": float(used),
+        "limit": float(limit) if limit is not None else None,
+        "remaining": float(remaining) if remaining is not None else None,
+        "pct": float(pct) if pct is not None else None,
+        "currency": spend["currency"],
+        "limit_reached": spend["limitReached"],
+    }
+    resets_at = spend.get("resetsAt")
+    if resets_at is not None:
+        if not isinstance(resets_at, str):
+            raise ValueError("spend.resetsAt must be an ISO-8601 string")
+        try:
+            out["countdown"], out["clock"] = oauth.format_reset(resets_at)
+        except (ValueError, TypeError):
+            raise ValueError(f"spend.resetsAt is not an ISO-8601 time: {resets_at!r}")
+        out["resets_at"] = resets_at
+    return out
+
+
 def usage_from_json(usage: object) -> dict:
     """Read a ``usage`` object from ``list --json`` back into the internal dict.
 
@@ -180,16 +239,7 @@ def usage_from_json(usage: object) -> dict:
     if "sevenDay" in usage:
         out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
     if "spend" in usage:
-        spend = usage["spend"]
-        out_spend = _window_from_json(spend, "spend")
-        for key in ("used", "limit"):
-            if not _is_number(spend.get(key)):
-                raise ValueError(f"spend.{key} must be a number")
-            out_spend[key] = float(spend[key])
-        if not isinstance(spend.get("currency"), str):
-            raise ValueError("spend.currency must be a string")
-        out_spend["currency"] = spend["currency"]
-        out["spend"] = out_spend
+        out["spend"] = _spend_from_json(usage["spend"])
     if "scoped" in usage:
         if not isinstance(usage["scoped"], list):
             raise ValueError("scoped must be a list")

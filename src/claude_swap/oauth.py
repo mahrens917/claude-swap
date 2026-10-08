@@ -762,6 +762,90 @@ def _log_usage_failure(
 
 
 
+def _spend_entry(eu: dict) -> dict | None:
+    """The ``spend`` object for an account whose extra usage is enabled.
+
+    Amounts arrive in cents. ``monthly_limit`` null means the account has no
+    monthly cap: ``limit``, ``remaining`` and ``pct`` are then None, and every
+    reader branches on that None. ``remaining`` is the cap minus what was
+    used, in dollars; ``limit_reached`` is the API's own verdict. None (with
+    a WARNING naming the field) when a figure the object needs is missing or
+    not a number, so a malformed response never reads as money left.
+    """
+    used_credits = eu.get("used_credits")
+    monthly_limit = eu.get("monthly_limit")
+    utilization = eu.get("utilization")
+    currency = eu.get("currency")
+    limit_reached = eu.get("spend_limit_reached")
+    try:
+        if used_credits is None:
+            raise ValueError("used_credits is null")
+        if not isinstance(currency, str):
+            raise ValueError(f"currency is {currency!r}")
+        if not isinstance(limit_reached, bool):
+            raise ValueError(f"spend_limit_reached is {limit_reached!r}")
+        used = float(used_credits) / 100
+        limit = float(monthly_limit) / 100 if monthly_limit is not None else None
+        pct = float(utilization) if utilization is not None else None
+    except (TypeError, ValueError) as e:
+        _logger.warning(
+            "extra_usage is enabled but unreadable (%s); no usage-credit figure "
+            "this fetch",
+            e,
+        )
+        return None
+    spend_entry: dict = {
+        "used": used,
+        "limit": limit,
+        "remaining": limit - used if limit is not None else None,
+        "pct": pct,
+        "currency": currency,
+        "limit_reached": limit_reached,
+    }
+    if eu.get("resets_at"):
+        spend_entry["resets_at"] = eu["resets_at"]
+        spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+    return spend_entry
+
+
+@dataclass(frozen=True)
+class UsageCreditRoom:
+    """Usage-credit money an account can still spend past its full windows.
+
+    ``remaining`` is dollars left under the monthly cap, or None when the
+    account has no cap (unlimited), which ranks above any finite amount.
+    """
+
+    remaining: float | None
+
+    def rank_key(self) -> tuple[int, float]:
+        """Sort key: larger is more room; an unlimited account outranks all."""
+        if self.remaining is None:
+            return (1, 0.0)
+        return (0, self.remaining)
+
+
+def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
+    """How much usage-credit room this account has, or None when it has none.
+
+    None when the reading carries no ``spend`` object (credits off), when the
+    API says the monthly cap is reached, or when the cap leaves nothing
+    (``remaining <= 0``). The 5h/7d windows play no part: this is the axis
+    :func:`account_headroom` deliberately excludes.
+    """
+    if not isinstance(usage, dict):
+        return None
+    spend = usage.get("spend")
+    if not isinstance(spend, dict):
+        return None
+    if spend["limit_reached"]:
+        return None
+    remaining = spend["remaining"]
+    if remaining is not None and remaining <= 0:
+        return None
+    return UsageCreditRoom(remaining=remaining)
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -786,27 +870,9 @@ def build_usage_result(data: dict) -> dict | None:
 
     eu = data.get("extra_usage")
     if eu and eu.get("is_enabled"):
-        # Claude Code returns nullable used_credits, monthly_limit, and utilization
-        # (monthly_limit=None = unlimited). All three are needed to render the spend
-        # line, so when any is null skip just the spend entry; five_hour/seven_day
-        # go through unchanged.
-        used_credits = eu.get("used_credits")
-        monthly_limit = eu.get("monthly_limit")
-        utilization = eu.get("utilization")
-        if used_credits is not None and monthly_limit is not None and utilization is not None:
-            try:
-                spend_entry: dict = {
-                    "used": float(used_credits) / 100,
-                    "limit": float(monthly_limit) / 100,
-                    "pct": float(utilization),
-                    "currency": eu.get("currency", "USD"),
-                }
-                if eu.get("resets_at"):
-                    spend_entry["resets_at"] = eu["resets_at"]
-                    spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
-                result["spend"] = spend_entry
-            except (TypeError, ValueError) as e:
-                _logger.debug("extra_usage parse failed: %r", e)
+        spend_entry = _spend_entry(eu)
+        if spend_entry is not None:
+            result["spend"] = spend_entry
 
     # Per-model weekly limits live in the newer ``limits`` array as
     # ``weekly_scoped`` entries carrying a ``scope.model.display_name`` (e.g.

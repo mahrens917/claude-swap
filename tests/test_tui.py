@@ -45,6 +45,13 @@ def _iso_in(seconds: float) -> str:
     )
 
 
+def capped_spend(used: float, limit: float, pct: float, **extra) -> dict:
+    """A capped usage-credit ``spend`` figure in ``oauth.build_usage_result``'s
+    shape, ``remaining`` derived the way the parser derives it."""
+    return {"used": used, "limit": limit, "remaining": limit - used, "pct": pct,
+            "currency": "USD", "limit_reached": False, **extra}
+
+
 def make_entry(
     pct5: float | None = 25.0,
     pct7: float | None = 10.0,
@@ -721,10 +728,10 @@ class TestUsageRows:
     def test_spend_row_first_with_amounts(self):
         from claude_swap.tui.widgets import usage_rows
 
-        entry = make_entry(spend={"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"})
+        entry = make_entry(spend=capped_spend(12.5, 50.0, 25.0))
         rows = usage_rows(entry.last_good, time.time())
         assert rows[0][0] == "$$"
-        assert "$12.50 / $50.00" in rows[0][2]
+        assert "$37.50 left of $50.00" in rows[0][2]
 
     def test_suffix_full_extends_countdown_with_clock(self):
         from claude_swap.tui.widgets import usage_rows
@@ -741,15 +748,37 @@ class TestUsageRows:
             spend={
                 "used": 12.5,
                 "limit": 50.0,
+                "remaining": 37.5,
                 "pct": 25.0,
                 "currency": "USD",
+                "limit_reached": False,
                 "resets_at": _iso_in(7200),
             }
         )
         spend = usage_rows(entry.last_good, time.time())[0]
         assert spend[0] == "$$"
         assert " · " in spend[3]
-        assert spend[3].index(" · ") < spend[3].index("$12.50")
+        assert spend[3].index(" · ") < spend[3].index("$37.50 left of $50.00")
+
+    def test_uncapped_spend_row_has_no_percent_and_names_no_cap(self):
+        """Asserts: an uncapped account's spend row carries a None percent
+        and the shared money words, and the account card renders it as
+        text with no bar and no "usage unknown"."""
+        from claude_swap.tui.widgets import usage_rows
+
+        spend = {"used": 8.11, "limit": None, "remaining": None, "pct": None,
+                 "currency": "USD", "limit_reached": False}
+        row = usage_rows({"spend": spend}, time.time())[0]
+        assert row == ("$$", None, "$8.11 used, no cap", "$8.11 used, no cap")
+
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        entry = make_entry(spend=spend)
+        card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
+        assert "$8.11 used, no cap" in card, card
+        assert "usage unknown" not in card, card
+        mini = mini_account_text(make_account(2, entry=entry), time.time()).plain
+        assert "$$ $8.11 used, no cap" in mini, mini
 
     def test_no_data_no_rows(self):
         from claude_swap.tui.widgets import usage_rows
@@ -880,13 +909,7 @@ class TestUsageRows:
         from claude_swap.tui.widgets import account_card_text
 
         entry = make_entry(
-            spend={
-                "used": 12.5,
-                "limit": 50.0,
-                "pct": 25.0,
-                "currency": "USD",
-                "resets_at": _iso_in(7200),
-            }
+            spend=capped_spend(12.5, 50.0, 25.0, resets_at=_iso_in(7200))
         )
         acc = make_account(1, active=True, entry=entry)
 
@@ -894,10 +917,10 @@ class TestUsageRows:
         assert wide.count(" · ") == 3
 
         mid_lines = account_card_text(acc, 78).plain.splitlines()
-        spend_line = next(line for line in mid_lines if "$12.50" in line)
+        spend_line = next(line for line in mid_lines if "$37.50" in line)
         assert " · " not in spend_line
         for line in mid_lines:
-            if "resets" in line and "$12.50" not in line:
+            if "resets" in line and "$37.50" not in line:
                 assert " · " in line
 
         narrow = account_card_text(acc, 40).plain
@@ -1058,7 +1081,7 @@ class TestMiniAccountText:
         now = time.time()
         entry = make_entry(
             pct5=None, pct7=None, age_s=age_s,
-            spend={"used": 10.29, "limit": 20.0, "pct": 51.45, "currency": "USD"},
+            spend=capped_spend(10.29, 20.0, 51.45),
         )
         text = mini_account_text(make_account(1, entry=entry), now)
         out = text.plain
@@ -1066,7 +1089,7 @@ class TestMiniAccountText:
             f"a spend-only account still reads as unknown: {out!r}"
         )
         assert "51%" in out, out
-        assert "$10.29" in out and "$20.00" in out, out
+        assert "$9.71 left of $20.00" in out, out
         pct_span = next(s for s in text.spans if out[s.start : s.end] == "51%")
         assert ("dim" in str(pct_span.style)) == expect_dim, (
             f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
@@ -1134,7 +1157,7 @@ class TestMiniAccountText:
         now = time.time()
         entry = make_entry(
             pct5=10.0, pct7=None,
-            spend={"used": 19.0, "limit": 20.0, "pct": 95.0, "currency": "USD"},
+            spend=capped_spend(19.0, 20.0, 95.0),
         )
         out = mini_account_text(make_account(1, entry=entry), now).plain
         assert "10%" in out, out
@@ -2921,7 +2944,7 @@ class TestAutoScreen:
                     7, kind="api_key",
                     entry=make_entry(
                         pct5=None, pct7=None,
-                        spend={"used": 1.0, "limit": 100.0, "pct": 1.0, "currency": "USD"},
+                        spend=capped_spend(1.0, 100.0, 1.0),
                     ),
                 ),
             ],
@@ -3404,13 +3427,13 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
             self._acct("6", "paid@x.com", switchable=True, last_good={
-                "spend": {"pct": 51.45, "used": 10.29, "limit": 20.0},
+                "spend": capped_spend(10.29, 20.0, 51.45),
             }),
         ), active="1")
         assert "usage unknown" not in out, (
             f"a spend-only account still reads as unknown: {out!r}"
         )
-        assert "$10.29" in out and "$20.00" in out, out
+        assert "$9.71 left of $20.00" in out, out
         assert "51%" in out, out
 
     def test_a_spend_only_candidates_reset_agrees_with_the_dashboard(self):
@@ -3426,10 +3449,7 @@ class TestUnswitchableRowsAreListed:
         now = time.time()
         stale_usage = UsageEntry(
             last_good={
-                "spend": {
-                    "pct": 96.0, "used": 48.0, "limit": 50.0,
-                    "resets_at": _iso_in(-60),
-                },
+                "spend": capped_spend(48.0, 50.0, 96.0, resets_at=_iso_in(-60)),
             },
             fetched_at=now - 120,  # measured well before the reset fired
             age_s=120.0,
@@ -3472,7 +3492,7 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 95.0}, "seven_day": {"pct": 95.0},
             }),
             self._acct("6", "cheap@x.com", switchable=True, last_good={
-                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+                "spend": capped_spend(0.2, 20.0, 1.0),
             }),
         ), active="1")
         assert out.index("busy@x.com") < out.index("cheap@x.com"), (
@@ -3489,7 +3509,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
             self._acct("8", "credit@x.com", switchable=True, disabled=True,
                        last_good={
-                           "spend": {"pct": 45.0, "used": 207.69, "limit": 466.0},
+                           "spend": capped_spend(207.69, 466.0, 45.0),
                        }),
         ), active="1")
         assert "auto-swap disabled" in out, (
@@ -3503,7 +3523,7 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
             self._acct("6", "cheap@x.com", switchable=True, last_good={
-                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+                "spend": capped_spend(0.2, 20.0, 1.0),
             }),
         ), active="1")
         assert "auto-swap disabled" not in out, (
@@ -4388,11 +4408,11 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
             self._acct("2", "b@x.com", switchable=True, last_good={
-                "spend": {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"},
+                "spend": capped_spend(12.5, 50.0, 25.0),
             }),
         ), active="1")
         assert "$$" in out, out
-        assert "$12.50 / $50.00" in out, out
+        assert "$37.50 left of $50.00" in out, out
         assert "reset unknown" not in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(

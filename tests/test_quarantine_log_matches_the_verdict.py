@@ -29,7 +29,7 @@ def _struck(tmp_path, gap, caplog, strikes=1):
     """Land `strikes` strikes `gap` seconds after a success; return (entry, lines)."""
     store = UsageStore(tmp_path)
     now = time.time()
-    store.path.write_text(json.dumps({"schemaVersion": 2, "accounts": {"1": {
+    store.path.write_text(json.dumps({"schemaVersion": 3, "accounts": {"1": {
         "email": "a@example.com", "organizationUuid": "",
         "fetchedAt": now - gap, "lastAttemptAt": now - gap,
         "lastGood": {"five_hour": {"pct": 5.0}},

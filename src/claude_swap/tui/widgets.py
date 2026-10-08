@@ -22,7 +22,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
 )
 from claude_swap.models import AccountSnapshot
-from claude_swap.switcher import ERROR_NOTES
+from claude_swap.switcher import ERROR_NOTES, spend_amounts
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
@@ -151,7 +151,7 @@ def usage_rows(
     rows: list[tuple[str, float, str, str]] = []
     spend = last_good.get("spend")
     if spend:
-        amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
+        amounts = spend_amounts(spend)
         # A monthly budget the server never reported a reset for has no
         # usage-window reset to name at all -- unlike 5h/7d/scoped, this
         # is not a gap in a real countdown, so it reads its own truth
@@ -160,7 +160,10 @@ def usage_rows(
         if spend.get("resets_at"):
             reset, reset_full = _reset_parts(spend, now, fetched_at, entry=entry)
             suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
-        rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
+        # pct is None for an uncapped account (no cap to be a share of);
+        # every renderer of this row branches on it.
+        pct = float(spend["pct"]) if spend["pct"] is not None else None
+        rows.append((SPEND_LABEL, pct, suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
@@ -320,6 +323,12 @@ def account_card_text(
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
             suffix = suffix_full
         text.append("\n    ")
+        if pct is None and label == SPEND_LABEL:
+            # No percent to draw a bar for: `usage_bar` reads None as
+            # "usage unknown", but the money words say exactly what is known.
+            text.append(f"{label:<{label_width}} ", style=palette.muted)
+            text.append(suffix, style=palette.muted)
+            continue
         text.append(
             usage_bar(
                 f"{label:<{label_width}}",
@@ -456,10 +465,12 @@ def mini_account_text(
         if parts:
             text.append(" · ", style=palette.track)
         _label, pct, suffix, _full = spend
-        color = palette.severity(pct)
         text.append("$$ ", style=palette.muted)
-        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
-        text.append(f" · {suffix}", style=palette.muted)
+        if pct is not None:
+            color = palette.severity(pct)
+            text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+            text.append(" · ", style=palette.muted)
+        text.append(suffix, style=palette.muted)
         parts += 1
     if not parts:
         # Nothing above rendered — every source `usage_rows` draws from

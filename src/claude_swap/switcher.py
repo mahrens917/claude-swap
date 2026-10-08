@@ -189,6 +189,34 @@ def _pace_marker(window: dict, fetched_at: float | None) -> str:
     return "  (ahead of pace)" if result and result.ahead else ""
 
 
+def spend_row_body(spend: dict) -> str:
+    """The ``$$`` row body: usage-credit money left, not money spent.
+
+    ``$591.89 left of $600.00`` under a cap, ``$8.11 used, no cap`` for an
+    uncapped account (``limit`` None), ``cap reached ($600.00)`` once the API
+    says the cap is hit. The percent leads when the API sent one.
+    """
+    pct = spend["pct"]
+    parts = [f"{pct:>3.0f}%"] if pct is not None else []
+    cell = oauth.fresh_reset_strings(spend)
+    if cell:
+        parts.append(f"resets {cell[1]:<12}")
+    parts.append(spend_amounts(spend))
+    return "   ".join(parts)
+
+
+def spend_amounts(spend: dict) -> str:
+    """The money words of a ``spend`` figure, shared by ``cswap list`` and
+    the dashboard: ``$591.89 left of $600.00``, ``$8.11 used, no cap``
+    (``limit`` None), or ``cap reached ($600.00)``."""
+    limit = spend["limit"]
+    if spend["limit_reached"]:
+        return f"cap reached (${limit:,.2f})" if limit is not None else "cap reached"
+    if limit is None:
+        return f"${spend['used']:,.2f} used, no cap"
+    return f"${spend['remaining']:,.2f} left of ${limit:,.2f}"
+
+
 def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str, str]]:
     """(label, body) rows for one usage measurement, unpadded.
 
@@ -199,14 +227,7 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
     rows: list[tuple[str, str]] = []
     spend = usage.get("spend")
     if spend:
-        used = spend["used"]
-        limit = spend["limit"]
-        pct = spend["pct"]
-        cell = oauth.fresh_reset_strings(spend)
-        if cell:
-            rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
-        else:
-            rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+        rows.append(("$$", spend_row_body(spend)))
     for label, w in (("5h", usage.get("five_hour")), ("7d", usage.get("seven_day"))):
         if w:
             # Pace only applies to the weekly (7d) window, never 5h (issue #125).

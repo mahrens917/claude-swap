@@ -11984,8 +11984,10 @@ class TestFormatUsageLines:
             "spend": {
                 "used": 1.0,
                 "limit": 10.0,
+                "remaining": 9.0,
                 "pct": 10.0,
                 "currency": "USD",
+                "limit_reached": False,
                 "resets_at": resets_at,
                 "clock": "stale-clock",
             }

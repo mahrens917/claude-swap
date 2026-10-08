@@ -348,6 +348,7 @@ class TestFetchUsage:
                 "monthly_limit": 500000,
                 "utilization": 14.58,
                 "currency": "USD",
+                "spend_limit_reached": False,
             },
         })
         assert result is not None
@@ -355,26 +356,100 @@ class TestFetchUsage:
         assert result["seven_day"]["pct"] == 61.0
         assert result["spend"]["used"] == 729.0
         assert result["spend"]["limit"] == 5000.0
+        assert result["spend"]["remaining"] == 4271.0
         assert result["spend"]["pct"] == 14.58
         assert result["spend"]["currency"] == "USD"
+        assert result["spend"]["limit_reached"] is False
 
-    def test_extra_usage_unlimited_keeps_other_rows(self):
-        """Unlimited (monthly_limit=None) drops the spend entry without losing five_hour/seven_day."""
+    def test_extra_usage_real_sample_reads_money_left(self):
+        """Asserts: the measured response shape (60000 cents cap, 811 used)
+        reads as $591.89 left of $600.00, cap not reached."""
+        result = oauth.build_usage_result({
+            "five_hour": {"utilization": 100.0, "resets_at": None},
+            "extra_usage": {
+                "is_enabled": True, "monthly_limit": 60000, "used_credits": 811.0,
+                "utilization": 1.35, "currency": "USD", "decimal_places": 2,
+                "disabled_reason": None, "user_disabled": False,
+                "spend_limit_reached": False, "credits_ever_enabled": True,
+                "daily": None, "weekly": None,
+            },
+        })
+        assert result["spend"]["limit"] == 600.0
+        assert result["spend"]["remaining"] == pytest.approx(591.89)
+        assert oauth.usage_credit_room(result) == oauth.UsageCreditRoom(
+            remaining=pytest.approx(591.89)
+        )
+
+    def test_extra_usage_unlimited_keeps_spend_with_no_cap(self):
+        """Asserts: an uncapped account (monthly_limit=None) keeps its spend
+        object with limit, remaining and pct None, and ranks as unlimited
+        credit room; five_hour/seven_day are untouched."""
         result = self._fetch_with_response({
             "five_hour": {"utilization": 22.0, "resets_at": None},
             "seven_day": {"utilization": 61.0, "resets_at": None},
             "extra_usage": {
                 "is_enabled": True,
-                "used_credits": 72900,
+                "used_credits": 811,
                 "monthly_limit": None,
                 "utilization": None,
                 "currency": "USD",
+                "spend_limit_reached": False,
             },
         })
         assert result is not None
         assert result["five_hour"]["pct"] == 22.0
         assert result["seven_day"]["pct"] == 61.0
+        assert result["spend"] == {
+            "used": 8.11, "limit": None, "remaining": None, "pct": None,
+            "currency": "USD", "limit_reached": False,
+        }
+        room = oauth.usage_credit_room(result)
+        assert room == oauth.UsageCreditRoom(remaining=None)
+        assert room.rank_key() > oauth.UsageCreditRoom(remaining=1e9).rank_key()
+
+    def test_extra_usage_limit_reached_has_no_credit_room(self):
+        """Asserts: the API's spend_limit_reached verdict keeps the figure
+        for display but leaves the account no usage-credit room."""
+        result = oauth.build_usage_result({
+            "extra_usage": {
+                "is_enabled": True, "used_credits": 60000, "monthly_limit": 60000,
+                "utilization": 100.0, "currency": "USD",
+                "spend_limit_reached": True,
+            },
+        })
+        assert result["spend"]["limit_reached"] is True
+        assert result["spend"]["remaining"] == 0.0
+        assert oauth.usage_credit_room(result) is None
+
+    def test_spent_down_cap_has_no_credit_room_without_the_verdict(self):
+        """Asserts: remaining <= 0 is no room even when the API has not yet
+        flipped spend_limit_reached."""
+        usage = {"spend": {"used": 600.0, "limit": 600.0, "remaining": 0.0,
+                           "pct": 100.0, "currency": "USD", "limit_reached": False}}
+        assert oauth.usage_credit_room(usage) is None
+
+    def test_credits_off_has_no_credit_room(self):
+        """Asserts: no spend object (extra usage disabled) is no room."""
+        assert oauth.usage_credit_room({"five_hour": {"pct": 100.0}}) is None
+        assert oauth.usage_credit_room(None) is None
+
+    def test_enabled_extra_usage_missing_its_verdict_warns_and_drops(self, caplog):
+        """Asserts: an enabled extra_usage block without spend_limit_reached is
+        unreadable, logged at WARNING, and yields no spend figure rather than
+        a guessed one."""
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            result = oauth.build_usage_result({
+                "five_hour": {"utilization": 5.0, "resets_at": None},
+                "extra_usage": {
+                    "is_enabled": True, "used_credits": 1, "monthly_limit": 100,
+                    "utilization": 1.0, "currency": "USD",
+                },
+            })
         assert "spend" not in result
+        assert any(
+            r.levelno == logging.WARNING and "extra_usage is enabled but unreadable"
+            in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
 
     def test_extra_usage_partial_keeps_other_rows(self):
         """A null in used_credits leaves the rest of the response untouched."""

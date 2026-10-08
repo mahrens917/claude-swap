@@ -74,7 +74,7 @@ class TestSchema:
     def test_round_trip(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         raw = json.loads(store.path.read_text(encoding="utf-8"))
-        assert raw["schemaVersion"] == 2
+        assert raw["schemaVersion"] == 3
         row = raw["accounts"]["1"]
         assert row["email"] == "a@x.com"
         assert row["lastGood"] == USAGE
@@ -396,7 +396,7 @@ class TestBackoff:
         store.path.write_text(
             json.dumps(
                 {
-                    "schemaVersion": 2,
+                    "schemaVersion": 3,
                     "accounts": {
                         "1": {
                             "email": "a@x.com",
@@ -1391,7 +1391,7 @@ class TestAttemptLedger:
         row.update(fields)
         rows[num] = row
         store.path.write_text(
-            json.dumps({"schemaVersion": 2, "accounts": rows}), encoding="utf-8"
+            json.dumps({"schemaVersion": 3, "accounts": rows}), encoding="utf-8"
         )
 
     def test_at_cap_blocks_reserve_in_both_modes(self, store, clock):
@@ -1572,7 +1572,7 @@ class TestHeaderReading:
         # untested independent of the consecutiveFailures one below.
         store.path.parent.mkdir(parents=True, exist_ok=True)
         store.path.write_text(json.dumps({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "accounts": {
                 "1": {
                     "email": IDENT["1"][0],
@@ -1605,7 +1605,7 @@ class TestHeaderReading:
         # failure that carries no information about the strike.
         store.path.parent.mkdir(parents=True, exist_ok=True)
         store.path.write_text(json.dumps({
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "accounts": {
                 "1": {
                     "email": IDENT["1"][0],

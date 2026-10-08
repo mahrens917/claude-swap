@@ -37,7 +37,8 @@ class TestJsonHelpers:
             "five_hour": {"pct": 25.0, "resets_at": resets_at,
                           "countdown": "4h", "clock": "02:00"},
             "seven_day": {"pct": 16.0},
-            "spend": {"used": 12.5, "limit": 300.0, "pct": 4.0, "currency": "USD",
+            "spend": {"used": 12.5, "limit": 300.0, "remaining": 287.5, "pct": 4.0,
+                      "currency": "USD", "limit_reached": False,
                       "resets_at": resets_at},
         }
         out = usage_to_json(usage)
@@ -94,7 +95,8 @@ class TestJsonHelpers:
     def test_usage_to_json_recomputes_spend_strings(self):
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
-        usage = {"spend": {"used": 1.0, "limit": 10.0, "pct": 10.0, "currency": "USD",
+        usage = {"spend": {"used": 1.0, "limit": 10.0, "remaining": 9.0, "pct": 10.0,
+                           "currency": "USD", "limit_reached": False,
                            "resets_at": resets_at,
                            "countdown": "stale", "clock": "stale-clock"}}
         out = usage_to_json(usage)
@@ -935,7 +937,8 @@ class TestUsageFromJson:
     INTERNAL = {
         "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
         "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
-        "spend": {"used": 5.0, "limit": 50.0, "pct": 10.0, "currency": "USD",
+        "spend": {"used": 5.0, "limit": 50.0, "remaining": 45.0, "pct": 10.0,
+                  "currency": "USD", "limit_reached": False,
                   "resets_at": "2099-02-01T00:00:00+00:00"},
         "scoped": [{"name": "Fable", "pct": 30.0,
                     "resets_at": "2099-01-07T00:00:00+00:00"}],
@@ -976,3 +979,57 @@ class TestUsageFromJson:
 
         with pytest.raises(ValueError):
             usage_from_json(usage)
+
+    def test_an_uncapped_spend_round_trips_with_null_limit(self):
+        """Asserts: an account with no monthly cap carries ``limit``,
+        ``remaining`` and ``pct`` as null through ``list --json`` and back,
+        so ``import-usage`` reads it as uncapped money, not a parse error."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "five_hour": {"pct": 100.0},
+            "spend": {"used": 8.11, "limit": None, "remaining": None, "pct": None,
+                      "currency": "USD", "limit_reached": False},
+        }
+        out = usage_to_json(internal)
+        assert out["spend"] == {
+            "used": 8.11, "limit": None, "remaining": None, "pct": None,
+            "currency": "USD", "limitReached": False,
+        }
+        assert usage_from_json(out) == internal
+
+    def test_a_capped_spend_projects_remaining_and_limit_reached(self):
+        """Asserts: the JSON ``spend`` object names the dollars left under the
+        cap as ``remaining`` and the API's cap verdict as ``limitReached``."""
+        from claude_swap.json_output import usage_to_json
+
+        out = usage_to_json({
+            "spend": {"used": 8.11, "limit": 600.0, "remaining": 591.89, "pct": 1.0,
+                      "currency": "USD", "limit_reached": False},
+        })
+        assert out["spend"]["remaining"] == 591.89
+        assert out["spend"]["limitReached"] is False
+
+    @pytest.mark.parametrize("spend", [
+        # remaining disagrees with limit - used: an edited document claiming money
+        {"used": 1, "limit": 10, "remaining": 50, "pct": 10, "currency": "USD",
+         "limitReached": False},
+        # a finite cap with no remaining figure
+        {"used": 1, "limit": 10, "remaining": None, "pct": 10, "currency": "USD",
+         "limitReached": False},
+        # no cap but a remaining figure
+        {"used": 1, "limit": None, "remaining": 5, "pct": None, "currency": "USD",
+         "limitReached": False},
+        # the cap verdict missing
+        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD"},
+        # remaining key absent rather than null
+        {"used": 1, "limit": None, "pct": None, "currency": "USD",
+         "limitReached": False},
+    ])
+    def test_an_inconsistent_spend_is_refused(self, spend):
+        """Asserts: a ``spend`` object whose cap, remainder and verdict do not
+        agree is refused before anything is written."""
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json({"spend": spend})
