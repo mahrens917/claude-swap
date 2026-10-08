@@ -369,9 +369,12 @@ def account_row(
     disabled: bool = False,
     login_expires_at: str | None = None,
     login_kind: str,
+    switch_threshold: float,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
-    backoff only; a lapsed one is the caller's to withhold."""
+    backoff only; a lapsed one is the caller's to withhold.
+    ``switch_threshold`` is the account's own switch point in percent
+    (``settings.account_switch_point``)."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -400,6 +403,10 @@ def account_row(
     # `cswap add-token`; its expiry is the recorded add time plus a year) or
     # "api-key" (no login to expire).
     row["loginKind"] = login_kind
+    # The utilization pct the auto engine switches this account away at:
+    # `autoswitch.creditThreshold` while its stored reading has usage-credit
+    # room, else `autoswitch.threshold`, read from settings.json.
+    row["switchThreshold"] = switch_threshold
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:

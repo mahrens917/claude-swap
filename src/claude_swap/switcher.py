@@ -102,7 +102,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    account_switch_point,
+    load_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     ClientUsageAnswer,
     FetchRecord,
@@ -10599,6 +10604,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
+        settings = load_settings(self.backup_dir)
         for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
@@ -10640,6 +10646,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=self._login_expires_at_iso(str(num), creds),
                     login_kind=self._login_kind(str(num), creds),
+                    switch_threshold=account_switch_point(settings, entry),
                 )
             )
         payload = {

@@ -2451,6 +2451,7 @@ def _usage_row(email: str, org_uuid: str = "", pct: float = 42.0, age_s: float =
         usage_fetched_at=time.time() - age_s,
         usage_age_s=age_s,
         login_kind="oauth",
+        switch_threshold=90.0,
     )
 
 

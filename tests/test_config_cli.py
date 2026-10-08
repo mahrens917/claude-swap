@@ -151,6 +151,34 @@ class TestConfigSetGet:
             }
 
 
+class TestConfigCreditThreshold:
+    """`autoswitch.creditThreshold` through `cswap config` (X3587)."""
+
+    def test_get_unset_reads_none(self, temp_home, capsys):
+        """Asserts: an unset creditThreshold reads `(none)`, and its JSON
+        value is null."""
+        code, out, _ = _run(["get", "autoswitch.creditThreshold"], capsys)
+        assert code == 0
+        assert out.strip() == "(none)"
+        code, out, _ = _run(
+            ["get", "autoswitch.creditThreshold", "--json"], capsys
+        )
+        assert code == 0
+        assert json.loads(out)["value"] is None
+
+    def test_set_100_then_get(self, temp_home, capsys):
+        """Asserts: `config set autoswitch.creditThreshold 100` succeeds and
+        reads back 100, while the same 100 for threshold exits 1."""
+        code, out, _ = _run(["set", "autoswitch.creditThreshold", "100"], capsys)
+        assert code == 0
+        assert "autoswitch.creditThreshold = 100" in out
+        code, out, _ = _run(["get", "autoswitch.creditThreshold"], capsys)
+        assert out.strip() == "100"
+        code, _, err = _run(["set", "autoswitch.threshold", "100"], capsys)
+        assert code == 1
+        assert "between 50 and 99.9" in err
+
+
 class TestConfigValidation:
     def test_out_of_range_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.threshold", "30"], capsys)

@@ -846,6 +846,21 @@ def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
     return UsageCreditRoom(remaining=remaining)
 
 
+def entry_credit_room(entry) -> UsageCreditRoom | None:
+    """Usage-credit room from an account's stored measurement (a
+    ``usage_store.UsageEntry``, or None for an account with no row).
+
+    Read off ``last_good``, not the decision value: a walled or header-only
+    row's decision value is rebuilt from its windows alone and carries no
+    ``spend`` object, and the walled row is exactly the at-limit account
+    whose credits matter. A sentinel row (expired, relogin) cannot run
+    sessions, so it has no room.
+    """
+    if entry is None or entry.sentinel is not None:
+        return None
+    return usage_credit_room(entry.last_good)
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))

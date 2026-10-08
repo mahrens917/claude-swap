@@ -18,6 +18,7 @@ from claude_swap.settings import (
     atomic_write_json,
     AutoSwitchSettings,
     UiSettings,
+    account_switch_point,
     effective_settings,
     load_settings,
     load_ui_settings,
@@ -27,6 +28,7 @@ from claude_swap.settings import (
     settings_path,
     unset_setting,
 )
+from claude_swap.usage_store import UsageEntry
 
 
 def _args(**kwargs) -> argparse.Namespace:
@@ -523,3 +525,95 @@ class TestTheWrittenFileLandsAt0600:
         finally:
             os.umask(previous)
         assert oct(p.stat().st_mode & 0o777) == "0o600"
+
+
+class TestCreditThreshold:
+    """`autoswitch.creditThreshold` (X3587): the switch point for an account
+    holding usage-credit room, allowed up to and including 100."""
+
+    def test_default_is_unset(self, tmp_path: Path):
+        """Asserts: with no key in the file the setting reads None, meaning
+        "same as threshold"."""
+        assert load_settings(tmp_path).credit_threshold is None
+
+    def test_set_accepts_100(self, tmp_path: Path):
+        """Asserts: `config set` takes 100 for creditThreshold and the load
+        reads it back unclamped."""
+        assert set_setting(tmp_path, "autoswitch.creditThreshold", "100") == 100.0
+        assert load_settings(tmp_path).credit_threshold == 100.0
+
+    def test_threshold_still_rejects_100(self, tmp_path: Path):
+        """Asserts: the plain threshold keeps its range below 100."""
+        with pytest.raises(ConfigError, match="between 50 and 99.9"):
+            set_setting(tmp_path, "autoswitch.threshold", "100")
+
+    def test_set_rejects_above_100_and_below_the_threshold_floor(self, tmp_path: Path):
+        """Asserts: creditThreshold refuses 100.5 and 49, the same floor as
+        threshold's, without writing the file."""
+        for raw in ("100.5", "49"):
+            with pytest.raises(ConfigError, match="between 50 and 100"):
+                set_setting(tmp_path, "autoswitch.creditThreshold", raw)
+        assert not settings_path(tmp_path).exists()
+
+    def test_load_clamps_and_keeps_null(self, tmp_path: Path):
+        """Asserts: a hand-written 120 clamps to 100 and an explicit null
+        reads as unset."""
+        path = settings_path(tmp_path)
+        path.write_text(json.dumps({"autoswitch": {"creditThreshold": 120}}))
+        assert load_settings(tmp_path).credit_threshold == 100.0
+        path.write_text(json.dumps({"autoswitch": {"creditThreshold": None}}))
+        assert load_settings(tmp_path).credit_threshold is None
+
+    def test_unset_returns_to_none(self, tmp_path: Path):
+        """Asserts: `config unset` removes the key and the setting reads None."""
+        set_setting(tmp_path, "autoswitch.creditThreshold", "100")
+        assert unset_setting(tmp_path, "autoswitch.creditThreshold") is True
+        assert load_settings(tmp_path).credit_threshold is None
+
+
+def _credit_entry(*, remaining: float | None = 50.0, reached: bool = False,
+                  sentinel: str | None = None) -> UsageEntry:
+    spend = {
+        "used": 10.0,
+        "limit": None if remaining is None else 10.0 + remaining,
+        "remaining": remaining,
+        "pct": None,
+        "currency": "USD",
+        "limit_reached": reached,
+    }
+    return UsageEntry(
+        sentinel=sentinel,
+        last_good={"five_hour": {"pct": 99.5}, "spend": spend},
+    )
+
+
+class TestAccountSwitchPoint:
+    """`account_switch_point`: creditThreshold for an account with credit
+    room, threshold for every other one."""
+
+    def test_credit_room_reads_the_credit_threshold(self):
+        """Asserts: a stored reading with money left under the cap, and one
+        with no cap, both switch at creditThreshold."""
+        s = AutoSwitchSettings(threshold=99.0, credit_threshold=100.0)
+        assert account_switch_point(s, _credit_entry()) == 100.0
+        assert account_switch_point(s, _credit_entry(remaining=None)) == 100.0
+
+    def test_no_room_reads_the_plain_threshold(self):
+        """Asserts: no row, no spend object, a reached cap, no money left and
+        a sentinel row all switch at the plain threshold."""
+        s = AutoSwitchSettings(threshold=99.0, credit_threshold=100.0)
+        assert account_switch_point(s, None) == 99.0
+        assert account_switch_point(
+            s, UsageEntry(last_good={"five_hour": {"pct": 99.5}})
+        ) == 99.0
+        assert account_switch_point(s, _credit_entry(reached=True)) == 99.0
+        assert account_switch_point(s, _credit_entry(remaining=0.0)) == 99.0
+        assert account_switch_point(
+            s, _credit_entry(sentinel="relogin_required")
+        ) == 99.0
+
+    def test_unset_credit_threshold_is_the_threshold_for_every_account(self):
+        """Asserts: with creditThreshold unset, an account holding credits
+        still switches at threshold, the rule before X3587."""
+        s = AutoSwitchSettings(threshold=99.0)
+        assert account_switch_point(s, _credit_entry()) == 99.0

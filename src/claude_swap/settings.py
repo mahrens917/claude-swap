@@ -20,6 +20,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap import oauth
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import replace_with_retry, write_all
 
@@ -72,6 +73,14 @@ class AutoSwitchSettings:
     # `dynamic` only: how long a healthy active is held before rotating to a
     # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
     alternation_chunk_seconds: float = 600.0
+    # The switch point for an account whose stored reading has usage-credit
+    # room (credits on, monthly cap not reached, money left). Such an account
+    # keeps answering past its window limit on paid credits, so its last
+    # points are safe to spend; an account without credits refuses requests
+    # once full, until the next poll moves the sessions. None means "same as
+    # `threshold`". Unlike `threshold` it may be 100. Read per account
+    # through :func:`account_switch_point`.
+    credit_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +130,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct "
             "(dynamic: fixed near 97% instead; still gates blackout/cadence)",
+        ),
+        SettingSpec(
+            "autoswitch", "creditThreshold", "credit_threshold", "float", 50.0, 100.0,
+            help="Switch point for an account with usage credits left "
+            "(may be 100); unset means the same as threshold",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -198,6 +212,22 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
         if name and name.lower() not in seen:
             seen[name.lower()] = name
     return tuple(seen.values())
+
+
+def account_switch_point(settings: AutoSwitchSettings, entry) -> float:
+    """The utilization pct at which this account is switched away from.
+
+    ``credit_threshold`` when it is set and the account's stored reading has
+    usage-credit room (:func:`oauth.entry_credit_room`), else ``threshold``.
+    ``entry`` is the account's ``UsageEntry`` (None when it has none, which
+    holds no credit room). The auto engine and ``cswap list --json``'s
+    ``switchThreshold`` both read it here, so the two cannot disagree.
+    """
+    if settings.credit_threshold is None:
+        return settings.threshold
+    if oauth.entry_credit_room(entry) is None:
+        return settings.threshold
+    return settings.credit_threshold
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:

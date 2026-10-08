@@ -11,7 +11,9 @@ from claude_swap.autoswitch import (
     SpendingUsageCreditsEvent,
     SwitchEvent,
 )
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import _format_usage_lines, spend_row_body
+from claude_swap.usage_store import UsageEntry
 from tests.test_autoswitch import EngineHarness, TickOutcome
 
 _CREDITS_LINE = "sessions run on Account-"
@@ -257,3 +259,189 @@ class TestMoneyLeftRow:
             spend={"8": _spend(None)},
         )
         assert "#8: $$ $8.11 used, no cap" in event.human()
+
+
+_LOST_ROOM_LINE = "lost its usage-credit room"
+
+
+def _near_full(pct: float = 99.5, spend: dict | None = None) -> dict:
+    usage: dict = {"five_hour": {"pct": pct}, "seven_day": {"pct": 40.0}}
+    if spend is not None:
+        usage["spend"] = spend
+    return usage
+
+
+def _credit_harness(temp_home, **settings) -> EngineHarness:
+    h = EngineHarness(temp_home, strategy="best", threshold=99.0, **settings)
+    h.seed(1, "a@example.com")
+    h.seed(2, "b@example.com")
+    h.seed(3, "c@example.com")
+    h.make_live("a@example.com", 1)
+    return h
+
+
+class TestCreditSwitchPoint:
+    """X3587: an account with usage-credit room switches at creditThreshold,
+    every other account at threshold."""
+
+    def test_an_account_with_credit_room_holds_at_99_5(self, temp_home):
+        """Asserts: threshold 99, creditThreshold 100, the active at 99.5
+        with money left: no switch, and the below-threshold line names its
+        own switch point of 100."""
+        h = _credit_harness(temp_home, credit_threshold=100.0)
+        outcome = h.tick_with_usage({
+            "1": _near_full(spend=_spend(50.0)), "2": _open(), "3": _open(),
+        })
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        assert h.active_number() == 1
+        no_switch = next(e for e in h.events if e.kind == "no-switch")
+        assert no_switch.reason == "below-threshold"
+        assert no_switch.detail == "99.5% < 100%"
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.switch_bar == 100.0
+        assert poll.switch_bars == {"1": 100.0, "2": 99.0, "3": 99.0}
+        assert poll.to_json()["switchBarsPct"] == poll.switch_bars
+        assert "(switch at 100%)" in poll.human()
+
+    def test_an_account_without_credits_switches_at_99_5(self, temp_home):
+        """Asserts: the same 99.5 on an account with no usage credits is past
+        its plain threshold of 99, so the engine switches proactively."""
+        h = _credit_harness(temp_home, credit_threshold=100.0)
+        outcome = h.tick_with_usage({
+            "1": _near_full(), "2": _open(), "3": _open(),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() != 1
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_a_reached_cap_switches_at_the_plain_threshold(self, temp_home):
+        """Asserts: credits on but the monthly cap reached is no credit room,
+        so 99.5 switches at threshold 99."""
+        h = _credit_harness(temp_home, credit_threshold=100.0)
+        outcome = h.tick_with_usage({
+            "1": _near_full(spend=_spend(5.0, reached=True)),
+            "2": _open(), "3": _open(),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+
+    def test_unset_credit_threshold_switches_a_credit_account_as_before(
+        self, temp_home
+    ):
+        """Asserts: with creditThreshold unset, an active holding credits at
+        99.5 switches at threshold 99, and the poll line reads 99 for every
+        account."""
+        h = _credit_harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _near_full(spend=_spend(50.0)), "2": _open(), "3": _open(),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert poll.switch_bar == 99.0
+        assert set(poll.switch_bars.values()) == {99.0}
+
+    def test_every_account_above_reads_each_accounts_own_point(self, temp_home):
+        """Asserts: the every-account-above-threshold state reads per-account
+        switch points: an active at 99.5 without credits and a peer at 99.5
+        WITH credits is not that state, because the peer sits below its own
+        point of 100, so the peer is a healthy landing (the plain rule would
+        have ranked on recovery instead)."""
+        h = _credit_harness(temp_home, credit_threshold=100.0, hysteresis_pct=0.0)
+        engine = h.engine
+        entries = {
+            "1": UsageEntry(last_good=_near_full(), fetched_at=0.0, age_s=0.0),
+            "2": UsageEntry(
+                last_good=_near_full(99.0, _spend(50.0)), fetched_at=0.0, age_s=0.0
+            ),
+        }
+        usage = {num: e.last_good for num, e in entries.items()}
+        headroom = {"1": 0.5, "2": 1.0}
+        ordered, _known, _reset, waiting = engine._rank_candidates(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current="1",
+            active_headroom=0.5,
+            settings=h.settings,
+            now=h.clock.now,
+            entries=entries,
+        )
+        assert ordered == ["2"]
+        assert waiting is False
+        plain, _, _, _ = engine._rank_candidates(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current="1",
+            active_headroom=0.5,
+            settings=AutoSwitchSettings(
+                strategy="best", threshold=99.0, hysteresis_pct=0.0
+            ),
+            now=h.clock.now,
+            entries=entries,
+        )
+        assert plain == []
+
+
+class TestLostCreditRoomAlarm:
+    """X3587 alarm: an active held past threshold on its credits that loses
+    the room while still over threshold logs a WARNING."""
+
+    def test_room_gone_under_a_held_account_warns(self, temp_home, caplog):
+        """Asserts: tick 1 holds the active at 99.5 on its credits; tick 2
+        reads the cap reached at 99.6, logs one WARNING naming the account,
+        its usage and the plain threshold, and switches."""
+        h = _credit_harness(temp_home, credit_threshold=100.0)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            first = h.tick_with_usage({
+                "1": _near_full(spend=_spend(1.0)), "2": _open(), "3": _open(),
+            })
+            assert first is TickOutcome.NO_ACTION, h.kinds()
+            assert _warnings(caplog, _LOST_ROOM_LINE) == []
+            h.clock.advance(60)
+            second = h.tick_with_usage({
+                "1": _near_full(99.6, _spend(0.0, reached=True)),
+                "2": _open(), "3": _open(),
+            })
+        assert second is TickOutcome.SWITCHED, h.kinds()
+        assert _warnings(caplog, _LOST_ROOM_LINE) == [
+            "Account-1 lost its usage-credit room at 99.6% used; it now "
+            "switches at the plain threshold 99%"
+        ]
+
+    def test_a_healthy_credit_pool_stays_quiet(self, temp_home, caplog):
+        """Asserts: two held ticks with money left, and a credit account that
+        loses its room while BELOW threshold, raise no alarm."""
+        h = _credit_harness(temp_home, credit_threshold=100.0)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            for _ in range(2):
+                h.tick_with_usage({
+                    "1": _near_full(spend=_spend(30.0)), "2": _open(), "3": _open(),
+                })
+                h.clock.advance(60)
+            h.tick_with_usage({
+                "1": _near_full(50.0, _spend(0.0, reached=True)),
+                "2": _open(), "3": _open(),
+            })
+        assert _warnings(caplog, _LOST_ROOM_LINE) == []
+
+    def test_no_alarm_without_a_credit_threshold(self, temp_home, caplog):
+        """Asserts: with creditThreshold unset nothing is ever held on
+        credits, so a cap reached over threshold raises no alarm."""
+        h = _credit_harness(temp_home)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            h.tick_with_usage({
+                "1": _near_full(98.0, _spend(1.0)), "2": _open(), "3": _open(),
+            })
+            h.clock.advance(60)
+            h.tick_with_usage({
+                "1": _near_full(99.5, _spend(0.0, reached=True)),
+                "2": _open(), "3": _open(),
+            })
+        assert _warnings(caplog, _LOST_ROOM_LINE) == []

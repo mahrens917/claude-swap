@@ -23,7 +23,9 @@ from claude_swap.json_output import (
 )
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.models import Platform
+from claude_swap.settings import set_setting, unset_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.usage_store import UsageEntry
 
 
 # --------------------------------------------------------------------------- #
@@ -169,27 +171,27 @@ class TestJsonHelpers:
     def test_account_row_includes_alias_when_set(self):
         from claude_swap.json_output import account_row
 
-        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth", alias="dev")
+        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth", switch_threshold=90.0, alias="dev")
         assert row["alias"] == "dev"
 
     def test_account_row_omits_alias_when_unset(self):
         from claude_swap.json_output import account_row
 
-        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth")
+        row = account_row(1, "a@x.com", "", "", True, None, login_kind="oauth", switch_threshold=90.0)
         assert "alias" not in row
 
     def test_account_row_includes_login_expiry_when_known(self):
         from claude_swap.json_output import account_row
 
         row = account_row(
-            1, "a@x.com", "", "", True, None, login_kind="oauth", login_expires_at="2026-10-08T01:06:36Z"
+            1, "a@x.com", "", "", True, None, login_kind="oauth", switch_threshold=90.0, login_expires_at="2026-10-08T01:06:36Z"
         )
         assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
     def test_account_row_omits_login_expiry_when_unknown(self):
         from claude_swap.json_output import account_row
 
-        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None, login_kind="oauth")
+        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None, login_kind="oauth", switch_threshold=90.0)
 
     @pytest.mark.parametrize("kind", ["oauth", "setup-token", "api-key"])
     def test_account_row_always_names_its_login_kind(self, kind):
@@ -197,7 +199,9 @@ class TestJsonHelpers:
         tell which renewal a near expiry needs."""
         from claude_swap.json_output import account_row
 
-        assert account_row(1, "a@x.com", "", "", True, None, login_kind=kind)[
+        assert account_row(
+            1, "a@x.com", "", "", True, None, login_kind=kind, switch_threshold=90.0
+        )[
             "loginKind"
         ] == kind
 
@@ -620,6 +624,37 @@ class TestStatusJson:
         assert active["usageStatus"] == list_row["usageStatus"] == "unavailable"
         assert active["usage"] == list_row["usage"] is None
 
+    def test_switch_threshold_is_each_accounts_own_switch_point(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Asserts: with threshold 99 and creditThreshold 100 in
+        settings.json, `--list --json` carries `switchThreshold` 100 for the
+        account with usage-credit room and 99 for the one without; with
+        creditThreshold unset both read 99."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        set_setting(switcher.backup_dir, "autoswitch.threshold", "99")
+        set_setting(switcher.backup_dir, "autoswitch.creditThreshold", "100")
+        now = time.time()
+        spend = {"used": 10.0, "limit": 60.0, "remaining": 50.0, "pct": 16.67,
+                 "currency": "USD", "limit_reached": False}
+        entries = {
+            "1": UsageEntry(last_good={"five_hour": {"pct": 99.5}, "spend": spend},
+                            fetched_at=now, age_s=0.0),
+            "2": UsageEntry(last_good={"five_hour": {"pct": 99.5}},
+                            fetched_at=now, age_s=0.0),
+        }
+        info = [
+            (1, "a@example.com", "", "", True, "", ""),
+            (2, "b@example.com", "", "", False, "", ""),
+        ]
+        rows = switcher._build_list_payload(info, entries)["accounts"]
+        assert [r["switchThreshold"] for r in rows] == [100.0, 99.0]
+        unset_setting(switcher.backup_dir, "autoswitch.creditThreshold")
+        rows = switcher._build_list_payload(info, entries)["accounts"]
+        assert [r["switchThreshold"] for r in rows] == [99.0, 99.0]
+
 
 # --------------------------------------------------------------------------- #
 # --switch / --switch-to --json
@@ -864,7 +899,7 @@ class TestAccountRowFailure:
 
     def test_unavailable_row_names_its_failure_and_retry(self):
         row = account_row(
-            2, "b@example.com", "", "", False, None, login_kind="oauth",
+            2, "b@example.com", "", "", False, None, login_kind="oauth", switch_threshold=90.0,
             last_error="http-429", backoff_until=1_800_000_000.0,
         )
         assert row["usageStatus"] == "unavailable"
@@ -872,12 +907,12 @@ class TestAccountRowFailure:
         assert row["usageRetryAt"] == "2027-01-15T08:00:00Z"
 
     def test_lapsed_backoff_leaves_only_the_error(self):
-        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", last_error="timeout")
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", switch_threshold=90.0, last_error="timeout")
         assert row["usageError"] == "timeout"
         assert "usageRetryAt" not in row
 
     def test_no_failure_adds_nothing(self):
-        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth")
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", switch_threshold=90.0)
         assert "usageError" not in row
         assert "usageRetryAt" not in row
 
@@ -888,7 +923,7 @@ class TestAccountRowFailure:
         """A served measurement or a sentinel already says what the row is;
         a failure left over from an earlier pass would only contradict it."""
         row = account_row(
-            2, "b@example.com", "", "", False, entry, login_kind="oauth",
+            2, "b@example.com", "", "", False, entry, login_kind="oauth", switch_threshold=90.0,
             usage_fetched_at=1_800_000_000.0,
             last_error="http-429", backoff_until=1_800_000_000.0,
         )
@@ -900,11 +935,11 @@ class TestAccountRowDisabled:
     """The additive ``disabled`` field on --list rows."""
 
     def test_disabled_true_included(self):
-        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", disabled=True)
+        row = account_row(2, "b@example.com", "", "", False, None, login_kind="oauth", switch_threshold=90.0, disabled=True)
         assert row["disabled"] is True
 
     def test_disabled_absent_by_default(self):
-        row = account_row(1, "a@example.com", "", "", False, None, login_kind="oauth")
+        row = account_row(1, "a@example.com", "", "", False, None, login_kind="oauth", switch_threshold=90.0)
         assert "disabled" not in row
 
 

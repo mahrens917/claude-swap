@@ -58,7 +58,12 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
+from claude_swap.settings import (
+    AutoSwitchSettings,
+    account_switch_point,
+    atomic_write_json,
+    parse_model_names,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, spend_row_body
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
@@ -807,6 +812,11 @@ class PollEvent(AutoSwitchEvent):
     # The used-% the proactive arm actually fires at (`proactive_switch_bar_pct`).
     # Additive field: absent (None) callers fall back to `threshold` below.
     switch_bar: float | None = None
+    # account number -> that account's own switch bar: an account with
+    # usage-credit room switches at `credit_threshold`, the rest at
+    # `threshold` (X3587), each through `proactive_switch_bar_pct`. Additive
+    # field: a candidate absent from it reads `switch_bar` as before.
+    switch_bars: dict[str, float] = field(default_factory=dict)
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -831,6 +841,8 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.switch_bar is not None:
             fields["switchBar"] = self.switch_bar
+        if self.switch_bars:
+            fields["switchBarsPct"] = self.switch_bars
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -838,6 +850,12 @@ class PollEvent(AutoSwitchEvent):
         if self.spend:
             fields["spend"] = self.spend
         return fields
+
+    def _bar_for(self, num: str) -> float:
+        """The switch bar this event carries for account ``num``."""
+        if num in self.switch_bars:
+            return self.switch_bars[num]
+        return self.switch_bar if self.switch_bar is not None else self.threshold
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
@@ -849,10 +867,7 @@ class PollEvent(AutoSwitchEvent):
             # Same fallback as `human()` below (#321): `switch_bar`, the
             # strategy-aware landing bar, when the event carries one, never
             # the raw `threshold` alone under `dynamic`.
-            kind, model = classify_candidate_block(
-                wins.items(),
-                self.switch_bar if self.switch_bar is not None else self.threshold,
-            )
+            kind, model = classify_candidate_block(wins.items(), self._bar_for(num))
             if kind == "full":
                 text += f" ({model} full)"
             elif kind == "model":
@@ -1400,10 +1415,13 @@ def _every_account_above_threshold(
     candidates: Sequence[str],
     headroom: dict[str, float | None],
     active_headroom: float | None,
-    threshold: float,
+    active_point: float,
+    point_of: Callable[[str], float],
 ) -> bool:
     """Whether the active account AND every measured candidate are at or over
-    the threshold — the state where "land somewhere healthy" has no answer.
+    their own switch points (``active_point`` for the active, ``point_of``
+    per candidate, see :func:`_switch_point`), the state where "land
+    somewhere healthy" has no answer.
 
     Requires the active account's own headroom to be known: without it we do
     not know we are in this state, and guessing here would relax the landing
@@ -1411,30 +1429,32 @@ def _every_account_above_threshold(
     verdict (it may be healthy, but it cannot be *chosen* either — the caller
     skips ``None`` headroom) as long as at least one candidate was measured.
     """
-    if active_headroom is None or (100.0 - active_headroom) < threshold:
+    if active_headroom is None or (100.0 - active_headroom) < active_point:
         return False
-    measured = [headroom.get(n) for n in candidates if headroom.get(n) is not None]
+    measured = [
+        (n, headroom[n]) for n in candidates if headroom.get(n) is not None
+    ]
     if not measured:
         return False
-    return all((100.0 - h) >= threshold for h in measured)
+    return all((100.0 - h) >= point_of(n) for n, h in measured)
 
 
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
 
 
-def _entry_credit_room(entry: UsageEntry | None) -> oauth.UsageCreditRoom | None:
-    """Usage-credit room from an account's stored measurement.
+def _switch_point(
+    settings: AutoSwitchSettings, entries: dict[str, UsageEntry] | None, num: str
+) -> float:
+    """This account's switch point (:func:`account_switch_point`) from the
+    tick's stored entries.
 
-    Read off ``last_good``, not the decision value: a walled or header-only
-    row's decision value is rebuilt from its windows alone and carries no
-    ``spend`` object, and the walled row is exactly the at-limit account
-    whose credits matter here. A sentinel row (expired, relogin) cannot run
-    sessions, so it has no room.
+    ``entries`` is None only from callers that rank on usage alone (direct
+    ranking tests predating usage credits): no stored row means no credit
+    room, so every account reads the plain threshold, the pre-credit rule.
     """
-    if entry is None or entry.sentinel is not None:
-        return None
-    return oauth.usage_credit_room(entry.last_good)
+    entry = entries.get(num) if entries is not None else None
+    return account_switch_point(settings, entry)
 
 
 def _usage_credit_pick(
@@ -1451,13 +1471,13 @@ def _usage_credit_pick(
     every time the active's spend crossed the peer's. Once the active has
     none, the peer with the most room takes them (no cap ranks first).
     """
-    current_room = _entry_credit_room(entries.get(current))
+    current_room = oauth.entry_credit_room(entries.get(current))
     if current_room is not None:
         return current, current_room
     rooms = {
         num: room
         for num in candidates
-        if (room := _entry_credit_room(entries.get(num))) is not None
+        if (room := oauth.entry_credit_room(entries.get(num))) is not None
     }
     if not rooms:
         return None
@@ -1742,6 +1762,11 @@ class AutoSwitchEngine:
         # long stretch on one account logs it once rather than every tick.
         self._credits_account_now: str | None = None
         self._credits_account_before: str | None = None
+        # The active the last measured tick held past `threshold` only
+        # because its usage-credit room raised its switch point to
+        # `credit_threshold` (None: no such hold). `_watch_credit_hold`
+        # reads it to warn when that room runs out under a held account.
+        self._credit_hold: str | None = None
         # Byte offset into the pin's trace the last tick read up to. None
         # until the first successful read takes its baseline; see
         # `_message_error_burst`.
@@ -2642,14 +2667,21 @@ class AutoSwitchEngine:
             LoginRestoreOutcome.RESTORED, LoginRestoreOutcome.WAITING,
         ):
             return TickOutcome.NO_ACTION
+        # The active's own switch point (X3587): `credit_threshold` while its
+        # stored reading has usage-credit room, else `threshold`.
+        active_point = _switch_point(settings, entries, current)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
-                switch_bar=proactive_switch_bar_pct(
-                    settings.strategy, settings.threshold
-                ),
+                switch_bar=proactive_switch_bar_pct(settings.strategy, active_point),
+                switch_bars={
+                    num: proactive_switch_bar_pct(
+                        settings.strategy, _switch_point(settings, entries, num)
+                    )
+                    for num in headroom
+                },
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -2766,7 +2798,8 @@ class AutoSwitchEngine:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
-            departure_pct = settings.threshold
+            departure_pct = active_point
+            self._watch_credit_hold(current, entries, utilization, settings)
             if settings.strategy == "dynamic":
                 trigger = _classify_dynamic_trigger(active_headroom)
             elif utilization < departure_pct:
@@ -2778,7 +2811,7 @@ class AutoSwitchEngine:
                             # display an impossible "100% < 99.9%".
                             detail=(
                                 f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                                f"{pct_label(departure_pct)}%"
                             ),
                         )
                     )
@@ -2923,9 +2956,11 @@ class AutoSwitchEngine:
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
+                entries,
             )
             no_return = self._no_return_account(
                 "proactive", state, hroom, active_h, recovered, settings, current,
+                entries,
             )
             barred = [n for n in cands if n != no_return]
             warm, cold = _rank_dynamic_candidates(
@@ -3386,7 +3421,7 @@ class AutoSwitchEngine:
                     reason="below-threshold",
                     detail=(
                         f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                        f"{pct_label(active_point)}%"
                     ),
                 )
             )
@@ -3463,6 +3498,7 @@ class AutoSwitchEngine:
                 kw["settings"],
                 kw["now"],
                 kw["current"],
+                kw["entries"],
             )
             no_return = self._no_return_account(
                 trigger,
@@ -3472,6 +3508,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                kw["entries"],
             )
             ranked = self._rank_candidates(
                 no_return=no_return, overload_backoff=overload_backoff, **kw
@@ -3729,7 +3766,8 @@ class AutoSwitchEngine:
                 )
                 if (
                     last_active_headroom is not None
-                    and (100.0 - last_active_headroom) < settings.threshold
+                    and (100.0 - last_active_headroom)
+                    < _switch_point(settings, entries, current)
                     and last_active.age_s is not None
                     and last_active.age_s <= WALL_FALLBACK_S
                 ):
@@ -3967,6 +4005,7 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        entries: dict[str, UsageEntry] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -4070,7 +4109,7 @@ class AutoSwitchEngine:
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
-                and left_headroom > 100.0 - settings.threshold
+                and left_headroom > 100.0 - _switch_point(settings, entries, barred)
             ):
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
@@ -4088,6 +4127,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         current: str | None = None,
+        entries: dict[str, UsageEntry] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -4270,7 +4310,7 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if h is not None and h > 100.0 - _switch_point(settings, entries, barred):
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
@@ -4359,7 +4399,8 @@ class AutoSwitchEngine:
         )
         active_at_threshold = (
             active_headroom is not None
-            and active_headroom <= 100.0 - settings.threshold
+            and active_headroom
+            <= 100.0 - _switch_point(settings, entries, current)
         )
         if h is not None:
             if active_headroom is not None:
@@ -4368,7 +4409,10 @@ class AutoSwitchEngine:
                     and h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT
                 ):
                     return True
-            elif not left_for_reset and h > 100.0 - settings.threshold:
+            elif (
+                not left_for_reset
+                and h > 100.0 - _switch_point(settings, entries, barred)
+            ):
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -4577,8 +4621,15 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        # Every threshold comparison in this pass reads the account's OWN
+        # switch point: an account with usage-credit room may run to
+        # `credit_threshold` (X3587), every other one to `threshold`.
+        def point_of(num: str) -> float:
+            return _switch_point(settings, entries, num)
+
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, headroom, active_headroom,
+            point_of(current), point_of,
         )
         # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
         # is distance to the NEAREST wall, which is what `account_headroom`
@@ -4713,8 +4764,10 @@ class AutoSwitchEngine:
         # `settings.threshold` back unchanged, so this is a no-op for them.
         # One exception below, `dynamic_self_walled`, deliberately keeps
         # `settings.threshold` -- see its own comment for why `bar` would
-        # make that specific check always false.
-        bar = proactive_switch_bar_pct(settings.strategy, settings.threshold)
+        # make that specific check always false. Per candidate: its own
+        # switch point (`point_of`) goes through the same strategy rule.
+        def bar_of(num: str) -> float:
+            return proactive_switch_bar_pct(settings.strategy, point_of(num))
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
@@ -4832,7 +4885,7 @@ class AutoSwitchEngine:
                 # burned worse). `best`/`consume-first` keep the escape
                 # unchanged — this is additive, gated on the strategy AND on
                 # `about_to_wall`, not the strategy alone.
-                if (100.0 - h) >= bar and not (
+                if (100.0 - h) >= bar_of(num) and not (
                     (all_above and not dynamic_landing) or dynamic_at_limit_escape
                 ):
                     continue
@@ -5053,7 +5106,7 @@ class AutoSwitchEngine:
                 # two floors coincide by construction (`bar == 100 -
                 # SPENT_HEADROOM_PCT`) and the tiers simply agree.
                 key = consume_first_rank_key(
-                    usage.get(num), bar, now, models
+                    usage.get(num), bar_of(num), now, models
                 )
                 key_axis[num] = "soonest reset"
             else:
@@ -5127,7 +5180,7 @@ class AutoSwitchEngine:
                 # checks `h <= SPENT_HEADROOM_PCT` FIRST, so this is only
                 # ever consulted once that has already failed.
                 dynamic_self_walled = (
-                    dynamic_landing and (100.0 - h) >= settings.threshold
+                    dynamic_landing and (100.0 - h) >= point_of(num)
                 )
                 # THREE TIERS, NOT TWO. Folding "genuinely unservable" (h <=
                 # SPENT_HEADROOM_PCT) and "self-walled but has real spare
@@ -5160,7 +5213,7 @@ class AutoSwitchEngine:
         if probe_num is not None:
             qualifying.append((
                 consume_first_rank_key(
-                    usage.get(probe_num), settings.threshold, now, models, probe=True
+                    usage.get(probe_num), point_of(probe_num), now, models, probe=True
                 ),
                 probe_num,
             ))
@@ -5716,6 +5769,46 @@ class AutoSwitchEngine:
                 )
             )
 
+    def _watch_credit_hold(
+        self,
+        current: str,
+        entries: dict[str, UsageEntry],
+        utilization: float,
+        settings: AutoSwitchSettings,
+    ) -> None:
+        """Alarm: the active was held past ``threshold`` on its usage-credit
+        room, and that room is gone (cap reached or money spent) while its
+        usage is still at or over ``threshold``.
+
+        From this tick it switches at the plain ``threshold`` again, and the
+        sessions were running on the last points of a window with nothing
+        behind it. Zero on a healthy pool except at a real cap. ``dynamic``
+        departs on its own fixed bar, so it never holds on credits.
+        """
+        credit_point = settings.credit_threshold
+        holds_on_credits = (
+            settings.strategy != "dynamic"
+            and credit_point is not None
+            and credit_point > settings.threshold
+            and utilization >= settings.threshold
+        )
+        room = oauth.entry_credit_room(entries.get(current))
+        if (
+            self._credit_hold == current
+            and room is None
+            and utilization >= settings.threshold
+        ):
+            _logger.warning(
+                "Account-%s lost its usage-credit room at %s%% used; it now "
+                "switches at the plain threshold %s%%",
+                current,
+                pct_label(utilization),
+                pct_label(settings.threshold),
+            )
+        self._credit_hold = (
+            current if holds_on_credits and room is not None else None
+        )
+
     def _announce_usage_credits(
         self, number: str, room: oauth.UsageCreditRoom, switched: bool
     ) -> None:
@@ -5755,7 +5848,7 @@ class AutoSwitchEngine:
         a fault. Zero on a healthy pool.
         """
         for number, entry in sorted(entries.items()):
-            room = _entry_credit_room(entry)
+            room = oauth.entry_credit_room(entry)
             if room is not None and not self.switcher.is_account_disabled(number):
                 _logger.warning(
                     "All accounts exhausted while Account-%s holds usage-credit "
