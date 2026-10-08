@@ -65,7 +65,7 @@ from claude_swap.settings import (
     holds_credit_point,
     parse_model_names,
 )
-from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, quarantine_ledger, read_engine_state, spend_row_body
+from claude_swap.switcher import ClaudeAccountSwitcher, EngineStateError, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, quarantine_ledger, read_engine_state, spend_row_body
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -1134,6 +1134,20 @@ class ErrorEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"error: {self.message}" + (" (will retry)" if self.transient else "")
+
+
+def state_file_error_event(exc: EngineStateError) -> ErrorEvent:
+    """The report for an engine state file that cannot be read.
+
+    Not transient: an unreadable or corrupt file stays that way until
+    someone fixes it, and every tick refuses to decide on it (reading it as
+    empty would drop the quarantine ledger and the cooldowns). The message
+    is the error's own, which names the file, plus the remedy.
+    """
+    return ErrorEvent(
+        message=f"{exc}; the engine cannot decide until this file is fixed",
+        transient=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -2477,6 +2491,9 @@ class AutoSwitchEngine:
             # that was missing let a stop report exit 0 = SWITCHED.
             self._emit(NoSwitchEvent(reason="engine-stopped"))
             return TickOutcome.NO_ACTION
+        except EngineStateError as e:
+            self._emit(state_file_error_event(e))
+            return TickOutcome.ERROR
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
@@ -6443,7 +6460,13 @@ class AutoSwitchEngine:
             # cadence either.
             return min(max(self._settle_wait_until - time.time(), 0.1), interval)
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        delay = self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        delay = interval * (0.9 + 0.2 * random.random())
+        if outcome is TickOutcome.ERROR:
+            # The tick already reported its failure; reading the plan again
+            # re-reads what may have just failed (an unreadable state file)
+            # and reports it a second time for the same tick.
+            return delay
+        delay = self._respect_poll_plan(delay)
         # T1313 (correctness-pass item 5): `_respect_poll_plan`'s own
         # collect (`usage_entries_by_account` -> `_resync_rotated_backup`'s
         # no-drift adopt) can itself make a restore pending ON DISK, with
@@ -6464,8 +6487,7 @@ class AutoSwitchEngine:
         # just the outcome, or this falls back to the ordinary cadence
         # already computed above instead of a `None` arithmetic error.
         #
-        # Guarded the same way `_respect_poll_plan` guards itself: this
-        # runs OUTSIDE `tick()`'s own try, on `run_loop`'s thread AFTER
+        # Guarded: this runs OUTSIDE `tick()`'s own try, on `run_loop`'s thread AFTER
         # `tick()` has returned, and `_settle_or_arm_wait`'s pre-try reads
         # (`_get_sequence_data()` on a torn ``sequence.json``) can raise --
         # unguarded, that reaches `run_loop`'s catch-all as a second
@@ -6523,7 +6545,12 @@ class AutoSwitchEngine:
 
         Only ever shortens, never below the planner's floor: the 429 budget
         lives in the plan, and this makes the loop obey it rather than
-        override it. Best-effort — the unshortened delay is always safe.
+        override it. Absorbs nothing: a read that fails here (an unreadable
+        engine state file, a usage store that cannot be read) raises to
+        ``run_loop``'s error path, which reports it, rather than sleeping
+        the unshortened delay as if the plan had been read. ``_next_delay``
+        does not call this after an ERROR tick, whose own report already
+        named the failure.
 
         Stop-gated, and OUTSIDE ``tick()``: ``run_loop`` calls this via
         ``_next_delay`` after ``tick()`` has returned, so none of its `_stop`
@@ -6542,46 +6569,43 @@ class AutoSwitchEngine:
         """
         if self._stop.is_set():
             return delay
-        try:
-            current = self.switcher.current_account_number()
-            if current is None:
-                return delay
-            now = self.clock()
-            state = self._read_state()
-            quarantined = set(quarantine_ledger(state))
-            votable = set(self.switcher.switchable_account_numbers()) - quarantined
-            votable.add(current)
-            entries = self.switcher.usage_entries_by_account(fetch=set())
-            due_ats = [
-                entry.next_poll_at
-                for num, entry in entries.items()
-                if entry.next_poll_at is not None
-                and not entry.header_only
-                and num in votable
-                and (
-                    num == current
-                    or not (
-                        entry.sentinel
-                        or entry.in_backoff(now)
-                        or entry.token_dead()
-                        or entry.attempts_in_window
-                        >= poll_policy.ATTEMPTS_PER_HOUR_MAX
-                    )
-                )
-            ]
-            if not due_ats:
-                return delay
-            due_in = min(due_ats) - now
-            # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
-            # raises a delay that was ALREADY below U: at the configurable
-            # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
-            # the 60s default it flattens the entire lower jitter half.
-            # Bounding due_in instead keeps "only ever shortens" true at every
-            # configured interval, and still refuses to poll faster than the
-            # planner's own floor when the row is overdue.
-            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
-        except Exception:
+        current = self.switcher.current_account_number()
+        if current is None:
             return delay
+        now = self.clock()
+        state = self._read_state()
+        quarantined = set(quarantine_ledger(state))
+        votable = set(self.switcher.switchable_account_numbers()) - quarantined
+        votable.add(current)
+        entries = self.switcher.usage_entries_by_account(fetch=set())
+        due_ats = [
+            entry.next_poll_at
+            for num, entry in entries.items()
+            if entry.next_poll_at is not None
+            and not entry.header_only
+            and num in votable
+            and (
+                num == current
+                or not (
+                    entry.sentinel
+                    or entry.in_backoff(now)
+                    or entry.token_dead()
+                    or entry.attempts_in_window
+                    >= poll_policy.ATTEMPTS_PER_HOUR_MAX
+                )
+            )
+        ]
+        if not due_ats:
+            return delay
+        due_in = min(due_ats) - now
+        # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
+        # raises a delay that was ALREADY below U: at the configurable
+        # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
+        # the 60s default it flattens the entire lower jitter half.
+        # Bounding due_in instead keeps "only ever shortens" true at every
+        # configured interval, and still refuses to poll faster than the
+        # planner's own floor when the row is overdue.
+        return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it.
@@ -6614,6 +6638,9 @@ class AutoSwitchEngine:
                                 ),
                             )
                         )
+                except EngineStateError as e:
+                    self._emit(state_file_error_event(e))
+                    delay = self.settings.interval_seconds * (0.9 + 0.2 * random.random())
                 except Exception as e:  # pragma: no cover - tick() already guards
                     self._emit(
                         ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)

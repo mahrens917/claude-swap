@@ -606,6 +606,45 @@ def framework_build_warning(
     )
 
 
+def menu_threshold(backup_dir: Path) -> tuple[int | None, str | None]:
+    """The auto-switch threshold the menu ticks, or why it cannot be read.
+
+    Returns ``(threshold, None)``, or ``(None, text)`` when settings.json
+    raises ``ConfigError`` (unreadable, not JSON, a value out of range): the
+    failure is logged at ERROR and the menu shows ``text`` in place of the
+    ticks, so a broken settings file is never read as "no threshold
+    chosen". Any other exception propagates.
+    """
+    from claude_swap.exceptions import ConfigError
+    from claude_swap.settings import load_settings
+
+    try:
+        return int(load_settings(backup_dir).threshold), None
+    except ConfigError as e:
+        logging.getLogger("claude-swap").error(
+            "auto-switch threshold unreadable for the menu: %s", e
+        )
+        return None, f"Settings unreadable: {e}"
+
+
+def start_engine_or_report(make_engine, notify):
+    """Build the auto-switch engine, or report why it could not start.
+
+    ``make_engine()`` builds it; on any exception the failure is logged at
+    ERROR with its traceback, ``notify(title, message)`` tells the user, and
+    None is returned, so the menu bar keeps running with auto-switch off
+    and the reason on screen and in the log.
+    """
+    try:
+        return make_engine()
+    except Exception as e:  # noqa: BLE001 -- a bad start must not take the menu bar down; reported at ERROR and on screen
+        logging.getLogger("claude-swap").error(
+            "auto-switch engine failed to start: %s", e, exc_info=True
+        )
+        notify("Auto-switch failed to start", str(e))
+        return None
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -767,16 +806,16 @@ def run(switcher) -> int:
             """Run the core AutoSwitchEngine (live) in a background thread."""
             if self._engine is not None:
                 return
-            try:
-                engine = AutoSwitchEngine(
+            engine = start_engine_or_report(
+                lambda: AutoSwitchEngine(
                     self.switcher,
                     load_settings(self.switcher.backup_dir),
                     self._on_engine_event,
                     dry_run=False,
-                )
-            except Exception as e:  # never let a bad start crash the menu bar
-                self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
-                rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
+                ),
+                lambda title, message: rumps.notification("claude-swap", title, message),
+            )
+            if engine is None:
                 return
             self._engine = engine
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
@@ -820,13 +859,6 @@ def run(switcher) -> int:
                     # engine emits it once per run; dropping it would leave a
                     # menu-bar user with a silently inert filter.
                     rumps.notification("claude-swap", "Configuration warning", ev.human())
-
-        def _threshold(self) -> int:
-            """Current auto-switch threshold from core settings (for the menu)."""
-            try:
-                return int(load_settings(self.switcher.backup_dir).threshold)
-            except Exception:
-                return 0
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
@@ -980,7 +1012,9 @@ def run(switcher) -> int:
             menu.add(auto_item)
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
+            current, unreadable = menu_threshold(self.switcher.backup_dir)
+            if unreadable is not None:
+                threshold_menu.add(rumps.MenuItem(unreadable))
             for pct in AUTO_THRESHOLD_CHOICES:
                 ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
                 ch.state = 1 if current == pct else 0

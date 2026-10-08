@@ -614,6 +614,74 @@ def probe_oauth_profile_live(access_token: str, timeout_s: float = 5.0) -> bool 
         return None
 
 
+#: The route a setup-token's liveness is asked on. Its scope is inference
+#: only (``SETUP_TOKEN_SCOPES``), so the profile endpoint the browser-login
+#: check uses refuses it by scope and gives no verdict either way. Claude
+#: Code itself sends this route on the same bearers (a high-volume route
+#: through the owner proxy, see ``autoswitch._message_error_burst``), it
+#: bills no tokens and spends nothing of the account's 5h or 7d window.
+SETUP_TOKEN_PROBE_URL = "https://api.anthropic.com/v1/messages/count_tokens"
+#: The model the count is asked for. Any model the account may use answers;
+#: a retired id answers a 4xx that is no verdict and is logged at WARNING.
+SETUP_TOKEN_PROBE_MODEL = "claude-haiku-4-5"
+
+
+def probe_setup_token_live(access_token: str, timeout_s: float = 10.0) -> bool | None:
+    """Is this ``claude setup-token`` access token accepted by the API now?
+
+    One ``POST /v1/messages/count_tokens`` for a one-character message: an
+    inference-scope request, so the token's own scope reaches it. Returns
+    ``True`` on a 200, ``False`` on a refusal of the credential itself (a
+    401, or a 403 whose error type is ``authentication_error``), and
+    ``None`` for no verdict: any other status, a 403 of another type (a
+    ``permission_error`` may be this route's scope rather than the token, and
+    a wrong ``False`` strikes a live account), or a transport failure. Every
+    no-verdict answer logs a WARNING naming the status, because on a healthy
+    account this check passes and anything else leaves a switch unvalidated.
+    Must not be called while any credential/config lock is held.
+    """
+    body = json.dumps({
+        "model": SETUP_TOKEN_PROBE_MODEL,
+        "messages": [{"role": "user", "content": "."}],
+    }).encode()
+    req = urllib.request.Request(SETUP_TOKEN_PROBE_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        "User-Agent": "claude-swap/1.0",
+    })
+    try:
+        with urllib.request.urlopen(
+            req, timeout=timeout_s, context=_pin_aware_ssl_context()
+        ) as resp:
+            resp.read()
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        raw = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        error_type = error.get("type") if isinstance(error, dict) else None
+        if e.code == 403 and error_type == "authentication_error":
+            return False
+        _logger.warning(
+            "setup-token liveness check on %s gave no verdict: http-%s (%s)",
+            SETUP_TOKEN_PROBE_URL, e.code, error_type,
+        )
+        return None
+    except (urllib.error.URLError, OSError) as e:
+        _logger.warning(
+            "setup-token liveness check on %s gave no verdict: %r",
+            SETUP_TOKEN_PROBE_URL, e,
+        )
+        return None
+
+
 def build_token_status(credentials: str) -> str | None:
     """Return a short debug summary of stored OAuth token state."""
     oauth = extract_oauth_data(credentials)

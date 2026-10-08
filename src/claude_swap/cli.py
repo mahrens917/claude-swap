@@ -1285,6 +1285,40 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _apply_cli_theme(argv: list[str]) -> None:
+    """Set the printer's theme from settings.json's ``ui.theme``.
+
+    A settings file that cannot be read (``ConfigError``: unreadable, not
+    JSON, a value outside its choices) ends the command with the error, in
+    the JSON envelope under ``--json``, rather than running every command on
+    a theme nobody chose. The script-consumed invocations of the proxy
+    command (``--ensure`` before every ``claude`` launch, ``--get_port`` and
+    ``--get_certdir`` read by ``$(...)``) render nothing themed and promise
+    silence, so they do not read it.
+    """
+    from claude_swap.appearance import (
+        cli_should_probe,
+        cli_theme,
+        pin_invocation_is_script_consumed,
+    )
+    from claude_swap.exceptions import ConfigError
+
+    if pin_invocation_is_script_consumed(argv):
+        return
+    # `run` execs a child that takes over the terminal, and `--json` must
+    # stay machine-readable: never probe (and emit the OSC query) in either.
+    probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
+    try:
+        setting = load_ui_settings(paths.get_backup_root()).theme
+    except ConfigError as e:
+        if "--json" in argv:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    printer.set_theme(cli_theme(setting, colors=probe))
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1298,16 +1332,7 @@ def main() -> None:
     from claude_swap.appearance import pin_invocation_is_script_consumed
 
     _use_native_tls(quiet=pin_invocation_is_script_consumed(argv))
-    try:
-        from claude_swap.appearance import cli_should_probe, cli_theme
-        # `run` execs a child that takes over the terminal, and `--json`
-        # must stay machine-readable — never probe (and emit the OSC query)
-        # in either case.
-        probe = cli_should_probe(argv, colors_enabled=printer.colors_enabled())
-        name = cli_theme(load_ui_settings(paths.get_backup_root()).theme, colors=probe)
-        printer.set_theme(name)
-    except Exception:
-        pass  # theme is cosmetic; never block the CLI on it
+    _apply_cli_theme(argv)
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "pin":

@@ -2917,7 +2917,7 @@ class TestTheUnspliceDecidesOnTheAccount:
                 if email:
                     _s.atomic_write_json(path, {"remoteControl": {"pinnedEmail": email}})
                 else:
-                    raw = _s._read_raw_for_write(path)
+                    raw = _s._read_raw(path, for_write=True)
                     raw.pop("remoteControl", None)
                     _s.atomic_write_json(path, raw)
                 return False                      # no proxy running
@@ -3081,7 +3081,7 @@ class TestTheUnspliceTouchesOnlyWhatThePinSpliced:
                     cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
                         "emailAddress": email, "accountUuid": "uuid-cloud"}}))
                 else:
-                    raw = _s._read_raw_for_write(path)
+                    raw = _s._read_raw(path, for_write=True)
                     raw.pop("remoteControl", None)
                     _s.atomic_write_json(path, raw)
                 return False

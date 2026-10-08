@@ -3638,6 +3638,49 @@ class ClaudeAccountSwitcher:
             )
         return struck
 
+    def record_token_refused(self, access_token: str, status: int) -> bool:
+        """Public entry point for the owner proxy: the API refused
+        ``access_token`` (``status`` 401, or an auth-typed 403) on a
+        ``/v1/messages`` reply. The refusal is charged to the slot whose
+        stored credential carries that token (`slot_for_access_token`), not
+        to whichever slot is live when the proxy's worker runs: a switch
+        between the reply and the worker moves the live login, and a
+        setup-token refused on a session still holding an account cswap
+        switched away from is just as dead. The stored credential carrying
+        the token (the live login when the slot is active, else its saved
+        copy) is handed to `record_credential_refused`, which strikes only a
+        setup-token. Returns that call's answer, or False when no stored
+        credential carries the token any more.
+        """
+        slot = self.slot_for_access_token(access_token)
+        if slot is None:
+            self._logger.info(
+                "a refusal (http-%s) named a token no stored credential "
+                "carries any more; nothing struck.",
+                status,
+            )
+            return False
+        identity = self._slot_identity(slot)
+        if identity is None:
+            return False
+        sources: list[str] = []
+        if slot == self.current_account_number():
+            active = self._store._read_active_credentials()
+            if active.value and not active.degraded:
+                sources.append(active.value)
+        saved, unreadable = self._read_account_credentials_ex(slot, identity[0])
+        if saved and not unreadable:
+            sources.append(saved)
+        holder = next(
+            (s for s in sources if oauth.extract_access_token(s) == access_token),
+            None,
+        )
+        if holder is None:
+            return False
+        return self.record_credential_refused(
+            slot, status, oauth.credential_fingerprint(holder)
+        )
+
     def _slot_identity(self, num: str) -> tuple[str, str] | None:
         """``(email, organizationUuid)`` slot ``num`` maps to, or None for
         a slot the roster does not hold."""
@@ -12702,6 +12745,44 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
             {num: (email, org)},
         )
 
+    def _probe_setup_token_target(
+        self, num: str, email: str, creds: str, access_token: str
+    ) -> tuple[bool | None, str | None, bool, bool | None]:
+        """`_probe_target_credential` for a ``claude setup-token`` target.
+
+        Its scope is inference only, so the profile endpoint refuses it by
+        scope and never gives a verdict: every wall switch onto such an
+        account landed unvalidated, and the owner proxy relayed the 429
+        (stripped) instead of the 401 that rebuilds the client onto the new
+        account at once (board row X3650). The check is asked on an
+        inference-scope route instead (`oauth.probe_setup_token_live`). A
+        setup-token has no refresh path, so a refusal is the verdict on its
+        own: the slot is struck through the same writer the owner proxy's
+        `/v1/messages` refusal uses (`record_credential_refused`'s
+        ``strike_refused_credential``, lifted by ``cswap add-token``).
+        Same return shape as `_probe_target_credential`.
+        """
+        live = oauth.probe_setup_token_live(access_token)
+        if live is True:
+            return True, creds, False, None
+        if live is None:
+            return None, creds, False, None
+        identity = self._slot_identity(num)
+        if identity is None:
+            raise SwitchError(
+                f"Account-{num} ({email}) left the roster while its "
+                "credential was being checked; nothing was activated."
+            )
+        self._usage_store.strike_refused_credential(
+            num, {num: identity}, oauth.credential_fingerprint(creds)
+        )
+        self._logger.warning(
+            "setup-token account %s (%s) refused by the API at switch time; "
+            "out of rotation until its token is re-added with cswap add-token",
+            num, email,
+        )
+        return False, None, True, None
+
     def _probe_target_credential(
         self, num: str, email: str, creds: str
     ) -> tuple[bool | None, str | None, bool, bool | None]:
@@ -12757,6 +12838,8 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         access_token = oauth_data.get("accessToken")
         if not access_token:
             return None, creds, False, None  # nothing to probe (non-OAuth blob)
+        if oauth.is_setup_token_credential(creds):
+            return self._probe_setup_token_target(num, email, creds, access_token)
         live = oauth.probe_oauth_profile_live(access_token)
         if live is True:
             return True, creds, False, None
@@ -12988,10 +13071,16 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     )
                 )
                 if live is False:
+                    remedy = (
+                        "Mint a new token with claude setup-token and run: "
+                        f"cswap add-token --slot {target_account}"
+                        if oauth.is_setup_token_credential(target_creds_probe)
+                        else "Log in as it and run: cswap add"
+                    )
                     raise TargetCredentialDead(
                         f"Account-{target_account} ({pre_email})'s stored "
                         "credential was rejected by the API; nothing was "
-                        "activated. Log in as it and run: cswap add"
+                        f"activated. {remedy}"
                     )
                 if live is None and proven_401:
                     # `stash_state` distinguishes what the escalation's POST

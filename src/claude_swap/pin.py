@@ -1681,7 +1681,7 @@ def _clear_pin_record(switcher) -> None:
 
     try:
         path = _s.settings_path(switcher.backup_dir)
-        raw = _s._read_raw_for_write(path)
+        raw = _s._read_raw(path, for_write=True)
         if raw.pop("remoteControl", None) is not None:
             _s.atomic_write_json(path, raw)
     except Exception:  # noqa: BLE001 — the caller re-reads and reports

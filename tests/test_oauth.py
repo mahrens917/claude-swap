@@ -1986,6 +1986,94 @@ class TestProbeOauthProfileLive:
             assert oauth.probe_oauth_profile_live("sk-live") is None
 
 
+class TestProbeSetupTokenLive:
+    """``probe_setup_token_live``: the switch-time check for a setup-token,
+    whose inference-only scope the profile endpoint refuses (board row
+    X3650). Only a refusal of the credential itself may answer False, since
+    a False strikes the account out of rotation."""
+
+    def _ok(self):
+        resp = MagicMock()
+        resp.read.return_value = b'{"input_tokens": 8}'
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    @staticmethod
+    def _err(code: int, error_type: str | None = None):
+        import io
+
+        body = (
+            json.dumps({"type": "error", "error": {"type": error_type}}).encode()
+            if error_type else b""
+        )
+        return urllib.error.HTTPError(
+            oauth.SETUP_TOKEN_PROBE_URL, code, "x", {}, io.BytesIO(body)
+        )
+
+    def test_the_request_is_one_count_on_the_inference_route(self):
+        """Asserts: the check is a POST to /v1/messages/count_tokens carrying
+        the bearer, the OAuth beta header and a one-message body, and a 200
+        reads live."""
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=self._ok()
+        ) as mock_open:
+            assert oauth.probe_setup_token_live("sk-ant-oat01-x") is True
+        req = mock_open.call_args.args[0]
+        assert req.full_url == "https://api.anthropic.com/v1/messages/count_tokens"
+        assert req.get_method() == "POST"
+        assert req.get_header("Authorization") == "Bearer sk-ant-oat01-x"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        body = json.loads(req.data)
+        assert body["model"] == oauth.SETUP_TOKEN_PROBE_MODEL
+        assert body["messages"] == [{"role": "user", "content": "."}]
+
+    @pytest.mark.parametrize(
+        "code,error_type",
+        [(401, None), (401, "authentication_error"), (403, "authentication_error")],
+    )
+    def test_a_refusal_of_the_credential_is_dead(self, code, error_type):
+        """Asserts: a 401, or a 403 typed authentication_error, reads dead."""
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=self._err(code, error_type),
+        ):
+            assert oauth.probe_setup_token_live("t") is False
+
+    @pytest.mark.parametrize(
+        "code,error_type",
+        [
+            (403, "permission_error"),
+            (403, None),
+            (400, "invalid_request_error"),
+            (404, "not_found_error"),
+            (429, "rate_limit_error"),
+            (529, "overloaded_error"),
+        ],
+    )
+    def test_anything_else_is_no_verdict_and_warns(self, code, error_type, caplog):
+        """Asserts: every other status is no verdict (None) and logs a
+        WARNING naming the status, never a False that would strike."""
+        with caplog.at_level(logging.WARNING, logger="claude-swap"), patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=self._err(code, error_type),
+        ):
+            assert oauth.probe_setup_token_live("t") is None
+        assert any(
+            r.levelno == logging.WARNING and f"http-{code}" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_transport_failure_is_no_verdict_and_warns(self, caplog):
+        """Asserts: a connection failure is no verdict and logs a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="claude-swap"), patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("down"),
+        ):
+            assert oauth.probe_setup_token_live("t") is None
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
 class TestBridgeTitleRestoreRunsWithoutTheProxy:
     """The restore must not depend on the proxy it exists to survive.
 

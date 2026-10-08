@@ -245,15 +245,42 @@ class TestReadRawReturnsDict:
         assert isinstance(raw, dict)
         assert raw["remoteControl"]["pinned"] is True
 
-    def test_read_raw_for_write_returns_a_dict(self, tmp_path: Path):
-        from claude_swap.settings import _read_raw_for_write
+    def test_the_write_read_returns_a_dict(self, tmp_path: Path):
+        """Asserts: the one reader in its read-modify-write mode returns the
+        same dict."""
+        from claude_swap.settings import _read_raw
 
         settings_path(tmp_path).write_text(
-            json.dumps({"remoteControl": {"pinned": True}})
+            json.dumps({"remoteControl": {"debugSlowMs": 5}})
         )
-        raw = _read_raw_for_write(settings_path(tmp_path))
-        assert isinstance(raw, dict)
-        assert raw["remoteControl"]["pinned"] is True
+        raw = _read_raw(settings_path(tmp_path), for_write=True)
+        assert raw == {"remoteControl": {"debugSlowMs": 5}}
+
+    @pytest.mark.parametrize("body,why", [
+        ("{not json", "is not valid JSON"),
+        ("[1]", "is not a JSON object"),
+    ], ids=["not-json", "not-object"])
+    def test_one_reader_names_the_remedy_only_for_a_write(
+        self, tmp_path: Path, body, why
+    ):
+        """Asserts: `_read_raw` is the one strict reader: a corrupt file
+        raises ConfigError naming it in both modes, and only the
+        read-modify-write mode adds the fix-or-delete remedy; the separate
+        write-side reader is gone."""
+        from claude_swap import settings as s
+
+        path = settings_path(tmp_path)
+        path.write_text(body)
+        with pytest.raises(ConfigError, match=why) as read_err:
+            s._read_raw(path)
+        with pytest.raises(ConfigError, match=why) as write_err:
+            s._read_raw(path, for_write=True)
+        assert str(path) in str(read_err.value)
+        assert "before changing settings" not in str(read_err.value)
+        assert str(write_err.value).endswith(
+            "fix or delete it before changing settings"
+        )
+        assert not hasattr(s, "_read_raw_for_write")
 
 
 class TestUiSettings:
@@ -644,3 +671,59 @@ class TestAccountSwitchPoint:
         still switches at threshold, the rule before X3587."""
         s = AutoSwitchSettings(threshold=99.0)
         assert account_switch_point(s, _credit_entry()) == 99.0
+
+
+class TestMenuBarSettingsReads:
+    """The menu bar's two reads of these settings (`menubar.menu_threshold`,
+    `menubar.start_engine_or_report`) surface a broken settings file at
+    ERROR and on screen instead of a silent unticked menu or a WARNING."""
+
+    def test_the_threshold_reads_from_settings(self, tmp_path):
+        """Asserts: a readable settings file gives its threshold, no error."""
+        from claude_swap.menubar import menu_threshold
+
+        save_settings(tmp_path, AutoSwitchSettings(threshold=95.0))
+        assert menu_threshold(tmp_path) == (95, None)
+
+    def test_a_corrupt_settings_file_is_shown_and_logged_at_error(
+        self, tmp_path, caplog
+    ):
+        """Asserts: a settings.json that is not JSON gives no threshold, a
+        menu text naming the failure, and one ERROR line."""
+        from claude_swap.menubar import menu_threshold
+
+        settings_path(tmp_path).write_text("{not json")
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            current, text = menu_threshold(tmp_path)
+        assert current is None
+        assert text is not None and text.startswith("Settings unreadable:")
+        assert str(settings_path(tmp_path)) in text
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+
+    def test_an_engine_that_cannot_start_is_reported_at_error(self, caplog):
+        """Asserts: a failed engine build returns None, logs at ERROR, and
+        notifies the user with the failure text."""
+        from claude_swap.menubar import start_engine_or_report
+
+        notes: list = []
+
+        def broken():
+            raise ConfigError("settings.json: autoswitch.threshold out of range")
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            got = start_engine_or_report(broken, lambda t, m: notes.append((t, m)))
+        assert got is None
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+        assert notes == [(
+            "Auto-switch failed to start",
+            "settings.json: autoswitch.threshold out of range",
+        )]
+
+    def test_an_engine_that_starts_is_returned(self):
+        """Asserts: a successful build is returned and nothing is notified."""
+        from claude_swap.menubar import start_engine_or_report
+
+        notes: list = []
+        engine = object()
+        assert start_engine_or_report(lambda: engine, notes.append) is engine
+        assert notes == []

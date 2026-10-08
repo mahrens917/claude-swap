@@ -11074,6 +11074,101 @@ class TestSwitchTargetLivenessGuard:
         mock_read.assert_not_called()
 
 
+class TestSetupTokenSwitchTargetIsValidated:
+    """A wall switch onto a ``claude setup-token`` account must validate:
+    the profile endpoint refuses that token by scope (it answers no verdict,
+    which the suite's autouse stub reproduces), so the check is asked on the
+    inference route ``oauth.probe_setup_token_live`` sends. The owner proxy
+    sends the client the rebuilding 401 only on ``validated`` True
+    (board row X3650)."""
+
+    _G = TestSwitchTargetLivenessGuard()
+    TOKEN = "sk-ant-oat01-target"
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = self._G._setup(temp_home)
+        self._G._seed(s, 1, "a@example.com")
+        token_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": self.TOKEN, "scopes": ["user:inference"]},
+        })
+        with patch.object(s, "_write_account_credentials") as write_creds:
+            self._G._seed(s, 2, "tok@example.com")
+        write_creds.assert_called_once()
+        s._write_account_credentials("2", "tok@example.com", token_creds)
+        self._G._make_live(temp_home, "a@example.com", 1)
+        return s
+
+    @staticmethod
+    def _urlopen(status: int, body: bytes = b"{}"):
+        """A urlopen stand-in answering the count route with ``status``;
+        any other URL fails the test, so the check rides that route only."""
+        import io
+        import urllib.error
+
+        def fake(req, timeout=None, context=None):
+            assert req.full_url == oauth.SETUP_TOKEN_PROBE_URL, req.full_url
+            if status == 200:
+                resp = MagicMock()
+                resp.read.return_value = body
+                resp.__enter__ = lambda r: r
+                resp.__exit__ = MagicMock(return_value=False)
+                return resp
+            raise urllib.error.HTTPError(
+                req.full_url, status, "refused", {}, io.BytesIO(body)
+            )
+
+        return fake
+
+    def test_a_live_setup_token_target_lands_validated(self, temp_home: Path):
+        """Asserts: a setup-token target whose count request answers 200
+        lands with validated True."""
+        s = self._switcher(temp_home)
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=self._urlopen(200)
+        ):
+            result = s.switch_to("2", json_output=True)
+        assert result["switched"] is True
+        assert result.get("validated") is True
+
+    def test_a_refused_setup_token_target_is_struck_not_activated(
+        self, temp_home: Path
+    ):
+        """Asserts: a 401 on the count request refuses the switch
+        (target-credential-dead, naming add-token), writes nothing live, and
+        strikes the slot as an API refusal."""
+        s = self._switcher(temp_home)
+        creds_path = temp_home / ".claude" / ".credentials.json"
+        before = creds_path.read_bytes()
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=self._urlopen(401)
+        ):
+            result = s.switch_to("2", json_output=True)
+        assert result["switched"] is False
+        assert result["reason"] == "target-credential-dead"
+        assert "add-token" in result["message"]
+        assert creds_path.read_bytes() == before
+        assert s._usage_store.entries(
+            {"2": ("tok@example.com", "")}
+        )["2"].token_dead()
+
+    def test_no_verdict_lands_unvalidated_and_says_why(
+        self, temp_home: Path, caplog
+    ):
+        """Asserts: a 500 on the count request is no verdict: the switch
+        lands with no validated key and a WARNING names the status."""
+        s = self._switcher(temp_home)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"), patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=self._urlopen(500)
+        ):
+            result = s.switch_to("2", json_output=True)
+        assert result["switched"] is True
+        assert "validated" not in result
+        assert any(
+            r.levelno == logging.WARNING and "http-500" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
     (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,

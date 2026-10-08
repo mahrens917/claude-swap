@@ -2310,3 +2310,53 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestThemeReadSurfacesConfigErrors:
+    """The pre-dispatch theme read (`cli._apply_cli_theme`) ends the command
+    on an unreadable settings.json instead of swallowing it."""
+
+    BROKEN = "/x/settings.json is not valid JSON (Expecting value)"
+
+    def _broken(self):
+        from claude_swap.exceptions import ConfigError
+
+        return patch(
+            "claude_swap.cli.load_ui_settings", side_effect=ConfigError(self.BROKEN)
+        )
+
+    def test_a_corrupt_settings_file_ends_the_command_with_the_error(self, capsys):
+        """Asserts: `cswap --list` on a corrupt settings.json exits 1 with the
+        error on stderr and never reaches the switcher."""
+        with self._broken(), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--list"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert self.BROKEN in capsys.readouterr().err
+        switcher_cls.assert_not_called()
+
+    def test_under_json_the_error_is_the_envelope_on_stdout(self, capsys):
+        """Asserts: with --json the ConfigError is the JSON error envelope on
+        stdout, exit 1."""
+        with self._broken(), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch.object(sys, "argv", ["claude-swap", "--list", "--json"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"] == {"type": "ConfigError", "message": self.BROKEN}
+
+    def test_the_silent_proxy_invocations_do_not_read_the_theme(self):
+        """Asserts: the proxy command's `--ensure` (run before every claude
+        launch, promised silent) never reads settings.json for a theme it
+        does not render."""
+        from claude_swap.appearance import pin_invocation_is_script_consumed
+
+        argv = ["pin", "--ensure"]
+        assert pin_invocation_is_script_consumed(argv)  # premise
+        with patch("claude_swap.cli.load_ui_settings") as read:
+            cli._apply_cli_theme(argv)
+        read.assert_not_called()

@@ -392,3 +392,66 @@ class TestSwitcherSetupTokenAccounts:
             row = dst.list_accounts(json_output=True, read_only=True)["accounts"][0]
             assert row["loginExpiresAt"] == "2027-10-07T00:00:00Z"
             assert row["loginKind"] == "setup-token"
+
+
+# ---------------------------------------------------------------------------
+# A refused token is charged to the slot that owns it
+# ---------------------------------------------------------------------------
+
+
+class TestRecordTokenRefused:
+    """`record_token_refused` is the owner proxy's entry point: it charges a
+    `/v1/messages` refusal to the slot whose stored credential carries the
+    request's own token, never to whichever slot is live when the proxy's
+    worker runs (a switch in between moved the live login and the refusal
+    was dropped)."""
+
+    def _two_slots(self, temp_home):
+        """Slot 1 a live browser login, slot 2 a setup-token not live."""
+        s = _linux_switcher()
+        s._write_account_credentials("1", "a@x.com", BROWSER_JSON)
+        s._write_account_config(
+            "1", "a@x.com",
+            json.dumps({"oauthAccount": {"emailAddress": "a@x.com", "accountUuid": "u1"}}),
+        )
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {
+            "email": "a@x.com", "uuid": "u1", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        s.add_account_from_token("sk-ant-oat01-x", "tok@x.com", slot=2)
+        (temp_home / ".claude" / ".credentials.json").write_text(BROWSER_JSON)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@x.com", "accountUuid": "u1"},
+        }))
+        assert s.current_account_number() == "1"  # premise: slot 2 not live
+        return s
+
+    def _strikes(self, s, num, email):
+        return s._usage_store.entries({num: (email, "")})[num].auth_dead_strikes
+
+    def test_a_refused_token_on_a_slot_not_live_strikes_that_slot(self, temp_home):
+        """Asserts: a refusal of slot 2's setup-token while slot 1 is live
+        strikes slot 2 and leaves slot 1 alone."""
+        s = self._two_slots(temp_home)
+        assert s.record_token_refused("sk-ant-oat01-x", 401) is True
+        assert self._strikes(s, "2", "tok@x.com") > 0
+        assert self._strikes(s, "1", "a@x.com") == 0
+
+    def test_a_token_no_slot_carries_strikes_nothing(self, temp_home):
+        """Asserts: a refusal of a token no stored credential carries returns
+        False and strikes no slot."""
+        s = self._two_slots(temp_home)
+        assert s.record_token_refused("sk-ant-oat01-gone", 401) is False
+        assert self._strikes(s, "2", "tok@x.com") == 0
+        assert self._strikes(s, "1", "a@x.com") == 0
+
+    def test_a_browser_login_token_is_never_struck(self, temp_home):
+        """Asserts: a refusal of the live browser login's token strikes
+        nothing; its refresh machinery owns its verdict."""
+        s = self._two_slots(temp_home)
+        assert s.record_token_refused("tok", 401) is False
+        assert self._strikes(s, "1", "a@x.com") == 0

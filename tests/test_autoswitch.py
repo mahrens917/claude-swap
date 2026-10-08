@@ -5206,13 +5206,16 @@ class TestLoopObeysThePollPlan:
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
         assert 0.9 * 360 <= delay <= 1.1 * 360
 
-    def test_a_store_failure_leaves_the_cadence_alone(self, harness):
+    def test_a_store_failure_reaches_the_loops_error_path(self, harness):
+        """Asserts: a usage store that cannot be read raises out of
+        `_next_delay` (to `run_loop`'s error path, which reports it) instead
+        of sleeping the ordinary cadence as if the plan had been read."""
         def boom(*a, **k):
             raise RuntimeError("store unreadable")
 
         harness.engine.switcher.usage_entries_by_account = boom
-        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
-        assert 0.9 * 60 <= delay <= 1.1 * 60
+        with pytest.raises(RuntimeError, match="store unreadable"):
+            harness.engine._next_delay(TickOutcome.NO_ACTION)
 
     def test_a_candidates_sooner_plan_shortens_the_sleep(self, harness):
         """A reset-driven wake is written to a CANDIDATE's own row
@@ -19945,9 +19948,7 @@ class TestT1313SettleWiring:
         pre-try reads (`_get_sequence_data()` on a torn `sequence.json`)
         can raise, and unguarded that would escape `_next_delay` into
         `run_loop`'s catch-all as a second ErrorEvent for the same tick.
-        Guarded the same way `_respect_poll_plan` guards itself just above
-        it: best-effort, the unshortened delay already computed stays
-        safe."""
+        Best-effort: the unshortened delay already computed stays safe."""
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         h.set_active(1)
@@ -19997,6 +19998,75 @@ class TestACorruptStateFileRaises:
         assert h.active_number() == 1
         error = next(e for e in h.events if e.kind == "error")
         assert str(h.engine.state_path) in error.message
+
+    def test_the_tick_reports_a_corrupt_state_file_as_needing_a_fix(
+        self, temp_home
+    ):
+        """Asserts: the tick's error event for a corrupt state file is not
+        transient and says the file needs fixing."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.state_path.write_text("{not json")
+        outcome = h.tick_with_usage({"1": _usage7(10.0, 10.0, _R_LATER)})
+        assert outcome is TickOutcome.ERROR, h.kinds()
+        errors = [e for e in h.events if e.kind == "error"]
+        assert len(errors) == 1
+        assert errors[0].transient is False
+        assert str(h.engine.state_path) in errors[0].message
+        assert "fixed" in errors[0].message
+
+    def test_the_poll_plan_raises_on_a_corrupt_state_file(self, temp_home):
+        """Asserts: `_respect_poll_plan` lets the state file's error out
+        instead of returning the unshortened delay as if the plan were
+        read."""
+        from claude_swap.switcher import EngineStateError
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.state_path.write_text("{not json")
+        with pytest.raises(EngineStateError):
+            h.engine._respect_poll_plan(60.0)
+
+    def test_an_error_tick_does_not_read_the_poll_plan_again(self, temp_home):
+        """Asserts: after an ERROR tick `_next_delay` gives the jittered
+        interval without re-reading the plan, so a corrupt state file is
+        reported once per tick, not twice."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.engine.state_path.write_text("{not json")
+        with patch.object(
+            h.engine, "_respect_poll_plan",
+            side_effect=AssertionError("the plan was read after an ERROR tick"),
+        ):
+            delay = h.engine._next_delay(TickOutcome.ERROR)
+        interval = h.engine.settings.interval_seconds
+        assert 0.9 * interval <= delay <= 1.1 * interval
+
+    def test_the_loop_reports_a_state_file_error_out_of_the_plan(self, temp_home):
+        """Asserts: a state file error raised from the delay computation
+        reaches `run_loop`'s error path as a non-transient event naming the
+        file."""
+        from claude_swap.switcher import EngineStateError
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        err = EngineStateError(f"{h.engine.state_path} is not valid JSON (x)")
+
+        def stop_after_wait(_delay):
+            h.engine._stop.set()
+            return True
+
+        with patch.object(h.engine, "tick", return_value=TickOutcome.NO_ACTION), \
+             patch.object(h.engine, "_next_delay", side_effect=err), \
+             patch.object(h.engine._wake, "wait", side_effect=stop_after_wait):
+            h.engine.run_loop()
+        errors = [e for e in h.events if e.kind == "error"]
+        assert errors and errors[0].transient is False
+        assert str(h.engine.state_path) in errors[0].message
 
     def test_a_missing_state_file_is_empty_state(self, temp_home):
         """Asserts: with no state file (first run) `_read_state` is empty."""

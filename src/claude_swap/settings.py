@@ -284,10 +284,17 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
     return AutoSwitchSettings(**kwargs)
 
 
-def _read_raw(path: Path) -> dict:
-    """The settings file as a dict. A file that is there but unreadable,
-    not JSON, or not a JSON object raises ``ConfigError`` naming the file:
-    every setting would otherwise run on a default nobody chose."""
+def _read_raw(path: Path, *, for_write: bool = False) -> dict:
+    """The settings file as a dict: the one reader of settings.json.
+
+    A file that is there but unreadable, not JSON, or not a JSON object
+    raises ``ConfigError`` naming the file: a read would otherwise run every
+    setting on a default nobody chose, and a read-modify-write starting from
+    ``{}`` would replace a malformed (maybe hand-recoverable) file with a
+    near-empty one. ``for_write`` names the caller a read-modify-write, and
+    adds the remedy to the message.
+    """
+    remedy = "; fix or delete it before changing settings" if for_write else ""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -296,13 +303,13 @@ def _read_raw(path: Path) -> dict:
         # documented default, the same as a file that sets none of them.
         return {}
     except (OSError, UnicodeDecodeError) as e:
-        raise ConfigError(f"could not read {path}: {e}") from e
+        raise ConfigError(f"could not read {path}: {e}{remedy}") from e
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as e:
-        raise ConfigError(f"{path} is not valid JSON ({e})") from e
+        raise ConfigError(f"{path} is not valid JSON ({e}){remedy}") from e
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path} is not a JSON object")
+        raise ConfigError(f"{path} is not a JSON object{remedy}")
     return raw
 
 
@@ -386,7 +393,7 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     """Write the autoswitch section, preserving unknown keys and sections."""
     path = settings_path(backup_root)
-    raw = _read_raw(path)
+    raw = _read_raw(path, for_write=True)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = _section(path, raw, "autoswitch")
     for field, json_key in _AUTOSWITCH_KEYS.items():
@@ -468,34 +475,6 @@ def format_setting_value(value) -> str:
     return str(value)
 
 
-def _read_raw_for_write(path: Path) -> dict:
-    """Raw read for the config write path: a corrupt file errors, never {}.
-
-    A read-modify-write starting from ``{}`` would replace a malformed (and
-    maybe hand-recoverable) file with a near-empty one. Same refusals as
-    ``_read_raw``, with the write path's remedy in the message.
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeDecodeError) as e:
-        raise ConfigError(f"could not read {path}: {e}") from e
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ConfigError(
-            f"{path} is not valid JSON ({e}); fix or delete it before "
-            "changing settings"
-        ) from e
-    if not isinstance(raw, dict):
-        raise ConfigError(
-            f"{path} is not a JSON object; fix or delete it before "
-            "changing settings"
-        )
-    return raw
-
-
 def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """Validate and persist one key for `cswap config set`; returns the value.
 
@@ -507,7 +486,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
+    raw = _read_raw(path, for_write=True)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get(spec.section)
     if not isinstance(section, dict):
@@ -522,7 +501,7 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
-    raw = _read_raw_for_write(path)
+    raw = _read_raw(path, for_write=True)
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
         return False
