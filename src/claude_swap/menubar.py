@@ -645,6 +645,22 @@ def start_engine_or_report(make_engine, notify):
         return None
 
 
+def run_engine_or_report(engine, notify) -> None:
+    """Run the auto-switch engine's loop, or report why it stopped.
+
+    A crash ends automatic switching for the rest of the menu bar's life, so
+    it is logged at ERROR with its traceback and ``notify(title, message)``
+    tells the user; the menu bar itself keeps running.
+    """
+    try:
+        engine.run_loop()
+    except Exception as e:  # noqa: BLE001 -- a crashed engine must not take the menu bar down; reported at ERROR and on screen
+        logging.getLogger("claude-swap").error(
+            "auto-switch engine crashed: %s", e, exc_info=True
+        )
+        notify("Auto-switch stopped", str(e))
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -821,10 +837,10 @@ def run(switcher) -> int:
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
 
         def _run_engine(self, engine):
-            try:
-                engine.run_loop()
-            except Exception:
-                self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
+            run_engine_or_report(
+                engine,
+                lambda title, message: rumps.notification("claude-swap", title, message),
+            )
 
         def _stop_engine(self):
             if self._engine is not None:

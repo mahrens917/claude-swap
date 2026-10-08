@@ -898,6 +898,22 @@ class TestMenuBarSettingsReads:
             "settings.json: autoswitch.threshold out of range",
         )]
 
+    def test_an_engine_that_crashes_is_reported_at_error(self, caplog):
+        """Asserts: an engine loop that raises is logged at ERROR (not DEBUG)
+        and the user is notified that auto-switch stopped."""
+        notes: list = []
+
+        class _Crashing:
+            def run_loop(self):
+                raise RuntimeError("store unreadable")
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            menubar.run_engine_or_report(
+                _Crashing(), lambda t, m: notes.append((t, m))
+            )
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+        assert notes == [("Auto-switch stopped", "store unreadable")]
+
     def test_an_engine_that_starts_is_returned(self):
         """Asserts: a successful build is returned and nothing is notified."""
         notes: list = []
