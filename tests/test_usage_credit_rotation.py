@@ -31,6 +31,7 @@ def _spend(remaining: float | None, *, used: float = 8.11, reached: bool = False
         "pct": None if limit is None else round(100 * used / limit, 2),
         "currency": "USD",
         "limit_reached": reached,
+        "reported": "dollars",
     }
 
 
@@ -81,7 +82,8 @@ class TestRotationOntoUsageCredits:
         assert switch.detail == "$591.89 left"
         credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
         assert credits.account["number"] == 2
-        assert credits.remaining == 591.89
+        assert credits.room.remaining == 591.89
+        assert credits.to_json()["reported"] == "dollars"
         assert credits.switched is True
         assert credits.to_json()["event"] == "spending-usage-credits"
         assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
@@ -234,7 +236,7 @@ class TestMoneyLeftRow:
         """Asserts: a capped account's `$$` row reads the dollars left of
         the cap, percent first."""
         spend = {"used": 8.11, "limit": 600.0, "remaining": 591.89, "pct": 1.35,
-                 "currency": "USD", "limit_reached": False}
+                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
         assert spend_row_body(spend) == "  1%   $591.89 left of $600.00"
         assert _format_usage_lines({"spend": spend}) == [
             "$$:   1%   $591.89 left of $600.00"
@@ -248,7 +250,7 @@ class TestMoneyLeftRow:
     def test_reached_row_names_the_cap(self):
         """Asserts: a reached cap reads as such, naming the cap."""
         spend = {"used": 600.0, "limit": 600.0, "remaining": 0.0, "pct": 100.0,
-                 "currency": "USD", "limit_reached": True}
+                 "currency": "USD", "limit_reached": True, "reported": "dollars"}
         assert spend_row_body(spend) == "100%   cap reached ($600.00)"
 
     def test_poll_line_prints_an_uncapped_credit_account(self):
@@ -732,3 +734,115 @@ class TestDynamicCandidatesAtTheirOwnBar:
         assert h.active_number() == 2
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "proactive"
+
+
+def _fraction(
+    pct: float | None = 0.0, *, reached: bool = False, reason: str | None = None
+) -> dict:
+    """A setup-token account's spend read off its reply headers
+    (``usage_store._header_fraction_spend``'s shape)."""
+    return {
+        "reported": "fraction", "used": None, "limit": None, "remaining": None,
+        "pct": pct, "currency": None, "limit_reached": reached,
+        "disabled_reason": reason,
+    }
+
+
+class TestHeaderMeasuredCredits:
+    """X3655: a setup-token account's usage credits, known only as a share
+    of its cap from its reply headers, count as credit room."""
+
+    def test_all_full_moves_to_a_setup_token_account_on_credits(
+        self, temp_home, caplog
+    ):
+        """Asserts: with every window full and only #2 holding an allowed
+        fraction spend, the engine switches to #2 on credits, and the event
+        and WARNING name its share of the cap rather than "no cap"."""
+        h = _harness(temp_home)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = h.tick_with_usage({
+                "1": _full(), "2": _full(_fraction(0.0)), "3": _full(),
+            })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "usage-credits"
+        assert switch.detail == "credits on, 0% of cap used"
+        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
+        payload = credits.to_json()
+        assert payload["reported"] == "fraction"
+        assert payload["remaining"] is None
+        assert payload["capUsedPct"] == 0.0
+        assert _warnings(caplog, _CREDITS_LINE) == [
+            "Every account's usage windows are full; sessions run on "
+            "Account-2 usage credits (credits on, 0% of cap used), switching to it"
+        ]
+
+    def test_out_of_credits_is_not_room(self, temp_home):
+        """Asserts: a fraction spend refused out_of_credits is no credit
+        target, so the fleet waits."""
+        h = _harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _full(),
+            "2": _full(_fraction(None, reached=True, reason="out_of_credits")),
+            "3": _full(),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
+
+    def test_a_known_dollar_amount_outranks_a_fraction(self, temp_home):
+        """Asserts: with the active out of credits, a peer with dollars left
+        takes the sessions over a peer with an unused fraction."""
+        h = _harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _full(), "2": _full(_fraction(0.0)), "3": _full(_spend(1.0)),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 3
+
+    def test_more_of_the_cap_unused_ranks_first_among_fractions(self, temp_home):
+        """Asserts: between two fraction peers, the one with less of its cap
+        used takes the sessions."""
+        h = _harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _full(), "2": _full(_fraction(80.0)), "3": _full(_fraction(10.0)),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 3
+
+    def test_an_allowed_fraction_account_takes_the_credit_switch_point(self):
+        """Asserts: `account_switch_point` gives an account whose reply
+        allowed its credits the credit threshold (100), and one out of
+        credits the plain threshold."""
+        from claude_swap.settings import account_switch_point
+
+        settings = AutoSwitchSettings(threshold=99.0, credit_threshold=100.0)
+        on = UsageEntry(last_good={"five_hour": {"pct": 99.5}, "spend": _fraction()})
+        out = UsageEntry(last_good={
+            "five_hour": {"pct": 99.5},
+            "spend": _fraction(None, reached=True, reason="out_of_credits"),
+        })
+        assert account_switch_point(settings, on) == 100.0
+        assert account_switch_point(settings, out) == 99.0
+
+    @pytest.mark.parametrize("spend, words", [
+        (_fraction(0.0), "credits on, 0% of cap used"),
+        (_fraction(None), "credits on, share of cap used unknown"),
+        (_fraction(None, reached=True, reason="out_of_credits"),
+         "credits on, out of credits"),
+        (_fraction(None, reached=True, reason="org_level_disabled"),
+         "credits refused (org_level_disabled)"),
+        (_fraction(None, reached=True), "credits on, cap reached"),
+    ])
+    def test_list_and_dashboard_rows_name_the_fraction(self, spend, words):
+        """Asserts: the `cswap list` `$$` row and the dashboard spend row read
+        a fraction spend in words, with no dollar figure and no leading
+        percent in the list row."""
+        from claude_swap.tui.widgets import usage_rows
+
+        assert spend_row_body(spend) == words
+        assert _format_usage_lines({"spend": spend}) == [f"$$: {words}"]
+        row = usage_rows({"spend": spend}, 0.0)[0]
+        assert row[0] == "$$"
+        assert row[1] == spend["pct"]
+        assert row[2] == words

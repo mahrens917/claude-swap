@@ -161,8 +161,11 @@ def usage_rows(
         if spend.get("resets_at"):
             reset, reset_full = _reset_parts(spend, now, fetched_at, entry=entry)
             suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
-        # pct is None for an uncapped account (no cap to be a share of);
-        # every renderer of this row branches on it.
+        # pct is None for an uncapped account (no cap to be a share of) and
+        # for a header-measured spend whose reply sent no utilization; every
+        # renderer of this row branches on it. A header-measured (fraction)
+        # spend's words come from spend_amounts too: "credits on, 0% of cap
+        # used" or "credits on, out of credits".
         pct = float(spend["pct"]) if spend["pct"] is not None else None
         rows.append((SPEND_LABEL, pct, suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):

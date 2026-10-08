@@ -32,7 +32,11 @@ from pathlib import Path
 from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
-from claude_swap.switcher import SENTINEL_NOTES, USAGE_RELOGIN_REQUIRED
+from claude_swap.switcher import (
+    SENTINEL_NOTES,
+    USAGE_RELOGIN_REQUIRED,
+    spend_amounts,
+)
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -313,8 +317,14 @@ def usage_summary(
                 seg += f" ({countdown})"
             parts.append(seg)
     spend = usage.get("spend")
-    if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
-        parts.append(f"$ {spend['pct']:.0f}%")
+    if isinstance(spend, dict):
+        if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
+            # A setup-token account's share of its cap, read off its reply
+            # headers: in words ("credits on, 0% of cap used"), so a refused
+            # or unknown share is not shown as a dollar-cap percent.
+            parts.append(f"$ {spend_amounts(spend)}")
+        elif isinstance(spend.get("pct"), (int, float)):
+            parts.append(f"$ {spend['pct']:.0f}%")
     return " · ".join(parts) if parts else "usage unavailable"
 
 

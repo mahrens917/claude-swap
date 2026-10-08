@@ -64,7 +64,7 @@ def _strike(sw, creds=DEAD, org=""):
     path = sw._usage_store.path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "accounts": {
             "2": {
                 "email": "owner@example.com",
@@ -163,7 +163,7 @@ class TestAdoptStashedLoginForSlot:
         path = switcher._usage_store.path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 "2": {
                     "email": "owner@example.com",
@@ -864,7 +864,7 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
         path = switcher._usage_store.path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {"2": {
                 "email": "", "organizationUuid": "",
                 "authDeadStrikes": AUTH_DEAD_STRIKES,

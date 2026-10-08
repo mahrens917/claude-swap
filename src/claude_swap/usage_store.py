@@ -1,7 +1,7 @@
 """Per-account usage table: last-known-good measurements + fetch/backoff state.
 
 Replaces the all-or-nothing 15s snapshot that previously lived in
-``cache/usage.json`` (now ``schemaVersion: 3``; a version-less legacy file is
+``cache/usage.json`` (now ``schemaVersion: 4``; a version-less legacy file is
 treated as empty — its data had a 15s shelf life anyway). One failed round
 trip no longer blanks every account: a failure updates the error/backoff
 fields and never touches the last-good measurement (stale-on-error). The
@@ -60,7 +60,15 @@ _logger = logging.getLogger("claude-swap")
 # 3: a stored ``spend`` carries ``remaining`` and ``limit_reached`` and may
 # have a null ``limit`` (uncapped). A version-2 file has spend objects the
 # readers cannot read, so it is discarded and every account refetched.
-SCHEMA_VERSION = 3
+# 4: a stored ``spend`` carries ``reported`` (``oauth.SPEND_REPORTED_*``):
+# dollars from the usage endpoint, or a fraction of the cap read off a
+# reply's overage headers. A version-3 file is NOT discarded: a setup-token
+# account's reading comes back only when the account is used, so dropping
+# it hides the account from the rotation (X3650). ``UsageStore.__init__``
+# rewrites it once as version 4 (``_migrate_v3_file``), every stored spend,
+# all of which version 3 took from the usage endpoint, marked ``dollars``.
+SCHEMA_VERSION = 4
+_SCHEMA_VERSION_V3 = 3
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
@@ -858,6 +866,86 @@ USAGE_HEADER_5H_RESET = "anthropic-ratelimit-unified-5h-reset"
 USAGE_HEADER_7D_PCT = "anthropic-ratelimit-unified-7d-utilization"
 USAGE_HEADER_7D_RESET = "anthropic-ratelimit-unified-7d-reset"
 
+# The usage-credit (extra usage, "overage") state rides on the same replies.
+# Read off live replies 2026-10-08: an account on credits past a full weekly
+# window answered 200 with ``overage-status: allowed``, ``overage-in-use:
+# true`` and ``overage-utilization: 0.0``; an account with credits on and no
+# money left carried ``overage-status: rejected`` and
+# ``overage-disabled-reason: out_of_credits``. The utilization is a 0-1
+# share of the monthly credit cap, never dollars. ``overage-in-use`` (whether
+# this request ran on credits) is deliberately not read: ``overage-status``
+# alone decides whether the account has credit room.
+USAGE_HEADER_OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
+USAGE_HEADER_OVERAGE_PCT = "anthropic-ratelimit-unified-overage-utilization"
+USAGE_HEADER_OVERAGE_RESET = "anthropic-ratelimit-unified-overage-reset"
+USAGE_HEADER_OVERAGE_DISABLED_REASON = (
+    "anthropic-ratelimit-unified-overage-disabled-reason"
+)
+# The overage-status values Claude Code itself handles. ``allowed_warning``
+# is allowed and nearing the cap. Any other value is unreadable here: it is
+# recorded as nothing and named once at WARNING
+# (``_warn_unknown_overage_status``).
+OVERAGE_STATUS_ALLOWED = "allowed"
+OVERAGE_STATUS_ALLOWED_WARNING = "allowed_warning"
+OVERAGE_STATUS_REJECTED = "rejected"
+KNOWN_OVERAGE_STATUSES = frozenset(
+    {OVERAGE_STATUS_ALLOWED, OVERAGE_STATUS_ALLOWED_WARNING, OVERAGE_STATUS_REJECTED}
+)
+_warned_overage_statuses: set[str] = set()
+
+
+def _warn_unknown_overage_status(status: str) -> None:
+    """Detector: a reply carried an overage-status this code cannot read.
+
+    Zero on a healthy system: a nonzero means Anthropic added a value and
+    the account's credit state goes unrecorded until the set above learns
+    it. Once per value per process, so a busy account does not repeat it.
+    """
+    if status in _warned_overage_statuses:
+        return
+    _warned_overage_statuses.add(status)
+    _logger.warning(
+        "Reply header %s carried an unknown value %r; the account's "
+        "usage-credit state is not recorded from it",
+        USAGE_HEADER_OVERAGE_STATUS,
+        status,
+    )
+
+
+def _header_fraction_spend(headers: Mapping[str, str]) -> dict | None:
+    """The ``spend`` object (``reported: fraction``) a reply's overage
+    headers describe, or None when the reply carries no overage-status or
+    an unknown one (the latter named at WARNING).
+
+    ``pct`` is the overage utilization on the 0-100 scale (None when the
+    header is absent); ``limit_reached`` is True when the status is
+    ``rejected`` or a disabled reason is present; ``disabled_reason`` is
+    that reason (e.g. ``out_of_credits``) or None; ``resets_at`` comes from
+    the overage reset header when it parses. ``used``, ``limit``,
+    ``remaining`` and ``currency`` are None: the headers carry no money.
+    """
+    status = headers.get(USAGE_HEADER_OVERAGE_STATUS)
+    if status is None:
+        return None
+    if status not in KNOWN_OVERAGE_STATUSES:
+        _warn_unknown_overage_status(status)
+        return None
+    reason = headers.get(USAGE_HEADER_OVERAGE_DISABLED_REASON) or None
+    spend: dict = {
+        "reported": oauth.SPEND_REPORTED_FRACTION,
+        "used": None,
+        "limit": None,
+        "remaining": None,
+        "pct": _header_pct(headers, USAGE_HEADER_OVERAGE_PCT),
+        "currency": None,
+        "limit_reached": status == OVERAGE_STATUS_REJECTED or reason is not None,
+        "disabled_reason": reason,
+    }
+    reset = _header_reset(headers, USAGE_HEADER_OVERAGE_RESET)
+    if reset is not None:
+        spend["resets_at"] = reset
+    return spend
+
 
 def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
     """A rate-limit header's utilization, as this store's 0-100 ``pct``
@@ -1246,6 +1334,47 @@ class UsageStore:
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
+        self._migrate_v3_file()
+
+    def _migrate_v3_file(self) -> None:
+        """Rewrite a version-3 store as version 4, once, under the lock.
+
+        Version 3 stored only usage-endpoint spends, so each stored
+        ``spend`` gains ``reported: dollars``; every other field is kept as
+        it was, so no reading is lost. After this the reader accepts only
+        version 4. Nothing happens for an absent, unreadable or other-version
+        file (``_read_rows`` reads those as empty, as before).
+        """
+        if not self.path.exists():
+            return
+        with self._lock():
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if (
+                not isinstance(raw, dict)
+                or raw.get("schemaVersion") != _SCHEMA_VERSION_V3
+            ):
+                return
+            rows = raw.get("accounts")
+            if not isinstance(rows, dict):
+                rows = {}
+            for row in rows.values():
+                last_good = row.get("lastGood") if isinstance(row, dict) else None
+                spend = (
+                    last_good.get("spend") if isinstance(last_good, dict) else None
+                )
+                if isinstance(spend, dict):
+                    spend["reported"] = oauth.SPEND_REPORTED_DOLLARS
+            self._write_rows(rows)
+        _logger.info(
+            "Usage store %s migrated from schema version %d to %d (%d accounts kept)",
+            self.path,
+            _SCHEMA_VERSION_V3,
+            SCHEMA_VERSION,
+            len(rows),
+        )
 
     # -- raw I/O ------------------------------------------------------------
 
@@ -1734,8 +1863,26 @@ class UsageStore:
         fetch involved, free on a request that already went out. Not an
         attempt: never touches the attempt ledger and never resets
         failure/backoff state (a header reading says nothing about whether
-        the next real fetch will succeed). Other stored windows (per-model,
-        extra usage — the headers carry neither) are left as they were.
+        the next real fetch will succeed). Per-model windows are left as
+        they were: the headers carry none.
+
+        Extra usage (usage credits) IS in the headers, as a share of the
+        monthly cap rather than dollars (``USAGE_HEADER_OVERAGE_*``). For a
+        ``header_only`` (setup-token) account, a reply carrying an
+        overage-status records a ``spend`` with ``reported: fraction``
+        (:func:`_header_fraction_spend`); a reply with no overage-status, or
+        an unknown one (named at WARNING), leaves the stored spend as it
+        was. An OAuth account's spend comes only from the usage endpoint
+        (``dollars``), so its replies' overage headers are not read: a
+        second source for the same account would contradict the endpoint
+        between its fetches.
+
+        The windows and the spend are recorded independently, whichever the
+        reply carries: the 5h/7d windows (and ``fetchedAt``) only when the
+        5h utilization is present, since ``fetchedAt`` vouches for every
+        stored window; the spend whenever its overage-status is present. A
+        reply may carry either alone (a 429 can carry no rate-limit headers
+        at all).
 
         Sets ``fetchedAt`` to ``now`` so the reading is trusted immediately,
         but leaves the real endpoint still due at ``lastAttemptAt +
@@ -1779,16 +1926,16 @@ class UsageStore:
         ``lastError`` and ``backoffUntil`` cleared) and ``nextPollAt`` is
         cleared, since no endpoint poll will ever follow it.
 
-        Returns True when a reading was recorded (the 5h utilization header
-        was present and the row was eligible); False, recording nothing,
-        otherwise.
+        Returns True when anything was recorded (the windows, the spend, or
+        both, on an eligible row); False, recording nothing, otherwise.
         """
         five_pct = _header_pct(headers, USAGE_HEADER_5H_PCT)
-        if five_pct is None:
-            return False
         seven_pct = _header_pct(headers, USAGE_HEADER_7D_PCT)
         five_reset = _header_reset(headers, USAGE_HEADER_5H_RESET)
         seven_reset = _header_reset(headers, USAGE_HEADER_7D_RESET)
+        header_spend = _header_fraction_spend(headers) if header_only else None
+        if five_pct is None and header_spend is None:
+            return False
         recorded = False
 
         def apply(_num: str, row: dict) -> None:
@@ -1804,6 +1951,11 @@ class UsageStore:
             recorded = True
             now = self.clock()
             last_good = dict(row.get("lastGood") or {})
+            if header_spend is not None:
+                last_good["spend"] = header_spend
+            row["lastGood"] = last_good
+            if five_pct is None:
+                return  # spend only: no window was read, fetchedAt stays
             five_entry: dict = {"pct": five_pct}
             if five_reset is not None:
                 five_entry["resets_at"] = five_reset
@@ -1813,7 +1965,6 @@ class UsageStore:
                 if seven_reset is not None:
                     seven_entry["resets_at"] = seven_reset
                 last_good["seven_day"] = seven_entry
-            row["lastGood"] = last_good
             row["fetchedAt"] = now
             if header_only:
                 row["consecutiveFailures"] = 0

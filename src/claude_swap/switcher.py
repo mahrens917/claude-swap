@@ -199,10 +199,13 @@ def spend_row_body(spend: dict) -> str:
 
     ``$591.89 left of $600.00`` under a cap, ``$8.11 used, no cap`` for an
     uncapped account (``limit`` None), ``cap reached ($600.00)`` once the API
-    says the cap is hit. The percent leads when the API sent one.
+    says the cap is hit. The percent leads when the API sent one, except
+    for a ``fraction`` spend (a setup-token account's reply headers), whose
+    words already carry it: ``credits on, 0% of cap used``.
     """
     pct = spend["pct"]
-    parts = [f"{pct:>3.0f}%"] if pct is not None else []
+    fraction = spend["reported"] == oauth.SPEND_REPORTED_FRACTION
+    parts = [f"{pct:>3.0f}%"] if pct is not None and not fraction else []
     cell = oauth.fresh_reset_strings(spend)
     if cell:
         parts.append(f"resets {cell[1]:<12}")
@@ -213,13 +216,33 @@ def spend_row_body(spend: dict) -> str:
 def spend_amounts(spend: dict) -> str:
     """The money words of a ``spend`` figure, shared by ``cswap list`` and
     the dashboard: ``$591.89 left of $600.00``, ``$8.11 used, no cap``
-    (``limit`` None), or ``cap reached ($600.00)``."""
+    (``limit`` None), or ``cap reached ($600.00)``. A ``fraction`` spend
+    (reply headers, no money figures) reads ``credits on, 0% of cap used``,
+    ``credits on, out of credits``, or the reply's own disabled reason."""
+    if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
+        return _fraction_spend_words(spend)
     limit = spend["limit"]
     if spend["limit_reached"]:
         return f"cap reached (${limit:,.2f})" if limit is not None else "cap reached"
     if limit is None:
         return f"${spend['used']:,.2f} used, no cap"
     return f"${spend['remaining']:,.2f} left of ${limit:,.2f}"
+
+
+def _fraction_spend_words(spend: dict) -> str:
+    """:func:`spend_amounts` for a ``fraction`` spend. Out of credits and
+    any other disabled reason are named; a refusal with no reason reads as
+    the cap reached."""
+    reason = spend["disabled_reason"]
+    if reason == "out_of_credits":
+        return "credits on, out of credits"
+    if reason is not None:
+        return f"credits refused ({reason})"
+    if spend["limit_reached"]:
+        return "credits on, cap reached"
+    if spend["pct"] is None:
+        return "credits on, share of cap used unknown"
+    return f"credits on, {spend['pct']:.0f}% of cap used"
 
 
 def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str, str]]:

@@ -74,7 +74,7 @@ class TestSchema:
     def test_round_trip(self, store, clock):
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         raw = json.loads(store.path.read_text(encoding="utf-8"))
-        assert raw["schemaVersion"] == 3
+        assert raw["schemaVersion"] == 4
         row = raw["accounts"]["1"]
         assert row["email"] == "a@x.com"
         assert row["lastGood"] == USAGE
@@ -396,7 +396,7 @@ class TestBackoff:
         store.path.write_text(
             json.dumps(
                 {
-                    "schemaVersion": 3,
+                    "schemaVersion": 4,
                     "accounts": {
                         "1": {
                             "email": "a@x.com",
@@ -1391,7 +1391,7 @@ class TestAttemptLedger:
         row.update(fields)
         rows[num] = row
         store.path.write_text(
-            json.dumps({"schemaVersion": 3, "accounts": rows}), encoding="utf-8"
+            json.dumps({"schemaVersion": 4, "accounts": rows}), encoding="utf-8"
         )
 
     def test_at_cap_blocks_reserve_in_both_modes(self, store, clock):
@@ -1572,7 +1572,7 @@ class TestHeaderReading:
         # untested independent of the consecutiveFailures one below.
         store.path.parent.mkdir(parents=True, exist_ok=True)
         store.path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 "1": {
                     "email": IDENT["1"][0],
@@ -1605,7 +1605,7 @@ class TestHeaderReading:
         # failure that carries no information about the strike.
         store.path.parent.mkdir(parents=True, exist_ok=True)
         store.path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 "1": {
                     "email": IDENT["1"][0],
@@ -1650,6 +1650,260 @@ class TestHeaderReading:
         assert entry.last_429_at == pytest.approx(before.last_429_at)
         # entries() reports the fresh reading, trusted.
         assert entry.decision_value() == entry.last_good
+
+
+# Live replies read 2026-10-08 (board row X3655): account 2 answered 200 on
+# credits past a full weekly window; account 4 had credits on and no money.
+_ON_CREDITS_HEADERS = {
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-5h-utilization": "0.3",
+    "anthropic-ratelimit-unified-7d-utilization": "1.01",
+    "anthropic-ratelimit-unified-overage-status": "allowed",
+    "anthropic-ratelimit-unified-overage-in-use": "true",
+    "anthropic-ratelimit-unified-overage-utilization": "0.0",
+    "anthropic-ratelimit-unified-overage-reset": "1793491200",
+}
+_OUT_OF_CREDITS_HEADERS = {
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits",
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.05",
+    "anthropic-ratelimit-unified-7d-utilization": "0.49",
+}
+_DOLLAR_SPEND = {
+    "reported": "dollars", "used": 8.11, "limit": 600.0, "remaining": 591.89,
+    "pct": 1.35, "currency": "USD", "limit_reached": False,
+}
+
+
+class TestHeaderOverageSpend:
+    """record_header_reading records the reply's overage (usage-credit)
+    headers as a ``reported: fraction`` spend."""
+
+    def test_an_allowed_overage_records_a_fraction_spend_with_room(
+        self, store, clock
+    ):
+        """Asserts: account 2's live reply (overage allowed, 0.0 of the cap
+        used) records a fraction spend: no money figures, pct 0, not
+        reached, no disabled reason, the overage reset kept, and usage-credit
+        room for the rotation."""
+        assert store.record_header_reading(
+            "1", IDENT, _ON_CREDITS_HEADERS, header_only=True
+        ) is True
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        resets_at = spend.pop("resets_at")
+        assert usage_store.parse_reset_ts(resets_at) == pytest.approx(1793491200)
+        assert spend == {
+            "reported": "fraction", "used": None, "limit": None,
+            "remaining": None, "pct": 0.0, "currency": None,
+            "limit_reached": False, "disabled_reason": None,
+        }
+        room = oauth.entry_credit_room(store.entries(IDENT)["1"])
+        assert room == oauth.UsageCreditRoom(
+            reported="fraction", remaining=None, cap_used_pct=0.0
+        )
+
+    def test_out_of_credits_records_a_reached_fraction_spend(self, store, clock):
+        """Asserts: account 4's live reply (overage rejected, reason
+        out_of_credits, no utilization header) records a fraction spend
+        that is reached, names the reason, has no pct, and is no room."""
+        store.record_header_reading(
+            "1", IDENT, _OUT_OF_CREDITS_HEADERS, header_only=True
+        )
+        entry = store.entries(IDENT)["1"]
+        spend = entry.last_good["spend"]
+        assert spend["reported"] == "fraction"
+        assert spend["pct"] is None
+        assert spend["limit_reached"] is True
+        assert spend["disabled_reason"] == "out_of_credits"
+        assert "resets_at" not in spend
+        assert oauth.entry_credit_room(entry) is None
+
+    def test_a_disabled_reason_alone_marks_the_spend_reached(self, store, clock):
+        """Asserts: a disabled reason under a non-rejected status still
+        reads as reached (no room)."""
+        headers = {
+            usage_store.USAGE_HEADER_5H_PCT: "0.1",
+            usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+            usage_store.USAGE_HEADER_OVERAGE_DISABLED_REASON: "org_level_disabled",
+        }
+        store.record_header_reading("1", IDENT, headers, header_only=True)
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["limit_reached"] is True
+        assert spend["disabled_reason"] == "org_level_disabled"
+
+    def test_no_overage_status_leaves_the_spend_as_it_was(self, store, clock):
+        """Asserts: a reply with no overage-status leaves a stored fraction
+        spend untouched, and records none where there was none."""
+        store.record_header_reading(
+            "1", IDENT, _ON_CREDITS_HEADERS, header_only=True
+        )
+        before = store.entries(IDENT)["1"].last_good["spend"]
+        clock.advance(60)
+        plain = {usage_store.USAGE_HEADER_5H_PCT: "0.4"}
+        assert store.record_header_reading("1", IDENT, plain, header_only=True)
+        assert store.entries(IDENT)["1"].last_good["spend"] == before
+        store.record_header_reading("2", IDENT, plain, header_only=True)
+        assert "spend" not in store.entries(IDENT)["2"].last_good
+
+    def test_an_oauth_accounts_spend_never_comes_from_headers(
+        self, store, clock
+    ):
+        """Asserts: for an OAuth (not header-only) account, a reply's
+        overage headers record no spend: a stored dollar spend stays, an
+        account with none stays with none, and an overage-only reply with
+        no 5h figure records nothing at all."""
+        store.record(
+            {"1": FetchRecord(usage={**USAGE, "spend": dict(_DOLLAR_SPEND)})},
+            IDENT,
+        )
+        store.record({"2": FetchRecord(usage=dict(USAGE))}, IDENT)
+        clock.advance(60)
+        assert store.record_header_reading("1", IDENT, _OUT_OF_CREDITS_HEADERS)
+        assert store.record_header_reading("2", IDENT, _OUT_OF_CREDITS_HEADERS)
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["spend"] == _DOLLAR_SPEND
+        assert entry.last_good["five_hour"]["pct"] == pytest.approx(5.0)
+        assert "spend" not in store.entries(IDENT)["2"].last_good
+        overage_only = {
+            usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+            usage_store.USAGE_HEADER_OVERAGE_PCT: "0.2",
+        }
+        assert store.record_header_reading("2", IDENT, overage_only) is False
+        assert "spend" not in store.entries(IDENT)["2"].last_good
+
+    def test_an_overage_only_reply_records_the_spend_alone(self, store, clock):
+        """Asserts: a header-only account's reply carrying the overage
+        headers but no 5h utilization still records its spend, and leaves
+        the stored windows and fetchedAt as they were."""
+        store.record_header_reading(
+            "1", IDENT, {usage_store.USAGE_HEADER_5H_PCT: "0.3"}, header_only=True
+        )
+        before = store.entries(IDENT)["1"]
+        clock.advance(120)
+        overage_only = {
+            usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+            usage_store.USAGE_HEADER_OVERAGE_PCT: "0.2",
+        }
+        assert store.record_header_reading(
+            "1", IDENT, overage_only, header_only=True
+        ) is True
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["spend"]["pct"] == pytest.approx(20.0)
+        assert entry.last_good["five_hour"] == before.last_good["five_hour"]
+        assert entry.fetched_at == before.fetched_at
+
+    def test_an_overage_only_reply_on_an_unread_account_records_the_spend(
+        self, store, clock
+    ):
+        """Asserts: a header-only account with no reading yet gains its
+        spend from an overage-only reply, with no window invented."""
+        no_windows = {
+            k: v for k, v in _OUT_OF_CREDITS_HEADERS.items()
+            if "utilization" not in k
+        }
+        assert store.record_header_reading(
+            "1", IDENT, no_windows, header_only=True
+        ) is True
+        last_good = store.entries(IDENT)["1"].last_good
+        assert last_good["spend"]["disabled_reason"] == "out_of_credits"
+        assert "five_hour" not in last_good and "seven_day" not in last_good
+
+    def test_an_unknown_overage_status_warns_once_and_records_no_spend(
+        self, store, clock, caplog, monkeypatch
+    ):
+        """Asserts: an overage-status outside the known set is named at
+        WARNING once per value, and records no spend."""
+        monkeypatch.setattr(usage_store, "_warned_overage_statuses", set())
+        headers = {
+            usage_store.USAGE_HEADER_5H_PCT: "0.1",
+            usage_store.USAGE_HEADER_OVERAGE_STATUS: "throttled",
+        }
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record_header_reading("1", IDENT, headers, header_only=True)
+            store.record_header_reading("1", IDENT, headers, header_only=True)
+            store.record_header_reading(
+                "1", IDENT,
+                {**headers, usage_store.USAGE_HEADER_OVERAGE_STATUS: "paused"},
+                header_only=True,
+            )
+        lines = [
+            r for r in caplog.records
+            if "carried an unknown value" in r.getMessage()
+        ]
+        assert [r.levelno for r in lines] == [logging.WARNING, logging.WARNING]
+        assert "'throttled'" in lines[0].getMessage()
+        assert "'paused'" in lines[1].getMessage()
+        assert "spend" not in store.entries(IDENT)["1"].last_good
+
+    @pytest.mark.parametrize("status", ["allowed", "allowed_warning", "rejected"])
+    def test_known_statuses_raise_no_warning(
+        self, store, clock, caplog, monkeypatch, status
+    ):
+        """Asserts: the three known overage-status values record a spend
+        and log no unknown-value line."""
+        monkeypatch.setattr(usage_store, "_warned_overage_statuses", set())
+        headers = {
+            usage_store.USAGE_HEADER_5H_PCT: "0.1",
+            usage_store.USAGE_HEADER_OVERAGE_STATUS: status,
+        }
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record_header_reading("1", IDENT, headers, header_only=True)
+        assert not any(
+            "carried an unknown value" in r.getMessage() for r in caplog.records
+        )
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["limit_reached"] is (status == "rejected")
+
+    def test_a_version_3_file_is_migrated_with_every_reading_kept(
+        self, tmp_path, clock
+    ):
+        """Asserts: a version-3 store holding an account-1 dollar spend and
+        an account-2 header-only reading (the setup-token kind only use can
+        re-acquire, X3650) is rewritten as version 4 on load with both
+        readings intact, the dollar spend marked ``reported: dollars``."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        v3_spend = {k: v for k, v in _DOLLAR_SPEND.items() if k != "reported"}
+        header_only_good = {
+            "five_hour": {"pct": 30.0, "resets_at": "2099-01-01T05:00:00Z"},
+            "seven_day": {"pct": 100.0},
+        }
+        (cache / "usage.json").write_text(json.dumps({
+            "schemaVersion": 3,
+            "accounts": {
+                "1": {"email": "a@x.com", "organizationUuid": "",
+                      "lastGood": {**USAGE, "spend": v3_spend},
+                      "fetchedAt": clock.now},
+                "2": {"email": "b@x.com", "organizationUuid": "org-2",
+                      "lastGood": header_only_good, "fetchedAt": clock.now,
+                      "consecutiveFailures": 0, "nextPollAt": None},
+            },
+        }), encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        raw = json.loads((cache / "usage.json").read_text(encoding="utf-8"))
+        assert raw["schemaVersion"] == 4
+        entries = store.entries(IDENT)
+        assert entries["1"].last_good == {**USAGE, "spend": _DOLLAR_SPEND}
+        assert entries["1"].fetched_at == clock.now
+        assert entries["2"].last_good == header_only_good
+        assert entries["2"].fetched_at == clock.now
+        assert oauth.entry_credit_room(entries["1"]) == oauth.UsageCreditRoom(
+            reported="dollars", remaining=591.89
+        )
+
+    def test_a_version_2_file_is_still_read_as_empty(self, tmp_path, clock):
+        """Asserts: only version 3 is migrated; an older file is read as
+        empty, as before."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "usage.json").write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {"1": {"email": "a@x.com", "organizationUuid": "",
+                               "lastGood": USAGE}},
+        }), encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        assert store.entries(IDENT)["1"].last_good is None
 
 
 class TestLast429Marker:

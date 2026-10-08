@@ -49,7 +49,7 @@ def capped_spend(used: float, limit: float, pct: float, **extra) -> dict:
     """A capped usage-credit ``spend`` figure in ``oauth.build_usage_result``'s
     shape, ``remaining`` derived the way the parser derives it."""
     return {"used": used, "limit": limit, "remaining": limit - used, "pct": pct,
-            "currency": "USD", "limit_reached": False, **extra}
+            "currency": "USD", "limit_reached": False, "reported": "dollars", **extra}
 
 
 def make_entry(
@@ -753,7 +753,7 @@ class TestUsageRows:
                 "remaining": 37.5,
                 "pct": 25.0,
                 "currency": "USD",
-                "limit_reached": False,
+                "limit_reached": False, "reported": "dollars",
                 "resets_at": _iso_in(7200),
             }
         )
@@ -769,7 +769,7 @@ class TestUsageRows:
         from claude_swap.tui.widgets import usage_rows
 
         spend = {"used": 8.11, "limit": None, "remaining": None, "pct": None,
-                 "currency": "USD", "limit_reached": False}
+                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
         row = usage_rows({"spend": spend}, time.time())[0]
         assert row == ("$$", None, "$8.11 used, no cap", "$8.11 used, no cap")
 
@@ -2576,7 +2576,7 @@ class TestAutoScreen:
         }))
         spend = {
             "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
-            "currency": "USD", "limit_reached": False,
+            "currency": "USD", "limit_reached": False, "reported": "dollars",
         } if with_credits else None
         ticks: list = []
         real_card = widgets.account_card_text
@@ -3466,7 +3466,7 @@ class TestUnswitchableRowsAreListed:
             **usage,
             "spend": {
                 "used": 50.0, "limit": 100.0, "remaining": 50.0, "pct": 50.0,
-                "currency": "USD", "limit_reached": False,
+                "currency": "USD", "limit_reached": False, "reported": "dollars",
             },
         }
 
@@ -3870,7 +3870,7 @@ class TestUnswitchableRowsAreListed:
         hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
         spend = {
             "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
-            "currency": "USD", "limit_reached": False,
+            "currency": "USD", "limit_reached": False, "reported": "dollars",
         }
         snap = self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=hot),

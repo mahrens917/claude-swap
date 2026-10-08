@@ -117,6 +117,7 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     if "spend" in usage:
         spend = usage["spend"]
         spend_out: dict = {
+            "reported": spend["reported"],
             "used": spend["used"],
             "limit": spend["limit"],
             "remaining": spend["remaining"],
@@ -124,6 +125,8 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
             "currency": spend["currency"],
             "limitReached": spend["limit_reached"],
         }
+        if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
+            spend_out["disabledReason"] = spend["disabled_reason"]
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
         cell = oauth.fresh_reset_strings(spend)
@@ -170,10 +173,20 @@ def _spend_from_json(spend: object) -> dict:
     monthly cap and numbers otherwise, and ``remaining`` must equal
     ``limit - used`` so an edited document cannot claim money the cap does
     not leave. ``pct`` is null when the API sent no utilization (always so
-    for an uncapped account).
+    for an uncapped account). ``reported`` names the measurement:
+    ``dollars`` (the usage endpoint) or ``fraction`` (a setup-token
+    account's reply headers, see :func:`_fraction_spend_from_json`).
     """
     if not isinstance(spend, dict):
         raise ValueError("spend must be an object")
+    reported = spend.get("reported")
+    if reported == oauth.SPEND_REPORTED_FRACTION:
+        return _fraction_spend_from_json(spend)
+    if reported != oauth.SPEND_REPORTED_DOLLARS:
+        raise ValueError(
+            f"spend.reported must be {oauth.SPEND_REPORTED_DOLLARS!r} or "
+            f"{oauth.SPEND_REPORTED_FRACTION!r}, not {reported!r}"
+        )
     used = spend.get("used")
     if not _is_number(used) or used < 0:
         raise ValueError("spend.used must be a non-negative number")
@@ -201,6 +214,7 @@ def _spend_from_json(spend: object) -> dict:
     if not isinstance(spend.get("limitReached"), bool):
         raise ValueError("spend.limitReached must be a boolean")
     out: dict = {
+        "reported": reported,
         "used": float(used),
         "limit": float(limit) if limit is not None else None,
         "remaining": float(remaining) if remaining is not None else None,
@@ -208,6 +222,50 @@ def _spend_from_json(spend: object) -> dict:
         "currency": spend["currency"],
         "limit_reached": spend["limitReached"],
     }
+    _spend_reset_from_json(spend, out)
+    return out
+
+
+def _fraction_spend_from_json(spend: dict) -> dict:
+    """A ``reported: fraction`` spend back to the internal shape.
+
+    The reply headers carry only a share of the monthly cap, so ``used``,
+    ``limit``, ``remaining`` and ``currency`` must all be present and null;
+    ``pct`` is the share used (null when the reply sent none) and
+    ``disabledReason`` the reply's reason credits are off, or null.
+    """
+    for key in ("used", "limit", "remaining", "currency"):
+        if key not in spend or spend[key] is not None:
+            raise ValueError(f"spend.{key} must be null for a fraction spend")
+    if "pct" not in spend:
+        raise ValueError("spend.pct is missing (null means no figure)")
+    pct = spend["pct"]
+    if pct is not None and (not _is_number(pct) or pct < 0):
+        raise ValueError("spend.pct must be a non-negative number or null")
+    if not isinstance(spend.get("limitReached"), bool):
+        raise ValueError("spend.limitReached must be a boolean")
+    if "disabledReason" not in spend:
+        raise ValueError("spend.disabledReason is missing (null means none)")
+    reason = spend["disabledReason"]
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError("spend.disabledReason must be a string or null")
+    out: dict = {
+        "reported": oauth.SPEND_REPORTED_FRACTION,
+        "used": None,
+        "limit": None,
+        "remaining": None,
+        "pct": float(pct) if pct is not None else None,
+        "currency": None,
+        "limit_reached": spend["limitReached"],
+        "disabled_reason": reason,
+    }
+    _spend_reset_from_json(spend, out)
+    return out
+
+
+def _spend_reset_from_json(spend: dict, out: dict) -> None:
+    """Copy a spend's ``resetsAt`` into ``out`` with its fetch-time strings
+    rebuilt; nothing when it is null or absent."""
     resets_at = spend.get("resetsAt")
     if resets_at is not None:
         if not isinstance(resets_at, str):
@@ -217,7 +275,6 @@ def _spend_from_json(spend: object) -> dict:
         except (ValueError, TypeError):
             raise ValueError(f"spend.resetsAt is not an ISO-8601 time: {resets_at!r}")
         out["resets_at"] = resets_at
-    return out
 
 
 def usage_from_json(usage: object) -> dict:

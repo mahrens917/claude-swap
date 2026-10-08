@@ -830,6 +830,16 @@ def _log_usage_failure(
 
 
 
+# How a ``spend`` object was measured, in its ``reported`` key. ``dollars``:
+# the usage endpoint's ``extra_usage`` block (:func:`_spend_entry`), with
+# ``used``/``limit``/``remaining`` in money. ``fraction``: a ``/v1/messages``
+# reply's overage headers (``usage_store.record_header_reading``), which give
+# only a share of the monthly credit cap, so ``used``, ``limit``,
+# ``remaining`` and ``currency`` are None and ``pct`` is the share used.
+SPEND_REPORTED_DOLLARS = "dollars"
+SPEND_REPORTED_FRACTION = "fraction"
+
+
 def _spend_entry(eu: dict) -> dict | None:
     """The ``spend`` object for an account whose extra usage is enabled.
 
@@ -863,6 +873,7 @@ def _spend_entry(eu: dict) -> dict | None:
         )
         return None
     spend_entry: dict = {
+        "reported": SPEND_REPORTED_DOLLARS,
         "used": used,
         "limit": limit,
         "remaining": limit - used if limit is not None else None,
@@ -880,26 +891,41 @@ def _spend_entry(eu: dict) -> dict | None:
 class UsageCreditRoom:
     """Usage-credit money an account can still spend past its full windows.
 
-    ``remaining`` is dollars left under the monthly cap, or None when the
-    account has no cap (unlimited), which ranks above any finite amount.
+    ``reported`` is the spend's measurement kind (``SPEND_REPORTED_*``).
+    For ``dollars``, ``remaining`` is dollars left under the monthly cap, or
+    None when the account has no cap (unlimited). For ``fraction`` (a
+    setup-token account read off its reply headers), ``remaining`` is None
+    and ``cap_used_pct`` is the share of the cap used, None when the reply
+    carried no utilization figure.
     """
 
+    reported: str
     remaining: float | None
+    cap_used_pct: float | None = None
 
-    def rank_key(self) -> tuple[int, float]:
-        """Sort key: larger is more room; an unlimited account outranks all."""
+    def rank_key(self) -> tuple[int, int, float]:
+        """Sort key, larger is more room: no cap first, then any known
+        dollar amount (larger first), then a fraction (more of the cap
+        unused first, an unknown share last)."""
+        if self.reported == SPEND_REPORTED_FRACTION:
+            if self.cap_used_pct is None:
+                return (0, 0, 0.0)
+            return (0, 1, 100.0 - self.cap_used_pct)
         if self.remaining is None:
-            return (1, 0.0)
-        return (0, self.remaining)
+            return (2, 1, 0.0)
+        return (1, 1, self.remaining)
 
 
 def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
     """How much usage-credit room this account has, or None when it has none.
 
     None when the reading carries no ``spend`` object (credits off), when the
-    API says the monthly cap is reached, or when the cap leaves nothing
-    (``remaining <= 0``). The 5h/7d windows play no part: this is the axis
-    :func:`account_headroom` deliberately excludes.
+    API says the monthly cap is reached (for a ``fraction`` spend: the reply
+    said the overage is rejected or disabled), or when a dollar cap leaves
+    nothing (``remaining <= 0``). An allowed fraction spend is room even
+    with its share unknown: the reply itself said credits answer. The 5h/7d
+    windows play no part: this is the axis :func:`account_headroom`
+    deliberately excludes.
     """
     if not isinstance(usage, dict):
         return None
@@ -908,10 +934,15 @@ def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
         return None
     if spend["limit_reached"]:
         return None
+    reported = spend["reported"]
+    if reported == SPEND_REPORTED_FRACTION:
+        return UsageCreditRoom(
+            reported=reported, remaining=None, cap_used_pct=spend["pct"]
+        )
     remaining = spend["remaining"]
     if remaining is not None and remaining <= 0:
         return None
-    return UsageCreditRoom(remaining=remaining)
+    return UsageCreditRoom(reported=reported, remaining=remaining)
 
 
 def entry_credit_room(entry) -> UsageCreditRoom | None:

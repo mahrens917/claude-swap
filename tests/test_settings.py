@@ -658,6 +658,7 @@ def _credit_entry(*, remaining: float | None = 50.0, reached: bool = False,
         "pct": None,
         "currency": "USD",
         "limit_reached": reached,
+        "reported": "dollars",
     }
     return UsageEntry(
         sentinel=sentinel,

@@ -5258,7 +5258,7 @@ class TestLoopObeysThePollPlan:
         path = harness.switcher._usage_store.path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 quarantined: {
                     "email": f"{'b' if quarantined == '2' else 'c'}@example.com",
@@ -5296,7 +5296,7 @@ class TestLoopObeysThePollPlan:
         path.parent.mkdir(parents=True, exist_ok=True)
         now = harness.clock.now
         path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 capped: {
                     "email": f"{'b' if capped == '2' else 'c'}@example.com",
@@ -6333,7 +6333,7 @@ class TestAModelWindowIsNotABlackout:
             threshold=90.0,
             spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0,
                          "remaining": 258.31, "currency": "USD",
-                         "limit_reached": False}},
+                         "limit_reached": False, "reported": "dollars"}},
         )
         text = event.human()
         assert "#8: ?" not in text, text
@@ -15009,7 +15009,7 @@ def _seed_healed_strike(h: EngineHarness, num: str, email: str, *, stale: bool =
     path = h.switcher._usage_store.path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "accounts": {
             num: {
                 "email": email,
@@ -15053,7 +15053,7 @@ def _run_write_probe(harness: EngineHarness, *, with_strike: bool):
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "accounts": {
                 "2": {
                     "email": "b@example.com",
@@ -15678,7 +15678,7 @@ class TestStoppedEngineDoesNotAct:
             m.AllExhaustedEvent(earliest_reset_at=None),
             m.SpendingUsageCreditsEvent(
                 account={"number": 2, "email": "b@example.com"},
-                remaining=None,
+                room=oauth.UsageCreditRoom(reported="dollars", remaining=None),
                 switched=False,
             ),
             m.SleepEvent(seconds=1.0, until="2024-01-01T00:00:00Z"),

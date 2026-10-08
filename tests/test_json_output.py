@@ -40,7 +40,7 @@ class TestJsonHelpers:
                           "countdown": "4h", "clock": "02:00"},
             "seven_day": {"pct": 16.0},
             "spend": {"used": 12.5, "limit": 300.0, "remaining": 287.5, "pct": 4.0,
-                      "currency": "USD", "limit_reached": False,
+                      "currency": "USD", "limit_reached": False, "reported": "dollars",
                       "resets_at": resets_at},
         }
         out = usage_to_json(usage)
@@ -98,7 +98,7 @@ class TestJsonHelpers:
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {"spend": {"used": 1.0, "limit": 10.0, "remaining": 9.0, "pct": 10.0,
-                           "currency": "USD", "limit_reached": False,
+                           "currency": "USD", "limit_reached": False, "reported": "dollars",
                            "resets_at": resets_at,
                            "countdown": "stale", "clock": "stale-clock"}}
         out = usage_to_json(usage)
@@ -638,7 +638,7 @@ class TestStatusJson:
         set_setting(switcher.backup_dir, "autoswitch.creditThreshold", "100")
         now = time.time()
         spend = {"used": 10.0, "limit": 60.0, "remaining": 50.0, "pct": 16.67,
-                 "currency": "USD", "limit_reached": False}
+                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
         entries = {
             "1": UsageEntry(last_good={"five_hour": {"pct": 99.5}, "spend": spend},
                             fetched_at=now, age_s=0.0),
@@ -973,7 +973,7 @@ class TestUsageFromJson:
         "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
         "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
         "spend": {"used": 5.0, "limit": 50.0, "remaining": 45.0, "pct": 10.0,
-                  "currency": "USD", "limit_reached": False,
+                  "currency": "USD", "limit_reached": False, "reported": "dollars",
                   "resets_at": "2099-02-01T00:00:00+00:00"},
         "scoped": [{"name": "Fable", "pct": 30.0,
                     "resets_at": "2099-01-07T00:00:00+00:00"}],
@@ -1024,12 +1024,12 @@ class TestUsageFromJson:
         internal = {
             "five_hour": {"pct": 100.0},
             "spend": {"used": 8.11, "limit": None, "remaining": None, "pct": None,
-                      "currency": "USD", "limit_reached": False},
+                      "currency": "USD", "limit_reached": False, "reported": "dollars"},
         }
         out = usage_to_json(internal)
         assert out["spend"] == {
             "used": 8.11, "limit": None, "remaining": None, "pct": None,
-            "currency": "USD", "limitReached": False,
+            "currency": "USD", "limitReached": False, "reported": "dollars",
         }
         assert usage_from_json(out) == internal
 
@@ -1040,7 +1040,7 @@ class TestUsageFromJson:
 
         out = usage_to_json({
             "spend": {"used": 8.11, "limit": 600.0, "remaining": 591.89, "pct": 1.0,
-                      "currency": "USD", "limit_reached": False},
+                      "currency": "USD", "limit_reached": False, "reported": "dollars"},
         })
         assert out["spend"]["remaining"] == 591.89
         assert out["spend"]["limitReached"] is False
@@ -1048,22 +1048,86 @@ class TestUsageFromJson:
     @pytest.mark.parametrize("spend", [
         # remaining disagrees with limit - used: an edited document claiming money
         {"used": 1, "limit": 10, "remaining": 50, "pct": 10, "currency": "USD",
-         "limitReached": False},
+         "limitReached": False, "reported": "dollars"},
         # a finite cap with no remaining figure
         {"used": 1, "limit": 10, "remaining": None, "pct": 10, "currency": "USD",
-         "limitReached": False},
+         "limitReached": False, "reported": "dollars"},
         # no cap but a remaining figure
         {"used": 1, "limit": None, "remaining": 5, "pct": None, "currency": "USD",
-         "limitReached": False},
+         "limitReached": False, "reported": "dollars"},
         # the cap verdict missing
-        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD"},
+        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD",
+         "reported": "dollars"},
         # remaining key absent rather than null
         {"used": 1, "limit": None, "pct": None, "currency": "USD",
-         "limitReached": False},
+         "limitReached": False, "reported": "dollars"},
     ])
     def test_an_inconsistent_spend_is_refused(self, spend):
         """Asserts: a ``spend`` object whose cap, remainder and verdict do not
         agree is refused before anything is written."""
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json({"spend": spend})
+
+    FRACTION_INTERNAL = {
+        "reported": "fraction", "used": None, "limit": None, "remaining": None,
+        "pct": 0.0, "currency": None, "limit_reached": False,
+        "disabled_reason": None, "resets_at": "2099-02-01T00:00:00+00:00",
+    }
+
+    def test_a_fraction_spend_projects_reported_and_null_money(self):
+        """Asserts: a header-measured spend serializes with ``reported:
+        fraction``, null money figures and its ``disabledReason``."""
+        from claude_swap.json_output import usage_to_json
+
+        out = usage_to_json({"spend": dict(self.FRACTION_INTERNAL)})["spend"]
+        out.pop("countdown")
+        out.pop("clock")
+        assert out == {
+            "reported": "fraction", "used": None, "limit": None,
+            "remaining": None, "pct": 0.0, "currency": None,
+            "limitReached": False, "disabledReason": None,
+            "resetsAt": "2099-02-01T00:00:00+00:00",
+        }
+
+    def test_a_fraction_spend_round_trips(self):
+        """Asserts: a fraction spend, reached with a disabled reason or
+        allowed with a share, reads back to the internal shape."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        reached = {
+            **self.FRACTION_INTERNAL, "pct": None, "limit_reached": True,
+            "disabled_reason": "out_of_credits",
+        }
+        for spend in (dict(self.FRACTION_INTERNAL), reached):
+            back = usage_from_json(usage_to_json({"spend": dict(spend)}))["spend"]
+            assert back.pop("countdown") and back.pop("clock")
+            assert back == spend
+
+    @pytest.mark.parametrize("spend", [
+        # money on a fraction spend
+        {"reported": "fraction", "used": 1.0, "limit": None, "remaining": None,
+         "pct": 0.0, "currency": None, "limitReached": False,
+         "disabledReason": None},
+        # a currency on a fraction spend
+        {"reported": "fraction", "used": None, "limit": None, "remaining": None,
+         "pct": 0.0, "currency": "USD", "limitReached": False,
+         "disabledReason": None},
+        # the disabled reason key absent
+        {"reported": "fraction", "used": None, "limit": None, "remaining": None,
+         "pct": 0.0, "currency": None, "limitReached": False},
+        # an unknown measurement kind
+        {"reported": "cents", "used": 1, "limit": 10, "remaining": 9,
+         "pct": 10, "currency": "USD", "limitReached": False},
+        # reported missing
+        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD",
+         "limitReached": False},
+    ])
+    def test_a_malformed_reported_spend_is_refused(self, spend):
+        """Asserts: a spend whose ``reported`` kind is missing or unknown, or
+        a fraction spend carrying money or no ``disabledReason``, is
+        refused."""
         from claude_swap.json_output import usage_from_json
 
         with pytest.raises(ValueError):

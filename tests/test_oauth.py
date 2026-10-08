@@ -377,7 +377,7 @@ class TestFetchUsage:
         assert result["spend"]["limit"] == 600.0
         assert result["spend"]["remaining"] == pytest.approx(591.89)
         assert oauth.usage_credit_room(result) == oauth.UsageCreditRoom(
-            remaining=pytest.approx(591.89)
+            reported="dollars", remaining=pytest.approx(591.89)
         )
 
     def test_extra_usage_unlimited_keeps_spend_with_no_cap(self):
@@ -401,11 +401,13 @@ class TestFetchUsage:
         assert result["seven_day"]["pct"] == 61.0
         assert result["spend"] == {
             "used": 8.11, "limit": None, "remaining": None, "pct": None,
-            "currency": "USD", "limit_reached": False,
+            "currency": "USD", "limit_reached": False, "reported": "dollars",
         }
         room = oauth.usage_credit_room(result)
-        assert room == oauth.UsageCreditRoom(remaining=None)
-        assert room.rank_key() > oauth.UsageCreditRoom(remaining=1e9).rank_key()
+        assert room == oauth.UsageCreditRoom(reported="dollars", remaining=None)
+        assert room.rank_key() > oauth.UsageCreditRoom(
+            reported="dollars", remaining=1e9
+        ).rank_key()
 
     def test_extra_usage_limit_reached_has_no_credit_room(self):
         """Asserts: the API's spend_limit_reached verdict keeps the figure
@@ -425,13 +427,54 @@ class TestFetchUsage:
         """Asserts: remaining <= 0 is no room even when the API has not yet
         flipped spend_limit_reached."""
         usage = {"spend": {"used": 600.0, "limit": 600.0, "remaining": 0.0,
-                           "pct": 100.0, "currency": "USD", "limit_reached": False}}
+                           "pct": 100.0, "currency": "USD", "limit_reached": False, "reported": "dollars"}}
         assert oauth.usage_credit_room(usage) is None
 
     def test_credits_off_has_no_credit_room(self):
         """Asserts: no spend object (extra usage disabled) is no room."""
         assert oauth.usage_credit_room({"five_hour": {"pct": 100.0}}) is None
         assert oauth.usage_credit_room(None) is None
+
+    @staticmethod
+    def _fraction(pct, *, reached=False, reason=None) -> dict:
+        return {"spend": {
+            "reported": "fraction", "used": None, "limit": None,
+            "remaining": None, "pct": pct, "currency": None,
+            "limit_reached": reached, "disabled_reason": reason,
+        }}
+
+    def test_an_allowed_fraction_spend_is_room(self):
+        """Asserts: a header-measured spend the reply allowed is room,
+        carrying its share of the cap used (None when unknown)."""
+        assert oauth.usage_credit_room(self._fraction(0.0)) == oauth.UsageCreditRoom(
+            reported="fraction", remaining=None, cap_used_pct=0.0
+        )
+        assert oauth.usage_credit_room(self._fraction(None)) == oauth.UsageCreditRoom(
+            reported="fraction", remaining=None, cap_used_pct=None
+        )
+
+    def test_a_refused_fraction_spend_is_no_room(self):
+        """Asserts: a fraction spend the reply refused (out of credits) is
+        no room."""
+        usage = self._fraction(None, reached=True, reason="out_of_credits")
+        assert oauth.usage_credit_room(usage) is None
+
+    def test_room_ranks_no_cap_then_dollars_then_fractions(self):
+        """Asserts: no cap outranks any dollar amount, any dollar amount
+        (even one cent) outranks any fraction, and among fractions more of
+        the cap unused ranks higher, an unknown share last."""
+        room = oauth.UsageCreditRoom
+        ordered = [
+            room(reported="fraction", remaining=None, cap_used_pct=None),
+            room(reported="fraction", remaining=None, cap_used_pct=90.0),
+            room(reported="fraction", remaining=None, cap_used_pct=0.0),
+            room(reported="dollars", remaining=0.01),
+            room(reported="dollars", remaining=500.0),
+            room(reported="dollars", remaining=None),
+        ]
+        keys = [r.rank_key() for r in ordered]
+        assert keys == sorted(keys)
+        assert len(set(keys)) == len(keys)
 
     def test_enabled_extra_usage_missing_its_verdict_warns_and_drops(self, caplog):
         """Asserts: an enabled extra_usage block without spend_limit_reached is

@@ -1085,24 +1085,28 @@ class SpendingUsageCreditsEvent(AutoSwitchEvent):
     """Every account's windows are full, so work runs on paid usage credits.
 
     ``account`` (an ``_ref`` shape) is the account the sessions run on from
-    this tick, ``remaining`` its dollars left under the monthly cap (None:
-    no cap), and ``switched`` whether the engine moved onto it this tick
-    rather than staying on the active."""
+    this tick, ``room`` its usage-credit room (``oauth.UsageCreditRoom``:
+    dollars left under the monthly cap, None for no cap, or for a
+    setup-token account the share of the cap used), and ``switched``
+    whether the engine moved onto it this tick rather than staying on the
+    active."""
 
     kind: ClassVar[str] = "spending-usage-credits"
     account: dict
-    remaining: float | None
+    room: oauth.UsageCreditRoom
     switched: bool
 
     def _fields(self) -> dict:
         return {
             "account": self.account,
-            "remaining": self.remaining,
+            "reported": self.room.reported,
+            "remaining": self.room.remaining,
+            "capUsedPct": self.room.cap_used_pct,
             "switched": self.switched,
         }
 
     def human(self) -> str:
-        money = _credit_money(oauth.UsageCreditRoom(remaining=self.remaining))
+        money = _credit_money(self.room)
         verb = "switching to" if self.switched else "staying on"
         return (
             "all windows full; spending usage credits, "
@@ -1615,7 +1619,13 @@ def _usage_credit_pick(
 
 
 def _credit_money(room: oauth.UsageCreditRoom) -> str:
-    """Dollars left in words, for the switch detail and the WARNING line."""
+    """The room in words, for the switch detail and the WARNING line:
+    dollars left, ``no cap``, or for a header-measured (setup-token) account
+    the share of its cap used, which is all its replies report."""
+    if room.reported == oauth.SPEND_REPORTED_FRACTION:
+        if room.cap_used_pct is None:
+            return "credits on, share of cap used unknown"
+        return f"credits on, {room.cap_used_pct:.0f}% of cap used"
     if room.remaining is None:
         return "no cap"
     return f"${room.remaining:,.2f} left"
@@ -6129,7 +6139,7 @@ class AutoSwitchEngine:
         self._emit(
             SpendingUsageCreditsEvent(
                 account=_ref(number, email),
-                remaining=room.remaining,
+                room=room,
                 switched=switched,
             )
         )

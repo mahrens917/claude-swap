@@ -115,7 +115,7 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
 _USAGE = {
     "five_hour": {"pct": 42.0},
     "seven_day": {"pct": 18.0},
-    "spend": {"pct": 30.0, "used": 3.0, "limit": 10.0},
+    "spend": {"reported": "dollars", "pct":30.0, "used": 3.0, "limit": 10.0},
 }
 
 
@@ -128,11 +128,29 @@ def test_tightest_pct_uses_max_window():
 def test_tightest_pct_none_for_non_dict_or_empty():
     assert menubar.tightest_pct("no credentials") is None
     assert menubar.tightest_pct(None) is None
-    assert menubar.tightest_pct({"spend": {"pct": 90.0}}) is None  # no 5h/7d
+    assert menubar.tightest_pct({"spend": {"reported": "dollars", "pct":90.0}}) is None  # no 5h/7d
 
 
 def test_usage_summary_dict():
     assert menubar.usage_summary(_USAGE) == "5h 42% · 7d 18% · $ 30%"
+
+
+@pytest.mark.parametrize("spend, words", [
+    ({"pct": 0.0, "limit_reached": False, "disabled_reason": None},
+     "credits on, 0% of cap used"),
+    ({"pct": None, "limit_reached": True, "disabled_reason": "out_of_credits"},
+     "credits on, out of credits"),
+])
+def test_usage_summary_shows_a_fraction_spend_in_words(spend, words):
+    """Asserts: a setup-token account's header-measured (fraction) spend
+    reads in the shared words, not as a dollar-cap '$ N%', including an
+    out-of-credits reading that has no percent at all."""
+    usage = {
+        "five_hour": {"pct": 5.0},
+        "spend": {"reported": "fraction", "used": None, "limit": None,
+                  "remaining": None, "currency": None, **spend},
+    }
+    assert menubar.usage_summary(usage) == f"5h 5% · $ {words}"
 
 
 def test_usage_summary_partial_windows():
@@ -146,7 +164,7 @@ def test_usage_summary_includes_scoped_model_limits():
         "five_hour": {"pct": 82.0},
         "seven_day": {"pct": 12.0},
         "scoped": [{"name": "Fable", "pct": 4.0}],
-        "spend": {"pct": 30.0},
+        "spend": {"reported": "dollars", "pct":30.0},
     }
     assert menubar.usage_summary(usage) == "5h 82% · 7d 12% · Fable 4% · $ 30%"
 
@@ -295,7 +313,7 @@ def test_format_usage_log_partial_window():
 def test_format_usage_log_none_when_no_numeric_window():
     assert menubar.format_usage_log("a@x.com", None) is None
     assert menubar.format_usage_log("a@x.com", "rate limited") is None
-    assert menubar.format_usage_log("a@x.com", {"spend": {"pct": 5.0}}) is None
+    assert menubar.format_usage_log("a@x.com", {"spend": {"reported": "dollars", "pct":5.0}}) is None
 
 
 def test_usage_log_key_ignores_clock_tracks_pct():
@@ -429,7 +447,7 @@ def test_usage_summary_live_countdown_from_resets_at():
     usage = {
         "five_hour": {"pct": 42.0, "resets_at": _iso(2 * 3600 + 33 * 60)},
         "seven_day": {"pct": 18.0, "resets_at": _iso(86400 + 19 * 3600)},
-        "spend": {"pct": 30.0},
+        "spend": {"reported": "dollars", "pct":30.0},
     }
     assert menubar.usage_summary(usage, _NOW) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
 
