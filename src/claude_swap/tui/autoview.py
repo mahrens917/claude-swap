@@ -34,7 +34,6 @@ from claude_swap.autoswitch import (
     classify_candidate_block,
     model_block_label,
     pct_label,
-    proactive_switch_bar_pct,
     select_probe_target,
 )
 from claude_swap import pin
@@ -128,6 +127,9 @@ class AutoScreen(Screen):
         # settings.json. ``_configured_strategy`` is the mount-time file
         # value the screen reverts to on exit.
         self._configured_strategy: str | None = None
+        # The mount-time file settings, put back into `app.auto_settings`
+        # on exit (None until mounted).
+        self._configured_settings: AutoSwitchSettings | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -144,13 +146,12 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
-        # threshold_pct AND auto_settings are loaded once at app startup;
-        # sync both to the fresh file value (unmount reverts only the
-        # session threshold adjustment, never this correction).
+        # auto_settings is loaded once at app startup; sync it to the fresh
+        # file value. While this view is open it IS this view's session copy
+        # (every bar and ranking derives from it); unmount puts the file
+        # value back, never undoing this correction.
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = proactive_switch_bar_pct(
-            self._settings.strategy, self._settings.threshold
-        )
+        self._configured_settings = self._settings
         self.app.auto_settings = self._settings
         self._configured_strategy = self._settings.strategy
         self._update_summary()
@@ -167,13 +168,12 @@ class AutoScreen(Screen):
     def on_unmount(self) -> None:
         if self._engine is not None:
             self._engine.stop()
-        # A session threshold must not outlive the engine it steered: unpin
-        # the poll planner and put the bar tick back on the file value.
+        # A session threshold must not outlive the engine it steered: release
+        # the poll planner's session inputs and put the settings every
+        # screen reads back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
-        if self._configured_threshold is not None:
-            self.app.threshold_pct = proactive_switch_bar_pct(
-                self._configured_strategy, self._configured_threshold
-            )
+        if self._configured_settings is not None:
+            self.app.auto_settings = self._configured_settings
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -238,9 +238,7 @@ class AutoScreen(Screen):
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.threshold_pct = proactive_switch_bar_pct(
-            self._settings.strategy, value
-        )
+        self.app.auto_settings = self._settings
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -250,9 +248,7 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(self._settings.strategy)
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
-        self.app.threshold_pct = proactive_switch_bar_pct(
-            value, self._settings.threshold
-        )
+        self.app.auto_settings = self._settings
         if self._engine is not None:
             self._engine.apply_strategy(value)
             self._engine.wake()  # show a decision under the new strategy now
@@ -269,8 +265,17 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
-        bar = proactive_switch_bar_pct(
-            self._settings.strategy, self._settings.threshold
+        # The ACTIVE account's own bar (X3647): its credit point while it
+        # holds usage credits. Before the first snapshot, or with no active
+        # login, the plain bar every account without credit room has.
+        snap = self.app.snapshot
+        active = (
+            next((acc for acc in snap.accounts if acc.is_active), None)
+            if snap is not None
+            else None
+        )
+        bar = account_switch_bar_pct(
+            self._settings, active.usage if active is not None else None
         )
         # The field is the bar in force: it prints only when the threshold
         # IS the bar (`bar == threshold`), plus while it is being adjusted
@@ -285,6 +290,8 @@ class AutoScreen(Screen):
                 text.append(" (session)", style=palette.muted)
         if bar != self._settings.threshold:
             text.append(f"{' · ' if show_threshold else ''}switch at {pct_label(bar)}%")
+            if active is not None:
+                text.append(f" on Account-{active.number}")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
@@ -387,6 +394,9 @@ class AutoScreen(Screen):
         if snap is None:
             return
         self._last_active_at = data.read_last_active_at(self.app.switcher.backup_dir)
+        # The summary's bar is the active account's own, so it follows the
+        # snapshot (a switch, or credit room gained or lost).
+        self._update_summary()
         self.query_one("#candidates", Static).update(
             self._candidates_text(snap, active_number=snap.active_number)
         )

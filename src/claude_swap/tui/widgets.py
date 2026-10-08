@@ -21,6 +21,7 @@ from claude_swap.json_output import (
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
 )
+from claude_swap.autoswitch import account_switch_bar_pct
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES, spend_amounts
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -544,7 +545,11 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now,
+                        acc, width,
+                        # The active account's OWN bar (X3647): its credit
+                        # point while it holds usage credits.
+                        threshold=account_switch_bar_pct(app.auto_settings, acc.usage),
+                        now=now,
                         palette=palette, cloud_pinned=pinned,
                     )
                 )

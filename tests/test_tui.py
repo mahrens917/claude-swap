@@ -98,6 +98,7 @@ def make_account(
     # `pin.account_is_pinned` -- so nothing rendered that pair.
     org_uuid: str = "",
     access_token_fp: str | None = None,
+    quarantined: bool = False,
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
@@ -110,6 +111,7 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+        quarantined=quarantined,
         access_token_fp=access_token_fp,
     )
 
@@ -2519,14 +2521,15 @@ class TestAutoScreen:
         async with app.run_test(size=(100, 40)) as pilot:
             await self._open(pilot)
             screen = app.screen
-            assert app.threshold_pct == 90.0  # mount syncs to the file value
+            assert app.auto_settings.threshold == 90.0  # mount syncs to the file value
             await pilot.press("right")  # inert outside adjust mode
             await pilot.pause()
             assert screen._settings.threshold == 90.0
             await pilot.press("t", "right", "right", "right")
             await pilot.pause()
             assert screen._settings.threshold == 93.0
-            assert app.threshold_pct == 93.0
+            # the session value is the one settings object every bar reads
+            assert app.auto_settings.threshold == 93.0
             engine = fake_engine.instances[0]
             assert engine.applied_thresholds == [91.0, 92.0, 93.0]
             from textual.widgets import Static
@@ -2547,8 +2550,60 @@ class TestAutoScreen:
             await pilot.press("escape")
             await settle(pilot)
             # leaving the screen reverts the tick and unpins poll planning
-            assert app.threshold_pct == 90.0
+            assert app.auto_settings.threshold == 90.0
             assert fake._poll_inputs_override is None
+
+    @pytest.mark.parametrize("with_credits,bar", [(True, 100.0), (False, 97.0)],
+                             ids=["credits", "plain"])
+    async def test_every_bar_is_the_active_accounts_own(
+        self, tmp_path, fake_engine, monkeypatch, with_credits, bar
+    ):
+        """Asserts: under `dynamic` with creditThreshold 100, the auto view's
+        summary and the active card's tick both show the ACTIVE account's
+        own bar (X3647): 100 while it holds usage credits, 97 without."""
+        from textual.widgets import Static
+
+        from claude_swap.tui import widgets
+
+        (tmp_path / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "dynamic", "threshold": 90, "creditThreshold": 100},
+        }))
+        spend = {
+            "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
+            "currency": "USD", "limit_reached": False,
+        } if with_credits else None
+        ticks: list = []
+        real_card = widgets.account_card_text
+
+        def card(acc, width, **kw):
+            ticks.append(kw["threshold"])
+            return real_card(acc, width, **kw)
+
+        monkeypatch.setattr(widgets, "account_card_text", card)
+        fake = FakeSwitcher(
+            [make_account(1, active=True, entry=make_entry(50.0, 10.0, spend=spend)),
+             make_account(2)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert f"switch at {bar:.0f}% on Account-1" in summary, summary
+            assert ticks and ticks[-1] == bar, ticks
+
+    async def test_a_settings_load_error_propagates(self, tmp_path, monkeypatch):
+        """Asserts: the app no longer swaps in default settings when the
+        settings load raises; the error reaches the caller."""
+        def boom(_root):
+            raise OSError("settings unreadable")
+
+        monkeypatch.setattr("claude_swap.tui.app.load_settings", boom)
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        with pytest.raises(OSError, match="settings unreadable"):
+            make_app(fake)
 
     async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -2575,7 +2630,7 @@ class TestAutoScreen:
             assert engine.wakes == 1  # a forced tick shows the new strategy
             assert "dynamic (session)" in summary.render().plain
             assert "switch at 97%" in summary.render().plain
-            assert app.threshold_pct == 97.0
+            assert app.auto_settings.strategy == "dynamic"
             # dynamic's configured threshold is not the engine's real bar —
             # at rest (not adjusting) the header must not claim it is.
             assert "threshold" not in summary.render().plain
@@ -3040,6 +3095,33 @@ class TestAccountsSnapshot:
         assert all(acc.usage.sentinel is not None for acc in snap.accounts)
         assert isinstance(snap.taken_at, float)
 
+    def test_snapshot_marks_the_engines_quarantined_slots(
+        self, temp_home, mock_claude_config
+    ):
+        """Asserts: `accounts_snapshot` marks a slot `quarantined` exactly
+        when the engine's state file holds it in the quarantine ledger,
+        and an absent state file quarantines nothing."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["sequence"] = [1, 2]
+        data["accounts"] = {
+            "1": {"email": "test@example.com", "uuid": "test-uuid-1234"},
+            "2": {"email": "other@example.com", "uuid": "uuid-2"},
+        }
+        switcher._write_json(switcher.sequence_file, data)
+
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [acc.quarantined for acc in snap.accounts] == [False, False]
+
+        switcher._write_json(
+            switcher.backup_dir / "autoswitch_state.json",
+            {"quarantine": {"2": {"email": "other@example.com", "reason": "x"}}},
+        )
+        snap = switcher.accounts_snapshot(fetch=set())
+        assert [acc.quarantined for acc in snap.accounts] == [False, True]
+
 
 # ---------------------------------------------------------------------------
 # CLI wiring
@@ -3308,11 +3390,12 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None, disabled=False, usage=None):
+              sentinel=None, disabled=False, usage=None, quarantined=False):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
+        a.quarantined = quarantined
         a.login_expires_at = None
         # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
         # ranking pass's own read) is real code, not an auto-mocked
@@ -3768,6 +3851,32 @@ class TestUnswitchableRowsAreListed:
             snap, settings, time.time(), "1"
         )
         assert ordered == ["2"], ordered
+
+    @pytest.mark.parametrize("strategy", ["consume-first", "dynamic", "best"])
+    def test_a_quarantined_slot_is_never_a_candidate(self, strategy):
+        """Asserts: a slot in the engine's quarantine ledger is left out of
+        the panel's candidates exactly as the engine leaves it out, however
+        much room it holds, and `ordered_accounts` sorts it with the
+        non-targets after the open candidate."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        from claude_swap.models import AccountsSnapshot
+
+        settings = AutoSwitchSettings(strategy=strategy, threshold=90.0)
+        snap = AccountsSnapshot(
+            active_number="1",
+            accounts=(
+                make_account(1, active=True, entry=make_entry(98.0, 10.0)),
+                make_account(2, entry=make_entry(0.0, 0.0), quarantined=True),
+                make_account(3, entry=make_entry(30.0, 10.0)),
+            ),
+            taken_at=time.time(),
+        )
+        ordered, *_ = tui_data.rank_switch_candidates(
+            snap, settings, time.time(), "1"
+        )
+        assert ordered == ["3"], ordered
+        assert tui_data.ordered_accounts(snap, settings, time.time()) == ["1", "3", "2"]
 
     def test_the_panel_lists_the_unread_token_probe_after_measured_under_dynamic(
         self,

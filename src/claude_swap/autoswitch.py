@@ -65,7 +65,7 @@ from claude_swap.settings import (
     holds_credit_point,
     parse_model_names,
 )
-from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, spend_row_body
+from claude_swap.switcher import ClaudeAccountSwitcher, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, quarantine_ledger, spend_row_body
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -2696,11 +2696,7 @@ class AutoSwitchEngine:
             # Dry-run must not write anything, so recovered quarantines are
             # only released (state mutation) on real ticks.
             state = self._release_recovered_quarantines(state)
-        quarantined = set(
-            state.get("quarantine", {})
-            if isinstance(state.get("quarantine"), dict)
-            else {}
-        )
+        quarantined = set(quarantine_ledger(state))
 
         # T1313: settle before `current` is read -- a live login can be a
         # different managed slot's own (already safely in its backup) while
@@ -3128,7 +3124,23 @@ class AutoSwitchEngine:
                 at_now,
             )
 
+        # The overload back-off for `dynamic`'s own arms, the bar
+        # `_rank_candidates_pass` puts on every ranked candidate: an account
+        # an `overloaded` departure left is not landed on until its
+        # `OVERLOAD_BACKOFF_S` runs out. Never released here: `proactive`
+        # reads a barred-empty list as correct (`_overload_bar_releases`),
+        # and alternation is a discretionary move with no escape to make.
+        def _not_backed_off(cands, at_now):
+            return [
+                n for n in cands
+                # default: EXTERNAL -- source: arithmetic, an account never
+                # backed off has no back-off running -- why: the map holds
+                # only accounts an `overloaded` departure left (`_perform`).
+                if at_now >= (overload_backoff.get(n) or 0)
+            ]
+
         def _dynamic_rank(cands, hroom, at_now, active_h):
+            cands = _not_backed_off(cands, at_now)
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
                 entries,
@@ -3266,8 +3278,8 @@ class AutoSwitchEngine:
             # block F3's deliberate, healthy alternation between two
             # unchanged accounts (never "recovered").
             warm_ordered, cold_ordered = _rank_dynamic_candidates(
-                oauth_candidates, headroom, usage, now, last_active_at,
-                settings.cache_ttl_seconds, bar_of,
+                _not_backed_off(oauth_candidates, now), headroom, usage, now,
+                last_active_at, settings.cache_ttl_seconds, bar_of,
             )
             # Kept alongside `warm_ordered`/`cold_ordered` (which the
             # retry below may re-rank on the UNMODELED axis): the
@@ -3298,8 +3310,8 @@ class AutoSwitchEngine:
                 # same way once every candidate folds to headroom 0 on it.
                 unmodeled = _headroom_by_account(usage, ())
                 warm_ordered, cold_ordered = _rank_dynamic_candidates(
-                    oauth_candidates, unmodeled, usage, now, last_active_at,
-                    settings.cache_ttl_seconds, bar_of,
+                    _not_backed_off(oauth_candidates, now), unmodeled, usage, now,
+                    last_active_at, settings.cache_ttl_seconds, bar_of,
                 )
                 floor_headroom = unmodeled
                 model_window_dropped = True
@@ -3559,7 +3571,8 @@ class AutoSwitchEngine:
                 # everywhere -- the predicate is asked directly instead.
                 probe_target = (
                     select_probe_target(
-                        usage, oauth_candidates, (), usage.get(current),
+                        usage, _not_backed_off(oauth_candidates, now), (),
+                        usage.get(current),
                         _numeric_probe_cooldown(state.get("probeCooldown")), now,
                     )
                     if self._models
@@ -6535,11 +6548,7 @@ class AutoSwitchEngine:
                 return delay
             now = self.clock()
             state = self._read_state()
-            quarantined = set(
-                state.get("quarantine", {})
-                if isinstance(state.get("quarantine"), dict)
-                else {}
-            )
+            quarantined = set(quarantine_ledger(state))
             votable = set(self.switcher.switchable_account_numbers()) - quarantined
             votable.add(current)
             entries = self.switcher.usage_entries_by_account(fetch=set())

@@ -287,6 +287,16 @@ def _format_usage_lines(
 _COUNTDOWN_COLUMN = len(f"{0:>3.0f}%   resets {'':<12}  in ")
 
 
+def quarantine_ledger(state: object) -> dict:
+    """The ``quarantine`` map of an auto-switch state dict (slot number ->
+    entry), or an empty map when the state carries none. The engine's tick
+    and :meth:`ClaudeAccountSwitcher.engine_quarantine_ledger` both read the
+    quarantined set through this, so the engine and the snapshot exclude
+    the same slots."""
+    ledger = state.get("quarantine") if isinstance(state, dict) else None
+    return ledger if isinstance(ledger, dict) else {}
+
+
 def _login_row(login_expires_at: float | None, quarantined: bool) -> tuple[str, str]:
     """(label, body) for the login-expiry row, shaped like a ``_usage_rows`` row."""
     value = oauth.format_login_expiry(login_expires_at, quarantined)
@@ -3448,6 +3458,7 @@ class ClaudeAccountSwitcher:
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
         seq_data = self._get_sequence_data() or {}
+        quarantined = self.engine_quarantine_ledger()
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
@@ -3466,6 +3477,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    quarantined=n in quarantined,
                     access_token_fp=oauth.access_token_fingerprint(creds),
                     login_expires_at=self._login_expires_at_epoch(n, creds),
                 )
@@ -8828,6 +8840,25 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         ).get("added", "")
         return bool(added) and bool(quarantined_at) and added > quarantined_at
 
+    def engine_quarantine_ledger(self) -> dict:
+        """The auto-switch engine's quarantine ledger (slot number -> entry)
+        as its state file holds it now: THE one reader of that file outside
+        the engine, for :meth:`_engine_quarantined` and the snapshot's
+        ``quarantined`` flag. The file is read under the engine's own rule
+        (``AutoSwitchEngine._read_state``): a missing or unparseable file is
+        no state, so no slot is quarantined, the same answer the engine's
+        next tick acts on. The keys are what the engine excludes from its
+        candidates (:func:`quarantine_ledger`)."""
+        try:
+            raw = json.loads(
+                (self.backup_dir / "autoswitch_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return quarantine_ledger(raw)
+
     def _engine_quarantined(self, num: str, fingerprint: str | None) -> bool:
         """Is slot ``num`` in the auto-switch engine's own quarantine ledger
         right now (its ``autoswitch_state.json``, e.g. an
@@ -8856,16 +8887,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         says the roster's own re-add stamp supersedes it -- see that
         method's docstring for why this must not require an engine tick.
         """
-        try:
-            raw = json.loads(
-                (self.backup_dir / "autoswitch_state.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return False
-        quarantine = raw.get("quarantine") if isinstance(raw, dict) else None
-        entry = quarantine.get(num) if isinstance(quarantine, dict) else None
+        entry = self.engine_quarantine_ledger().get(num)
         if not isinstance(entry, dict):
             return False
         if entry.get("fingerprintUnknown"):

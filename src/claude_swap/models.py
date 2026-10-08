@@ -146,6 +146,9 @@ class AccountSnapshot:
     # RUNNING engine leaves a disabled ACTIVE on its next tick, so the explicit
     # switch holds only while auto is stopped.
     disabled: bool = False
+    # In the auto-switch engine's quarantine ledger (its state file), which
+    # the engine excludes from its candidates the same as a disabled slot.
+    quarantined: bool = False
     # The access token's fingerprint (oauth.access_token_fingerprint), taken
     # fresh every snapshot. Lets a reconciler require it to match before
     # carrying a stale "token expired" sentinel forward: unchanged bytes mean

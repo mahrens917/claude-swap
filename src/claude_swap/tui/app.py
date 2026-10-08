@@ -18,7 +18,6 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
-from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import (
@@ -76,16 +75,11 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # The auto-switch threshold (status strip tick) AND the settings
-        # object every account-listing screen ranks by (`ordered_accounts`).
-        try:
-            self.auto_settings = load_settings(switcher.backup_dir)
-            self.threshold_pct: float | None = proactive_switch_bar_pct(
-                self.auto_settings.strategy, self.auto_settings.threshold
-            )
-        except Exception:
-            self.auto_settings = AutoSwitchSettings()
-            self.threshold_pct = None
+        # THE ONE settings object every screen reads: the ranking every
+        # account list follows (`ordered_accounts`) and each account's own
+        # switch bar (`account_switch_bar_pct`). The auto view replaces it
+        # with its session copy while open. A load error propagates.
+        self.auto_settings: AutoSwitchSettings = load_settings(switcher.backup_dir)
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:

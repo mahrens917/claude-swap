@@ -19957,3 +19957,62 @@ class TestT1313SettleWiring:
         ):
             delay = h.engine._next_delay(TickOutcome.NO_ACTION)  # must not raise
         assert delay > 0
+
+
+class TestDynamicArmsReadTheOverloadBackoff:
+    """X3647 U8: `dynamic`'s own proactive and alternation arms bar a
+    measured candidate inside its overload back-off, the way
+    `_rank_candidates_pass` does."""
+
+    def _harness(self, temp_home) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="dynamic", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_a_walled_active_skips_a_backed_off_candidate(self, temp_home):
+        """Asserts: an active about to wall (98%, `proactive`) does not land
+        on the candidate it would rank first (soonest weekly reset) while
+        that candidate is backed off after an `overloaded` departure; it
+        lands on the next one."""
+        h = self._harness(temp_home)
+        h.engine._overload_backoff["2"] = h.clock.now + OVERLOAD_BACKOFF_S
+        outcome = h.tick_with_usage({
+            "1": _usage7(98.0, 10.0, _R_LATEST),
+            "2": _usage7(10.0, 10.0, _R_SOON),
+            "3": _usage7(10.0, 10.0, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 3
+
+    def test_the_back_off_ending_restores_the_candidate(self, temp_home):
+        """Asserts: control for the test above: with no back-off running the
+        same fleet lands on the soonest-reset candidate."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage7(98.0, 10.0, _R_LATEST),
+            "2": _usage7(10.0, 10.0, _R_SOON),
+            "3": _usage7(10.0, 10.0, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 2
+
+    def test_a_backed_off_only_candidate_is_no_alternation_partner(self, temp_home):
+        """Asserts: a healthy active (the alternation arm) with a warm partner
+        past its dwell does not alternate onto that partner while it is
+        backed off."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"lastActiveAt": {"1": now - 10 * 86400.0, "2": now - 60.0}},
+        )
+        h.engine._overload_backoff["2"] = now + OVERLOAD_BACKOFF_S
+        outcome = h.tick_with_usage({
+            "1": _usage7(40.0, 10.0, _R_LATEST),
+            "2": _usage7(10.0, 10.0, _R_SOON),
+        })
+        assert outcome is not TickOutcome.SWITCHED, h.kinds()
+        assert h.active_number() == 1

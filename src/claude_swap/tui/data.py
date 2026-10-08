@@ -378,23 +378,20 @@ def rank_switch_candidates(
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
-    oauth_candidates = [
-        acc.number
+    # The engine's candidate set: switchable, not disabled, not in its
+    # quarantine ledger (`switchable_account_numbers()` minus the ledger),
+    # never the active.
+    rotation_pool = [
+        acc
         for acc in snap.accounts
         if acc.number != active_number
         and acc.switchable
         and not acc.disabled
-        and acc.kind != "api_key"
+        and not acc.quarantined
     ]
+    oauth_candidates = [acc.number for acc in rotation_pool if acc.kind != "api_key"]
     api_key_candidates = (
-        [
-            acc.number
-            for acc in snap.accounts
-            if acc.number != active_number
-            and acc.switchable
-            and not acc.disabled
-            and acc.kind == "api_key"
-        ]
+        [acc.number for acc in rotation_pool if acc.kind == "api_key"]
         if settings.include_api_key_accounts
         else []
     )
@@ -595,7 +592,7 @@ def ordered_accounts(
             # sentinel-like tier above, or the two screens disagree on the
             # same snapshot.
             return (3,)
-        if acc.disabled:
+        if acc.disabled or acc.quarantined:
             return (2,)
         # Soonest BINDING-window recovery first, unknown last -- matches
         # the auto view's own fallback key for a row its admission pass
