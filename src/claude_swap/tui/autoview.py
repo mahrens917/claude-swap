@@ -29,6 +29,7 @@ from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
+    account_switch_bar_pct,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -404,19 +405,20 @@ class AutoScreen(Screen):
         # disagree with the account a tick would actually switch to. THE
         # RANKING CALL BELOW reads off `settings` (never `self._settings`
         # directly, which can be `None` before `on_mount` loads it) so it
-        # can never read a DIFFERENT strategy than `bar` below computes.
-        # `bar` ITSELF keeps its own pre-existing `self._settings`-or-0.0
-        # guard, untouched by this refactor.
+        # can never read a DIFFERENT strategy than `bar_of` below computes;
+        # `bar_of` is read only inside the row's own `self._settings` check.
         # THE BAR EVERY ADMISSION/LABEL DECISION BELOW READS (#321): under
         # `dynamic` this is `proactive_switch_bar_pct`'s 97, not the raw
         # `settings.threshold` — a candidate with hours left on its reset
         # is headroom `dynamic` exists to spend, not a blocked one. Every
-        # other strategy gets `settings.threshold` back unchanged, so this
-        # is a no-op for them.
-        bar = (
-            proactive_switch_bar_pct(self._settings.strategy, self._settings.threshold)
-            if self._settings else 0.0
-        )
+        # other strategy gets the account's own switch point back. PER ROW
+        # (X3647): each account is judged at its OWN bar, the one the
+        # engine's `bar_of` reads (`account_switch_bar_pct`: a credit point
+        # while it holds usage credits), so the panel blocks exactly the
+        # rows the engine blocks.
+        def bar_of(usage_entry) -> float:
+            return account_switch_bar_pct(settings, usage_entry)
+
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         # The badge rides on that account's own row rather than the summary
@@ -634,6 +636,7 @@ class AutoScreen(Screen):
                 # on the 5h/7d-only axis for ORDERING purposes.
                 kind = "open"
                 if self._settings:
+                    bar = bar_of(acc.usage)
                     # A window whose chip reads data.REFETCHING, or one of
                     # the retry/backoff markers reset_text names for the
                     # same provably-stale case (#325 follow-up — the chip

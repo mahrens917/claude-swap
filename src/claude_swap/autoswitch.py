@@ -37,7 +37,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -320,6 +320,47 @@ def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
     if strategy == "dynamic":
         return 100.0 - SPENT_HEADROOM_PCT
     return threshold
+
+
+def account_switch_bar_pct(settings: "AutoSwitchSettings", entry) -> float:
+    """The used-% THIS account is blocked at as a candidate and departs at
+    as the active: :func:`proactive_switch_bar_pct` on its own switch point
+    (:func:`account_switch_point`), except that an account holding its
+    credit point (:func:`holds_credit_point`) keeps that point under every
+    strategy, ``dynamic`` included (X3647). Usage credits pay for its work
+    past every window limit, so ``dynamic``'s fixed 97 (about to wall) is
+    no wall for it. ``entry`` is the account's ``UsageEntry`` or None.
+    """
+    point = account_switch_point(settings, entry)
+    if holds_credit_point(settings, entry):
+        return point
+    return proactive_switch_bar_pct(settings.strategy, point)
+
+
+def _switch_bar(
+    settings: "AutoSwitchSettings", entries: dict | None, num: str
+) -> float:
+    """:func:`account_switch_bar_pct` from the tick's stored entries, the
+    bar twin of :func:`_switch_point` (``entries`` None reads no credit
+    room, the pre-credit rule)."""
+    entry = entries.get(num) if entries is not None else None
+    return account_switch_bar_pct(settings, entry)
+
+
+def classify_dynamic_departure(
+    settings: "AutoSwitchSettings", entry, active_headroom: float
+) -> str:
+    """`dynamic`'s trigger for an active with a reading: an active holding
+    its credit point departs at that point (:func:`account_switch_bar_pct`),
+    every other active through :func:`_classify_dynamic_trigger`. The engine
+    tick and the dashboard preview both call this, so the preview names the
+    trigger the engine takes."""
+    if active_headroom > 0 and holds_credit_point(settings, entry):
+        utilization = 100.0 - active_headroom
+        if utilization >= account_switch_bar_pct(settings, entry):
+            return "proactive"
+        return "dynamic-healthy"
+    return _classify_dynamic_trigger(active_headroom)
 
 
 # Strategies that rank by soonest weekly reset rather than most headroom.
@@ -1239,6 +1280,43 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     )
 
 
+def _unread_header_only(entries: dict | None, num: str) -> bool:
+    """Whether ``num`` is a setup-token account the switch has never read.
+
+    ``header_only`` is set by the collector from the slot's stored login
+    (``oauth.is_setup_token_credential``, the same test ``loginKind`` reads),
+    never from a store row, so a token slot with no row at all still carries
+    it. Such an account answers 403 on the usage endpoint and is measured
+    only from the reply headers recorded while it is active: with no
+    reading (the caller's decision value is None) nothing but a probe
+    switch can ever read it, so it is a probe target where an unread OAuth
+    account (which the next fetch reads) is not. A struck token is a known
+    state, never an unread one. ``entries`` None (a caller ranking on usage
+    alone) carries no login kind, so nothing reads as an unread token.
+    """
+    if entries is None:
+        return False
+    entry = entries.get(num)
+    return entry is not None and entry.header_only and not entry.token_dead()
+
+
+def _first_out_of_probe_cooldown(
+    candidates: Sequence[str], probe_cooldown: dict[str, float] | None, now: float
+) -> str | None:
+    """The first of ``candidates`` (roster order) not cooling down from a
+    previous probe, or None. Unread accounts carry no headroom to rank on,
+    so roster order is the whole tie-break, the one ``select_probe_target``
+    already falls to when every unread headroom reads the same."""
+    cooling = probe_cooldown or {}
+    for num in candidates:
+        # default: EXTERNAL -- source: arithmetic, an account never probed
+        # has no cooldown running -- why: `probeCooldown` holds only accounts
+        # a probe switch landed on (`_perform`).
+        if cooling.get(num, 0.0) <= now:
+            return num
+    return None
+
+
 def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
     """``state["probeCooldown"]``, TYPE-GUARDED to a fresh dict of numeric
     values only -- every writer of ``self._last_probe_cooldown`` (the
@@ -1512,6 +1590,7 @@ def _dynamic_active_headroom(
     current: str,
     active_headroom: float | None,
     entries: dict[str, UsageEntry] | None,
+    rotation: Collection[str],
 ) -> float | None:
     """Widen ``active_headroom`` to the unmodeled 5h/7d value under
     ``dynamic``, so the trigger classification and every re-rank this tick
@@ -1534,7 +1613,7 @@ def _dynamic_active_headroom(
     """
     if settings.strategy != "dynamic" or not models or active_headroom is None:
         return active_headroom
-    if not _model_window_binds_everywhere(usage, models, settings, entries):
+    if not _model_window_binds_everywhere(usage, models, settings, entries, rotation):
         return active_headroom
     unmodeled = _headroom_by_account(usage, ()).get(current)
     if unmodeled is not None and unmodeled > active_headroom:
@@ -1596,9 +1675,11 @@ def _model_window_binds_everywhere(
     models: tuple[str, ...],
     settings: AutoSwitchSettings,
     entries: dict[str, UsageEntry] | None,
+    rotation: Collection[str],
 ) -> bool:
-    """True only when the model window blocks every account in ``usage``
-    (model-gated) and at least one of them is blocked ONLY by that window
+    """True only when the model window blocks every account of ``rotation``
+    (the active and its rotation candidates; model-gated, read from
+    ``usage``) and at least one of them is blocked ONLY by that window
     (:func:`classify_candidate_block` returns ``"model"``, never
     ``"open"``) — i.e. dropping ``models`` is what rescues the fleet, not
     a stand-in for a genuine 5h/7d exhaustion. "A MODEL WINDOW IS NOT A
@@ -1631,11 +1712,19 @@ def _model_window_binds_everywhere(
     usage-credit move is. ``entries`` None (ranking on usage alone) reads
     every account at the plain threshold with no credit room, as does an
     unset ``credit_threshold``, so the pre-credit verdict holds there.
+
+    ONLY THE ROTATION COUNTS (X3647): a quarantined, disabled or otherwise
+    excluded account is no place the fleet can move to, so its open window
+    (or its credit point) is no evidence that the wall does not bind. The
+    measured case: a quarantined credit account cancelled the Fable wall
+    for a fleet that could not use it.
     """
     if not models:
         return False
     saw_model_only_wall = False
     for num, value in usage.items():
+        if num not in rotation:
+            continue
         windows = [
             (label, pct)
             for label, pct, _ in oauth.relevant_windows(
@@ -1835,6 +1924,13 @@ class AutoSwitchEngine:
         # hardcoded `None` — a probe the engine is still cooling down from
         # would otherwise read as fresh to the panel and jump back to the top.
         self._last_probe_cooldown: dict[str, float] = {}
+        # `_watch_unread_candidates`'s record: account number -> when this
+        # engine first ranked it with no usage reading in the current
+        # stretch, and the accounts already warned about in that stretch.
+        # Engine-lifetime like `_overload_backoff`: a restart starts every
+        # stretch again.
+        self._unread_since: dict[str, float] = {}
+        self._unread_warned: set[str] = set()
 
     def _announce_demotion(self) -> None:
         """Say once, on the first tick, that this engine lost the LIVE lock.
@@ -2693,12 +2789,9 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
-                switch_bar=proactive_switch_bar_pct(settings.strategy, active_point),
+                switch_bar=_switch_bar(settings, entries, current),
                 switch_bars={
-                    num: proactive_switch_bar_pct(
-                        settings.strategy, _switch_point(settings, entries, num)
-                    )
-                    for num in headroom
+                    num: _switch_bar(settings, entries, num) for num in headroom
                 },
                 fetch_errors={
                     num: entry.last_error
@@ -2764,8 +2857,20 @@ class AutoSwitchEngine:
         # under `strategy == "dynamic"`. The consume-first phase-2 refetch
         # below re-derives `active_headroom` from a fresh `headroom` too —
         # calling the same helper there is what keeps them on one axis.
+        # The rotation: the active and every account it may move to (not
+        # quarantined, not disabled, a usable stored login). Read once here,
+        # before the widen below needs it, and reused as the candidate list,
+        # so the fleet-wide model-window question (X3647) and the ranking
+        # count the same accounts.
+        candidates = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num != current and num not in quarantined
+        ]
+        rotation = (current, *candidates)
         active_headroom = _dynamic_active_headroom(
-            settings, self._models, usage, current, active_headroom, entries
+            settings, self._models, usage, current, active_headroom, entries,
+            rotation,
         )
         # adr/0010 R2: two margins of the bar, on the SAME widened reading
         # the trigger is classified from. `dynamic` only, so `best` and
@@ -2819,7 +2924,9 @@ class AutoSwitchEngine:
             departure_pct = active_point
             self._watch_credit_hold(current, entries, utilization, settings)
             if settings.strategy == "dynamic":
-                trigger = _classify_dynamic_trigger(active_headroom)
+                trigger = classify_dynamic_departure(
+                    settings, entries.get(current), active_headroom
+                )
             elif utilization < departure_pct:
                 if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
@@ -2912,11 +3019,6 @@ class AutoSwitchEngine:
 
         # -- candidate selection ------------------------------------------
         overload_backoff = self._overload_backoff
-        candidates = [
-            num
-            for num in self.switcher.switchable_account_numbers()
-            if num != current and num not in quarantined
-        ]
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
@@ -3007,7 +3109,9 @@ class AutoSwitchEngine:
                 not warm_ordered
                 and not cold_ordered
                 and self._models
-                and _model_window_binds_everywhere(usage, self._models, settings, entries)
+                and _model_window_binds_everywhere(
+                    usage, self._models, settings, entries, rotation
+                )
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321) — ONLY where it
                 # binds everywhere (`_model_window_binds_everywhere`, the
@@ -3110,7 +3214,9 @@ class AutoSwitchEngine:
                 not warm_ordered
                 and not cold_ordered
                 and self._models
-                and _model_window_binds_everywhere(usage, self._models, settings, entries)
+                and _model_window_binds_everywhere(
+                    usage, self._models, settings, entries, rotation
+                )
             ):
                 # A MODEL WINDOW IS NOT A BLACKOUT (#321), same retry as the
                 # `proactive` arm above: `_dynamic_active_headroom` widens a
@@ -3247,7 +3353,13 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
             )
             walled_escape = None
-            if _about_to_wall(raw_active_headroom):
+            # An active holding its credit point walls nowhere below that
+            # point (usage credits answer past every window limit), so the
+            # walled escape is not its departure; `classify_dynamic_departure`
+            # already moved its proactive bar to the credit point (X3647).
+            if _about_to_wall(raw_active_headroom) and not holds_credit_point(
+                settings, entries.get(current)
+            ):
                 if blackout_escape:
                     # ONE list, warm and cold together — never `cold_
                     # ordered` alone (that left a WARM rescue invisible to
@@ -3372,7 +3484,7 @@ class AutoSwitchEngine:
                     )
                     if self._models
                     and _model_window_binds_everywhere(
-                        usage, self._models, settings, entries
+                        usage, self._models, settings, entries, rotation
                     )
                     else None
                 )
@@ -3562,6 +3674,7 @@ class AutoSwitchEngine:
         probe_cooldown = _numeric_probe_cooldown(state.get("probeCooldown"))
         self._last_probe_cooldown = probe_cooldown
         decided_now = self.clock()
+        self._watch_unread_candidates(oauth_candidates, usage, decided_now)
         if dynamic_ordered is not None:
             # Already admitted+ranked above (item 3/4) — never re-enter
             # `_rank_candidates_pass`.
@@ -3605,7 +3718,8 @@ class AutoSwitchEngine:
             }
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
-                settings, self._models, usage, current, headroom.get(current), entries
+                settings, self._models, usage, current, headroom.get(current), entries,
+                rotation,
             )
             decided_now = self.clock()
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
@@ -3933,7 +4047,8 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(
-                    num, email, call_trigger, left_snapshot, switch_detail=overload_detail
+                    num, email, call_trigger, left_snapshot,
+                    switch_detail=overload_detail, tick_trigger=trigger,
                 )
             status = self._freshen_target(num, email)
             if self._stop.is_set():
@@ -3976,7 +4091,8 @@ class AutoSwitchEngine:
                 continue
             try:
                 return self._perform(
-                    num, email, call_trigger, left_snapshot, switch_detail=overload_detail
+                    num, email, call_trigger, left_snapshot,
+                    switch_detail=overload_detail, tick_trigger=trigger,
                 )
             except _CandidateDead as exc:
                 if exc.confirmed:
@@ -4536,7 +4652,9 @@ class AutoSwitchEngine:
         if (
             ordered
             or not self._models
-            or not _model_window_binds_everywhere(usage, self._models, settings, entries)
+            or not _model_window_binds_everywhere(
+                usage, self._models, settings, entries, (current, *oauth_candidates)
+            )
         ):
             self._last_probe_num = probe_num
             return ordered, any_known, active_reset_ts, waiting
@@ -4783,9 +4901,11 @@ class AutoSwitchEngine:
         # One exception below, `dynamic_self_walled`, deliberately keeps
         # `settings.threshold` -- see its own comment for why `bar` would
         # make that specific check always false. Per candidate: its own
-        # switch point (`point_of`) goes through the same strategy rule.
+        # switch point (`point_of`) goes through the same strategy rule,
+        # and one holding its credit point keeps that point even under
+        # `dynamic` (`account_switch_bar_pct`, X3647).
         def bar_of(num: str) -> float:
-            return proactive_switch_bar_pct(settings.strategy, point_of(num))
+            return _switch_bar(settings, entries, num)
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
@@ -4800,11 +4920,24 @@ class AutoSwitchEngine:
         # admitted `-inf`, either would sort first in `ordered` and win a
         # switch this tick can never actually resolve.
         probe_candidates: list[str] = []
+        # Setup-token candidates with no reading at all (X3650): unrankable,
+        # yet unreadable by anything but a switch onto them, so skipping them
+        # as "unreadable" like every other None row left them unread forever.
+        # Held for the probe pick after the loop, behind the same no-return
+        # and overload bars every ranked candidate clears.
+        unread_tokens: list[str] = []
         key_axis: dict[str, str] = {}  # per candidate, set alongside its key
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
+                if (
+                    usage.get(num) is None
+                    and _unread_header_only(entries, num)
+                    and num != no_return
+                    and now >= ((overload_backoff or {}).get(num) or 0)
+                ):
+                    unread_tokens.append(num)
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (
@@ -5225,6 +5358,14 @@ class AutoSwitchEngine:
         # most headroom among `probe_candidates`, same tie-break the key
         # itself uses (`-h`) -- the shared function this pass and the
         # "Next best" panel both call, so neither re-derives the predicate.
+        #
+        # An unread setup-token candidate joins the below-threshold probe
+        # under the same two conditions the loop puts on a measured one (a
+        # known active reset, not the recovery axis): its weekly reset is as
+        # unmeasured as its headroom.
+        consume_first_trigger = trigger in CONSUME_FIRST_STRATEGIES
+        if consume_first_trigger and active_reset_ts is not None and not by_recovery_axis:
+            probe_candidates.extend(unread_tokens)
         probe_num = select_probe_target(
             usage, probe_candidates, models, usage.get(current), probe_cooldown, now
         )
@@ -5235,10 +5376,24 @@ class AutoSwitchEngine:
                 ),
                 probe_num,
             ))
+        # A TRIGGER THAT LEAVES THE ACTIVE (at-limit, proactive, failover and
+        # the rest) probes an unread setup-token candidate too, ranked after
+        # every measured landing (a known good account beats an unknown one)
+        # and ahead of a recovery-axis sliver (an unread account may hold its
+        # whole window). Not a sort key: it has no reading to key on.
+        leave_probe = (
+            None
+            if consume_first_trigger
+            else _first_out_of_probe_cooldown(unread_tokens, probe_cooldown, now)
+        )
+        landed = bool(qualifying)
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
+        if leave_probe is not None:
+            ordered.insert(len(ordered) if landed else 0, leave_probe)
+            probe_num = leave_probe
         axis = key_axis.get(ordered[0]) if ordered else None  # winner's own axis
         # EVERY CANDIDATE READABLE, not merely one of them holding room. A
         # row we could not read may be a healthy account, and announcing a
@@ -5486,7 +5641,14 @@ class AutoSwitchEngine:
         trigger: str,
         left: tuple[float | None, float],
         switch_detail: str = "",
+        *,
+        tick_trigger: str,
     ) -> TickOutcome:
+        # `trigger` names the switch performed (the decision log, the
+        # probe cooldown, `leftTrigger`); `tick_trigger` is the tick's own
+        # classification, which alone decides whether the cooldown recheck
+        # below applies. They differ only for a probe.
+        #
         # ASK `_stop`, NOT `dry_run`. `stop()` sets `dry_run = True` so the
         # badge cannot read " LIVE " for a dead engine; that is a DISPLAY
         # fact, and reading it here as "the user asked for dry-run" makes a
@@ -5532,11 +5694,13 @@ class AutoSwitchEngine:
             # yield to the wall on the SAME reading the gate above did, or
             # the bypass is undone here under the lock.
             #
-            # "probe" included: it is a consume-first admission (just of an
-            # unknown-reset candidate), and must back off under the same
-            # concurrent-engine race the ordinary consume-first recheck does.
+            # Keyed on the TICK's trigger, so a probe backs off exactly when
+            # the move it rides would: a consume-first probe under the same
+            # concurrent-engine race the ordinary consume-first recheck
+            # does, while an at-limit probe of an unread setup-token account
+            # (X3650) escapes a walled active like any at-limit move.
             if (
-                trigger in (*_COOLDOWN_GATED_TRIGGERS, "probe")
+                tick_trigger in _COOLDOWN_GATED_TRIGGERS
                 and not _cooldown_yields_to_the_wall(
                     self.settings.strategy, left[0]
                 )
@@ -5853,6 +6017,45 @@ class AutoSwitchEngine:
                 switched=switched,
             )
         )
+
+    def _watch_unread_candidates(
+        self,
+        candidates: Sequence[str],
+        usage: dict[str, dict | str | None],
+        now: float,
+    ) -> None:
+        """Detector: a rotation candidate has had no usage reading for longer
+        than one probe cooldown while the engine looked for a candidate.
+
+        An unread candidate cannot be ranked, so the rotation is blind to it:
+        an OAuth account's fetch is failing, or a setup-token account the
+        probe (X3650) has not reached. Either outlasts a probe cooldown only
+        when something is broken, so zero on a healthy pool. One WARNING per
+        account per stretch: the stretch ends at the first reading (a
+        sentinel included, which names its own state) or when the account
+        stops being a candidate.
+        """
+        listed = set(candidates)
+        for num in list(self._unread_since):
+            if num not in listed:
+                del self._unread_since[num]
+                self._unread_warned.discard(num)
+        for num in candidates:
+            if usage.get(num) is not None:
+                self._unread_since.pop(num, None)
+                self._unread_warned.discard(num)
+                continue
+            since = self._unread_since.setdefault(num, now)
+            unread_for = now - since
+            if unread_for > PROBE_COOLDOWN_S and num not in self._unread_warned:
+                self._unread_warned.add(num)
+                _logger.warning(
+                    "Account-%s has had no usage reading for %d min while the "
+                    "engine looked for a rotation candidate; it cannot be "
+                    "ranked until a reading lands",
+                    num,
+                    int(unread_for // 60),
+                )
 
     def _warn_unused_usage_credits(self, entries: dict[str, UsageEntry]) -> None:
         """Detector: the engine is entering the all-exhausted wait while an

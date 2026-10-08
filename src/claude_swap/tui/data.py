@@ -28,11 +28,12 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     STATE_FILENAME,
     _binding_recovery_ts,
-    _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
     _rank_dynamic_candidates,
+    _switch_point,
+    classify_dynamic_departure,
     rank_candidates_pass,
 )
 from claude_swap.exceptions import ClaudeSwitchError
@@ -395,14 +396,24 @@ def rank_switch_candidates(
         else []
     )
 
+    entries = {acc.number: acc.usage for acc in snap.accounts}
+    # The accounts the fleet-wide model-window question counts, as the
+    # engine's tick counts them: the active and its rotation candidates.
+    rotation = (active_number, *oauth_candidates)
+
     def _trigger_for(active_headroom: float | None, active_disabled: bool) -> str:
+        """The engine tick's own classification: the active departs at ITS
+        switch point (`_switch_point`, a credit point while it holds usage
+        credits), never the plain threshold."""
         if active_disabled:
             return "disabled-active"
         if active_headroom is None:
             return "unreadable-active"
         if settings.strategy == "dynamic":
-            return _classify_dynamic_trigger(active_headroom)
-        if (100.0 - active_headroom) < settings.threshold:
+            return classify_dynamic_departure(
+                settings, entries.get(active_number), active_headroom
+            )
+        if (100.0 - active_headroom) < _switch_point(settings, entries, active_number):
             return (
                 settings.strategy
                 if settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -478,6 +489,7 @@ def rank_switch_candidates(
             settings=settings,
             now=now,
             probe_cooldown=probe_cooldown,
+            entries=entries,
         )
         return ordered, rank_axis
 
@@ -485,11 +497,10 @@ def rank_switch_candidates(
     active_disabled = next(
         (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )
-    entries = {acc.number: acc.usage for acc in snap.accounts}
     trigger = _trigger_for(
         _dynamic_active_headroom(
             settings, models, usage, active_number,
-            model_headroom.get(active_number), entries,
+            model_headroom.get(active_number), entries, rotation,
         ),
         active_disabled,
     )
@@ -499,7 +510,7 @@ def rank_switch_candidates(
         not ordered
         and models
         and settings.strategy == "dynamic"
-        and _model_window_binds_everywhere(usage, models, settings, entries)
+        and _model_window_binds_everywhere(usage, models, settings, entries, rotation)
     ):
         ordered, rank_axis = _rank_on((), trigger)
     if (

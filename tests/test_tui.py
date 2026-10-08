@@ -3346,6 +3346,72 @@ class TestUnswitchableRowsAreListed:
         with patch.object(AutoScreen, "app", property(lambda s: app)):
             return str(v._candidates_text(snap, active_number=active))
 
+    @staticmethod
+    def _with_credits(usage: dict) -> dict:
+        """``usage`` plus usage-credit room ($50 of $100 left)."""
+        return {
+            **usage,
+            "spend": {
+                "used": 50.0, "limit": 100.0, "remaining": 50.0, "pct": 50.0,
+                "currency": "USD", "limit_reached": False,
+            },
+        }
+
+    def test_the_preview_trigger_reads_the_actives_own_switch_point(self):
+        """Asserts: an active at 95% holding usage credits under threshold 90
+        and creditThreshold 100 previews `below-threshold`, the engine's own
+        classification at its credit point, and an active without credits
+        at 95% previews `proactive` (X3647)."""
+        settings = AutoSwitchSettings(
+            strategy="best", threshold=90.0, credit_threshold=100.0
+        )
+        peer = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        hot = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0}}
+        for active, want in ((self._with_credits(hot), "below-threshold"), (hot, "proactive")):
+            snap = self._snap(
+                self._acct("1", "a@x.com", switchable=True, last_good=active),
+                self._acct("2", "b@x.com", switchable=True, last_good=peer),
+            )
+            _ordered, _axis, trigger, _unmodeled = tui_data.rank_switch_candidates(
+                snap, settings, time.time(), "1"
+            )
+            assert trigger == want, (active, trigger)
+
+    def test_each_row_is_judged_at_its_own_bar(self):
+        """Asserts: under threshold 90 and creditThreshold 100, a candidate
+        at 7d 95% holding usage credits prints no block (its bar is 100)
+        while one without credits at 7d 95% prints `>= 90%`, the bar the
+        engine judges each against (X3647)."""
+        settings = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
+        low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        hot = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 95.0}}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=low),
+            self._acct("2", "credit@x.com", switchable=True, last_good=self._with_credits(hot)),
+            self._acct("3", "plain@x.com", switchable=True, last_good=hot),
+        ), active="1", settings=settings)
+        rows = {line.split()[1]: line for line in out.splitlines() if "@x.com" in line}
+        assert ">=" not in rows["credit@x.com"], rows["credit@x.com"]
+        assert "7d 95% >= 90%" in rows["plain@x.com"], rows["plain@x.com"]
+
+    def test_under_dynamic_a_credit_row_keeps_its_credit_point(self):
+        """Asserts: under `dynamic` a candidate at 7d 98% holding usage
+        credits is not blocked at the strategy's 97 (its bar is its credit
+        point, 100), while one without credits still prints `>= 97%`."""
+        settings = AutoSwitchSettings(
+            strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        hot = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 98.0}}
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True, last_good=low),
+            self._acct("2", "credit@x.com", switchable=True, last_good=self._with_credits(hot)),
+            self._acct("3", "plain@x.com", switchable=True, last_good=hot),
+        ), active="1", settings=settings)
+        rows = {line.split()[1]: line for line in out.splitlines() if "@x.com" in line}
+        assert ">=" not in rows["credit@x.com"], rows["credit@x.com"]
+        assert "7d 98% >= 97%" in rows["plain@x.com"], rows["plain@x.com"]
+
     def test_a_credential_less_slot_is_shown_with_what_to_do(self):
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
@@ -4681,7 +4747,10 @@ class TestUnswitchableRowsAreListed:
             {"probeCooldown": {"5": None}},
         )
         # Lands on "2", not "5" -- the pop in `_perform` never reaches "5".
-        h.engine._perform("2", "b@x.invalid", "proactive", (90.0, float("inf")))
+        h.engine._perform(
+            "2", "b@x.invalid", "proactive", (90.0, float("inf")),
+            tick_trigger="proactive",
+        )
         assert h.active_number() == 2
 
         # The panel reads real wall-clock time (`time.time()`), not the

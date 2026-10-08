@@ -5,6 +5,8 @@ and `cswap list` shows the money left per account."""
 
 import logging
 
+import pytest
+
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     PollEvent,
@@ -566,12 +568,14 @@ class TestFleetFableWallWithCredits:
             for e in h.events
         )
 
-    def test_detector_fires_when_the_credit_account_is_quarantined(
+    def test_a_quarantined_credit_account_does_not_cancel_the_fleet_wall(
         self, temp_home, caplog
     ):
         """Asserts: every Fable window full and the only credit account (#3)
-        quarantined, so outside the candidate set: the engine enters the
-        all-exhausted wait and logs the X3586 detector WARNING naming #3."""
+        quarantined, so outside the rotation: the fleet-wide Fable wall
+        stands (#3's credit point no longer ends it), so the engine reads
+        the active on its open 5h/7d windows and stays, with no
+        all-exhausted wait and no unused-credit detector line."""
         h = _fable_harness(
             temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
         )
@@ -581,12 +585,9 @@ class TestFleetFableWallWithCredits:
                 "1": _fable(100.0), "2": _fable(100.0),
                 "3": _fable(100.0, _spend(42.0)),
             })
-        assert outcome is TickOutcome.BLOCKED, h.kinds()
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert _warnings(caplog, _DETECTOR_LINE) == [
-            "All accounts exhausted while Account-3 holds usage-credit room "
-            "($42.00 left) the rotation did not use"
-        ]
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert _warnings(caplog, _DETECTOR_LINE) == []
 
 
 class TestModelWallPredicateReadsCreditPoints:
@@ -609,8 +610,33 @@ class TestModelWallPredicateReadsCreditPoints:
         entries = self._entries(usage)
         held = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
         plain = AutoSwitchSettings(threshold=90.0)
-        assert _model_window_binds_everywhere(usage, ("Fable",), held, entries) is False
-        assert _model_window_binds_everywhere(usage, ("Fable",), plain, entries) is True
+        rotation = ("1", "2", "3")
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), held, entries, rotation
+        ) is False
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), plain, entries, rotation
+        ) is True
+
+    def test_only_the_rotation_counts(self):
+        """Asserts: the credit account (#2) outside the rotation (quarantined
+        or disabled) does not end the wall the rotation (#1, #3) is under,
+        and an open account outside it does not either."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        held = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
+        usage = {"1": _fable(100.0), "2": _fable(100.0, _spend(5.0)), "3": _fable(100.0)}
+        entries = self._entries(usage)
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), held, entries, ("1", "3")
+        ) is True
+        open_outside = {"1": _fable(100.0), "2": _fable(10.0), "3": _fable(100.0)}
+        assert _model_window_binds_everywhere(
+            open_outside, ("Fable",), held, self._entries(open_outside), ("1", "3")
+        ) is True
+        assert _model_window_binds_everywhere(
+            open_outside, ("Fable",), held, self._entries(open_outside), ("1", "2", "3")
+        ) is False
 
     def test_without_credit_room_the_wall_stands(self):
         """Asserts: creditThreshold set but no account with credit room:
@@ -620,5 +646,52 @@ class TestModelWallPredicateReadsCreditPoints:
         usage = {"1": _fable(95.0), "2": _fable(100.0, _spend(0.0, reached=True))}
         settings = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
         assert _model_window_binds_everywhere(
-            usage, ("Fable",), settings, self._entries(usage)
+            usage, ("Fable",), settings, self._entries(usage), ("1", "2")
         ) is True
+
+
+class TestDynamicBarReadsTheCreditPoint:
+    """X3647: under `dynamic` an account holding its credit point is blocked
+    and departs at that point, never at the strategy's fixed 97."""
+
+    @staticmethod
+    def _entry(usage: dict) -> UsageEntry:
+        return UsageEntry(last_good=usage, fetched_at=0.0, age_s=0.0)
+
+    def test_the_bar_per_strategy_and_credit_room(self):
+        """Asserts: `account_switch_bar_pct` is the credit point for an
+        account holding credits under `dynamic` and `best`, 97 for a plain
+        account under `dynamic`, and the threshold for a plain `best` one."""
+        from claude_swap.autoswitch import account_switch_bar_pct
+
+        credit = self._entry(_full(_spend(20.0)))
+        plain = self._entry(_full())
+        dynamic = AutoSwitchSettings(strategy="dynamic", threshold=90.0, credit_threshold=100.0)
+        best = AutoSwitchSettings(strategy="best", threshold=90.0, credit_threshold=100.0)
+        assert account_switch_bar_pct(dynamic, credit) == 100.0
+        assert account_switch_bar_pct(dynamic, plain) == 97.0
+        assert account_switch_bar_pct(best, credit) == 100.0
+        assert account_switch_bar_pct(best, plain) == 90.0
+        unset = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        assert account_switch_bar_pct(unset, credit) == 97.0
+
+    @pytest.mark.parametrize("with_credits", [True, False], ids=["credits", "plain"])
+    def test_a_credit_active_at_98_is_not_a_dynamic_departure(
+        self, temp_home, with_credits
+    ):
+        """Asserts: under `dynamic`, an active at 98% holding usage credits
+        (credit point 100) is not classified `proactive` and stays, while
+        the same active without credits leaves for the open peer."""
+        hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
+        active = {**hot, "spend": _spend(20.0)} if with_credits else hot
+        h = EngineHarness(
+            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": active, "2": _open()})
+        want_active = 1 if with_credits else 2
+        assert h.active_number() == want_active, h.kinds()
+        switched = [e for e in h.events if isinstance(e, SwitchEvent)]
+        assert bool(switched) is not with_credits, h.kinds()

@@ -7201,6 +7201,7 @@ class TestDynamicStrategy:
         # unmodeled 38.
         widened = _dynamic_active_headroom(
             h.engine.settings, h.engine._models, fleet_usage, "5", 10.0, None,
+            tuple(fleet_usage),
         )
         assert widened == 10.0, (
             f"got {widened!r} — account 7 is open on the model-gated axis, "
@@ -9311,7 +9312,10 @@ class TestConsumeFirstProbesAnUnknownReset:
             h.switcher.backup_dir / "autoswitch_state.json",
             {"probeCooldown": {"2": h.clock.now + PROBE_COOLDOWN_S - 1}},
         )
-        h.engine._perform("2", "b@example.com", "proactive", (90.0, float("inf")))
+        h.engine._perform(
+            "2", "b@example.com", "proactive", (90.0, float("inf")),
+            tick_trigger="proactive",
+        )
         assert h.active_number() == 2
         assert "2" not in h.state().get("probeCooldown", {}), (
             "landing on a cooling-down account again must clear its cooldown"
@@ -9331,7 +9335,10 @@ class TestConsumeFirstProbesAnUnknownReset:
             h.switcher.backup_dir / "autoswitch_state.json",
             {"probeCooldown": {"2": h.clock.now - 1}},  # already elapsed
         )
-        h.engine._perform("2", "b@example.com", "probe", (90.0, float("inf")))
+        h.engine._perform(
+            "2", "b@example.com", "probe", (90.0, float("inf")),
+            tick_trigger="consume-first",
+        )
         assert h.active_number() == 2
         cooldown = h.state().get("probeCooldown", {})
         assert cooldown.get("2") == h.clock.now + PROBE_COOLDOWN_S, (
@@ -9349,7 +9356,10 @@ class TestConsumeFirstProbesAnUnknownReset:
         panel then names a cooling-down account as its own next probe
         target for as long as that early return holds."""
         h = self._harness(temp_home)
-        h.engine._perform("2", "b@example.com", "probe", (90.0, float("inf")))
+        h.engine._perform(
+            "2", "b@example.com", "probe", (90.0, float("inf")),
+            tick_trigger="consume-first",
+        )
         cooldown = h.state().get("probeCooldown", {})
         assert h.engine._last_probe_cooldown == cooldown, (
             f"got {h.engine._last_probe_cooldown!r}, state has {cooldown!r} "
@@ -9360,8 +9370,9 @@ class TestConsumeFirstProbesAnUnknownReset:
     def test_a_probe_switch_backs_off_under_the_concurrent_engine_cooldown(
         self, temp_home
     ):
-        """`_perform`'s cooldown gate includes ``"probe"`` in its trigger
-        tuple: a probe is still a consume-first admission and must back off
+        """`_perform`'s cooldown gate keys on the tick's own trigger
+        (``tick_trigger``): a consume-first probe is still a consume-first
+        admission and must back off
         under the same concurrent-engine race (loop + cron --once) an
         ordinary consume-first switch does. Seed ``lastSwitchAt`` as if a
         concurrent engine just switched, then probe #2 directly (bypassing
@@ -9374,7 +9385,8 @@ class TestConsumeFirstProbesAnUnknownReset:
             {"lastSwitchAt": h.clock.now},
         )
         outcome = h.engine._perform(
-            "2", "b@example.com", "probe", (90.0, float("inf"))
+            "2", "b@example.com", "probe", (90.0, float("inf")),
+            tick_trigger="consume-first",
         )
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a probe switch must back off under the same "
@@ -19349,12 +19361,15 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         from claude_swap.autoswitch import _model_window_binds_everywhere
 
         usage = self._specimen_usage()
-        with_8 = _model_window_binds_everywhere(usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None)
+        with_8 = _model_window_binds_everywhere(
+            usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None, tuple(usage)
+        )
         without_8 = _model_window_binds_everywhere(
             {k: v for k, v in usage.items() if k != "8"},
             ("Fable",),
             AutoSwitchSettings(threshold=90.0),
             None,
+            tuple(k for k in usage if k != "8"),
         )
         assert with_8 is True, (
             "a spend-only account (#8) must not disarm the predicate — "
@@ -19372,7 +19387,9 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         from claude_swap.autoswitch import _model_window_binds_everywhere
 
         usage = self._specimen_usage(account_3_seven_day=100)
-        assert _model_window_binds_everywhere(usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None) is False, (
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), AutoSwitchSettings(threshold=90.0), None, tuple(usage)
+        ) is False, (
             "no account in this roster is model-only-walled once #3's 7d "
             "is spent too — the predicate must not fire"
         )
@@ -19389,7 +19406,10 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         # wall -- is this class's `test_a_spend_only_account_cannot_
         # disarm_the_predicate`'s `with_8 is True` assertion.
         without_8 = {k: v for k, v in usage.items() if k != "8"}
-        assert _model_window_binds_everywhere(without_8, ("Fable",), AutoSwitchSettings(threshold=90.0), None) is False, (
+        assert _model_window_binds_everywhere(
+            without_8, ("Fable",), AutoSwitchSettings(threshold=90.0), None,
+            tuple(without_8),
+        ) is False, (
             "dropping #8 from an already-open roster must not change the "
             "verdict"
         )
