@@ -1986,6 +1986,7 @@ class TestProbeOauthProfileLive:
             assert oauth.probe_oauth_profile_live("sk-live") is None
 
 
+@pytest.mark.no_setup_token_probe_fake
 class TestProbeSetupTokenLive:
     """``probe_setup_token_live``: the switch-time check for a setup-token,
     whose inference-only scope the profile endpoint refuses (board row

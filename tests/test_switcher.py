@@ -11074,6 +11074,7 @@ class TestSwitchTargetLivenessGuard:
         mock_read.assert_not_called()
 
 
+@pytest.mark.no_setup_token_probe_fake
 class TestSetupTokenSwitchTargetIsValidated:
     """A wall switch onto a ``claude setup-token`` account must validate:
     the profile endpoint refuses that token by scope (it answers no verdict,
@@ -11167,6 +11168,38 @@ class TestSetupTokenSwitchTargetIsValidated:
             r.levelno == logging.WARNING and "http-500" in r.getMessage()
             for r in caplog.records
         )
+
+
+class TestSetupTokenSwitchUnderTheSuiteStub:
+    """The suite's autouse stub for ``oauth.probe_setup_token_live``
+    answers the switch check with no network: no verdict by default, a
+    test's own verdict when it sets one."""
+
+    def test_the_default_stub_answers_no_verdict_without_the_network(
+        self, temp_home: Path, block_real_setup_token_probe
+    ):
+        """Asserts: with the stub left at its default, a switch onto a
+        setup-token lands unvalidated, the check was asked once for the
+        target's token, and urlopen was never reached."""
+        s = TestSetupTokenSwitchTargetIsValidated()._switcher(temp_home)
+        with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
+            result = s.switch_to("2", json_output=True)
+        urlopen.assert_not_called()
+        assert result["switched"] is True
+        assert "validated" not in result
+        assert block_real_setup_token_probe.calls == [
+            TestSetupTokenSwitchTargetIsValidated.TOKEN
+        ]
+
+    def test_a_test_set_verdict_is_the_answer(
+        self, temp_home: Path, block_real_setup_token_probe
+    ):
+        """Asserts: a test that sets the stub's verdict to True gets a
+        switch that lands validated."""
+        block_real_setup_token_probe.verdict = True
+        s = TestSetupTokenSwitchTargetIsValidated()._switcher(temp_home)
+        result = s.switch_to("2", json_output=True)
+        assert result.get("validated") is True
 
 
 class TestClaudeCodeLockCooperation:

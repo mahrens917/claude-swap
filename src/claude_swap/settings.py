@@ -488,9 +488,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     path = settings_path(backup_root)
     raw = _read_raw(path, for_write=True)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict):
-        section = {}
+    section = _section(path, raw, spec.section)
     section[spec.json_key] = value
     raw[spec.section] = section
     atomic_write_json(path, raw)
@@ -502,8 +500,8 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
     raw = _read_raw(path, for_write=True)
-    section = raw.get(spec.section)
-    if not isinstance(section, dict) or spec.json_key not in section:
+    section = _section(path, raw, spec.section)
+    if spec.json_key not in section:
         return False
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     del section[spec.json_key]

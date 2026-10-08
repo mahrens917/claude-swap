@@ -705,6 +705,33 @@ def block_real_switch_target_probe(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def block_real_setup_token_probe(request, monkeypatch):
+    """No test may send the live setup-token switch check.
+
+    ``_probe_setup_token_target`` calls ``oauth.probe_setup_token_live`` on
+    every setup-token switch target, and without this stub a test that does
+    not mock it reaches for the network and stays offline only because this
+    module's DNS block refuses the lookup. Stubbed to answer ``None`` (its
+    documented "no verdict" answer); a test sets ``.verdict`` on the
+    yielded namespace to answer True or False instead, and reads ``.calls``
+    for the tokens it was asked about.
+    ``@pytest.mark.no_setup_token_probe_fake`` opts out for
+    ``TestProbeSetupTokenLive``, which mocks ``urlopen`` beneath it.
+    """
+    if request.node.get_closest_marker("no_setup_token_probe_fake"):
+        yield None
+        return
+    state = types.SimpleNamespace(verdict=None, calls=[])
+
+    def _probe(access_token, timeout_s=10.0):
+        state.calls.append(access_token)
+        return state.verdict
+
+    monkeypatch.setattr("claude_swap.oauth.probe_setup_token_live", _probe)
+    yield state
+
+
+@pytest.fixture(autouse=True)
 def block_real_policy_limits_fetch(request, monkeypatch):
     """Safety net: no test may make a live ``policy_limits`` request.
 

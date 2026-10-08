@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from claude_swap import menubar
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
+from claude_swap.settings import AutoSwitchSettings, save_settings, settings_path
 from claude_swap.switcher import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
 
 
@@ -853,3 +854,53 @@ class TestFrameworkBuildWarning:
         # The symptom is that everything looks healthy, so say so.
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "logs nothing" in msg
+
+
+class TestMenuBarSettingsReads:
+    """The menu bar's two reads of these settings (`menubar.menu_threshold`,
+    `menubar.start_engine_or_report`) surface a broken settings file at
+    ERROR and on screen instead of a silent unticked menu or a WARNING."""
+
+    def test_the_threshold_reads_from_settings(self, tmp_path):
+        """Asserts: a readable settings file gives its threshold, no error."""
+        save_settings(tmp_path, AutoSwitchSettings(threshold=95.0))
+        assert menubar.menu_threshold(tmp_path) == (95, None)
+
+    def test_a_corrupt_settings_file_is_shown_and_logged_at_error(
+        self, tmp_path, caplog
+    ):
+        """Asserts: a settings.json that is not JSON gives no threshold, a
+        menu text naming the failure, and one ERROR line."""
+        settings_path(tmp_path).write_text("{not json")
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            current, text = menubar.menu_threshold(tmp_path)
+        assert current is None
+        assert text is not None and text.startswith("Settings unreadable:")
+        assert str(settings_path(tmp_path)) in text
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+
+    def test_an_engine_that_cannot_start_is_reported_at_error(self, caplog):
+        """Asserts: a failed engine build returns None, logs at ERROR, and
+        notifies the user with the failure text."""
+        notes: list = []
+
+        def broken():
+            raise ConfigError("settings.json: autoswitch.threshold out of range")
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            got = menubar.start_engine_or_report(
+                broken, lambda t, m: notes.append((t, m))
+            )
+        assert got is None
+        assert [r.levelno for r in caplog.records] == [logging.ERROR]
+        assert notes == [(
+            "Auto-switch failed to start",
+            "settings.json: autoswitch.threshold out of range",
+        )]
+
+    def test_an_engine_that_starts_is_returned(self):
+        """Asserts: a successful build is returned and nothing is notified."""
+        notes: list = []
+        engine = object()
+        assert menubar.start_engine_or_report(lambda: engine, notes.append) is engine
+        assert notes == []

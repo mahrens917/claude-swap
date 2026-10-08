@@ -6487,20 +6487,16 @@ class AutoSwitchEngine:
         # just the outcome, or this falls back to the ordinary cadence
         # already computed above instead of a `None` arithmetic error.
         #
-        # Guarded: this runs OUTSIDE `tick()`'s own try, on `run_loop`'s thread AFTER
-        # `tick()` has returned, and `_settle_or_arm_wait`'s pre-try reads
-        # (`_get_sequence_data()` on a torn ``sequence.json``) can raise --
-        # unguarded, that reaches `run_loop`'s catch-all as a second
-        # ErrorEvent for the same tick. Best-effort: the unshortened delay
-        # already computed above is always safe.
-        try:
-            if (
-                self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
-                and self._settle_wait_until is not None
-            ):
-                delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
-        except Exception:
-            pass
+        # Unguarded on purpose: this runs on `run_loop`'s thread AFTER
+        # `tick()` has returned, and a raise here (a torn ``sequence.json``
+        # read by the settle) reaches `run_loop`'s own error path, which
+        # reports it as an ErrorEvent. It is the only report for this
+        # tick: an ERROR tick returned above before this recheck.
+        if (
+            self._settle_or_arm_wait() is LoginRestoreOutcome.WAITING
+            and self._settle_wait_until is not None
+        ):
+            delay = min(delay, max(self._settle_wait_until - time.time(), 0.1))
         return delay
 
     def _respect_poll_plan(self, delay: float) -> float:

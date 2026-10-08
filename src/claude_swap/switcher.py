@@ -3662,12 +3662,20 @@ class ClaudeAccountSwitcher:
             return False
         identity = self._slot_identity(slot)
         if identity is None:
+            self._logger.warning(
+                "a refusal (http-%s) named a token of account %s, which left "
+                "the roster during the lookup; nothing struck.",
+                status, slot,
+            )
             return False
         sources: list[str] = []
+        live_unread = False
         if slot == self.current_account_number():
             active = self._store._read_active_credentials()
             if active.value and not active.degraded:
                 sources.append(active.value)
+            else:
+                live_unread = True
         saved, unreadable = self._read_account_credentials_ex(slot, identity[0])
         if saved and not unreadable:
             sources.append(saved)
@@ -3676,6 +3684,20 @@ class ClaudeAccountSwitcher:
             None,
         )
         if holder is None:
+            # `slot_for_access_token` also matches a slot's retained `.prev`
+            # copy, and a refusal of that older token says nothing about the
+            # credential stored now; an unreadable current copy cannot be
+            # compared at all. Either way nothing is struck, and the line
+            # names the slot so a refusal that went unrecorded is visible.
+            if unreadable or live_unread:
+                reason = "its current credential could not be read"
+            else:
+                reason = "it matched only the retained previous copy"
+            self._logger.warning(
+                "a refusal (http-%s) named a token account %s does not "
+                "store as current (%s); nothing struck.",
+                status, slot, reason,
+            )
             return False
         return self.record_credential_refused(
             slot, status, oauth.credential_fingerprint(holder)

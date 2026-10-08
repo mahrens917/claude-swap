@@ -10554,6 +10554,10 @@ class TestClearingHandsBackTheLiveAccount:
         monkeypatch.setattr("claude_swap.pin.wired_env_keys", lambda s: {})
         monkeypatch.setattr("claude_swap.pin.clear_wiring",
                             lambda *a, **k: True)
+        # The record clear reads cswap's settings file under `backup_dir`,
+        # which these stub switchers do not have; this class asserts only the
+        # identity handed to `apply_pin`, so the record clear is a no-op.
+        monkeypatch.setattr("claude_swap.pin._clear_pin_record", lambda s: None)
         monkeypatch.setattr(
             "claude_swap.pin.identity_for_config",
             lambda s, email=None, **_k: ({"emailAddress": email}
@@ -13841,3 +13845,51 @@ class TestDaemonCanPinReadsHealth:
             isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
             for h in calls[0]
         ), f"no empty ProxyHandler passed to build_opener: {calls[0]}"
+
+
+class TestClearRecordSurfacesItsErrors:
+    """X3650 U11 item 2: the record clear's settings read and write raise to
+    `clear_pin`'s caller instead of being absorbed and reported as a
+    contended clear ("re-run once it frees up"), which never converges."""
+
+    def test_an_unreadable_settings_file_raises_config_error(self, tmp_path):
+        """Asserts: `_clear_pin_record` over a settings.json that is not
+        JSON raises ConfigError naming the file, and leaves the file as it
+        was."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.exceptions import ConfigError
+
+        path = tmp_path / "settings.json"
+        path.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ConfigError, match="is not valid JSON") as caught:
+            ops._clear_pin_record(types.SimpleNamespace(backup_dir=tmp_path))
+        assert str(path) in str(caught.value)
+        assert path.read_text(encoding="utf-8") == "{not json"
+
+    def test_clear_pin_raises_the_config_error_to_its_caller(
+        self, tmp_path, monkeypatch
+    ):
+        """Asserts: a `clear_pin` whose package could not clear, and whose
+        record clear then meets an unreadable settings file, raises that
+        ConfigError to its caller rather than returning the "re-run once it
+        frees up" verdict."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.exceptions import ConfigError
+
+        (tmp_path / "settings.json").write_text("[1]", encoding="utf-8")
+
+        def _no_package():
+            raise ImportError("no package")
+
+        monkeypatch.setattr(ops, "_impl", _no_package)
+        monkeypatch.setattr(ops, "_pinned_email_now", lambda sw: ("a@b.c", ""))
+        monkeypatch.setattr(ops, "_live_login_for_config", lambda sw: None)
+        monkeypatch.setattr(ops, "wired_env_keys", lambda sw: {})
+        monkeypatch.setattr(ops, "clear_wiring", lambda *a, **k: False)
+        monkeypatch.setattr(ops, "env_keys_survive", lambda before: [])
+        with pytest.raises(ConfigError, match="is not a JSON object"):
+            ops.clear_pin(types.SimpleNamespace(backup_dir=tmp_path))

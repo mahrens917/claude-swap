@@ -19940,15 +19940,13 @@ class TestT1313SettleWiring:
             login
         ), "a stopped engine's delay computation must never perform the restore"
 
-    def test_next_delay_recheck_swallows_a_raise(
+    def test_next_delay_recheck_raise_reaches_the_loops_error_path(
         self, temp_home: Path,
     ):
-        """(correctness-pass item 5's own guard, T1448) The item 5 recheck
-        calls `_settle_or_arm_wait` outside any try -- its settle's own
-        pre-try reads (`_get_sequence_data()` on a torn `sequence.json`)
-        can raise, and unguarded that would escape `_next_delay` into
-        `run_loop`'s catch-all as a second ErrorEvent for the same tick.
-        Best-effort: the unshortened delay already computed stays safe."""
+        """Asserts: a raise from the item 5 settle recheck (a torn
+        `sequence.json` read) leaves `_next_delay` and is reported once by
+        `run_loop` as an ErrorEvent naming it, instead of being absorbed
+        into the ordinary cadence with nothing shown."""
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         h.set_active(1)
@@ -19956,8 +19954,32 @@ class TestT1313SettleWiring:
             h.engine, "_settle_or_arm_wait",
             side_effect=RuntimeError("torn sequence.json"),
         ):
-            delay = h.engine._next_delay(TickOutcome.NO_ACTION)  # must not raise
-        assert delay > 0
+            with pytest.raises(RuntimeError, match="torn sequence.json"):
+                h.engine._next_delay(TickOutcome.NO_ACTION)
+
+        events = []
+        h.engine.on_event = events.append
+        calls = []
+
+        def settle_once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("torn sequence.json")
+            h.engine.stop()
+            return LoginRestoreOutcome.NONE
+
+        with patch.object(
+            h.engine, "tick", return_value=TickOutcome.NO_ACTION
+        ), patch.object(
+            h.engine, "_respect_poll_plan", side_effect=lambda d: d
+        ), patch.object(
+            h.engine, "_settle_or_arm_wait", side_effect=settle_once
+        ), patch.object(h.engine._wake, "wait", return_value=None):
+            assert h.engine.run_loop() == 0
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        assert [e.message for e in errors] == [
+            "RuntimeError: torn sequence.json"
+        ]
 
 
 class TestACorruptStateFileRaises:

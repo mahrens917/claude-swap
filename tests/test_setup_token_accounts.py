@@ -449,6 +449,63 @@ class TestRecordTokenRefused:
         assert self._strikes(s, "2", "tok@x.com") == 0
         assert self._strikes(s, "1", "a@x.com") == 0
 
+    def test_a_slot_that_left_the_roster_is_logged_at_warning(
+        self, temp_home, caplog
+    ):
+        """Asserts: when the slot owning the token leaves the roster between
+        the lookup and the strike, the call returns False, strikes nothing,
+        and logs one WARNING naming the slot and the reason, never the
+        token."""
+        import logging
+
+        s = self._two_slots(temp_home)
+        with patch.object(s, "_slot_identity", return_value=None), \
+                caplog.at_level(logging.WARNING):
+            assert s.record_token_refused("sk-ant-oat01-x", 401) is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+        assert "account 2" in text and "left the roster" in text
+        assert "sk-ant-oat01-x" not in text
+        assert self._strikes(s, "2", "tok@x.com") == 0
+
+    def test_a_token_only_the_previous_copy_holds_is_logged_at_warning(
+        self, temp_home, caplog
+    ):
+        """Asserts: a token that maps to slot 2 only through its retained
+        previous copy strikes nothing and logs one WARNING naming the slot
+        and that reason, never the token."""
+        import logging
+
+        s = self._two_slots(temp_home)
+        with patch.object(s, "slot_for_access_token", return_value="2"), \
+                caplog.at_level(logging.WARNING):
+            assert s.record_token_refused("sk-ant-oat01-old", 401) is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+        assert "account 2" in text and "previous copy" in text
+        assert "sk-ant-oat01-old" not in text
+        assert self._strikes(s, "2", "tok@x.com") == 0
+
+    def test_an_unreadable_current_copy_is_logged_at_warning(
+        self, temp_home, caplog
+    ):
+        """Asserts: when slot 2's saved credential cannot be read, the
+        refusal strikes nothing and the WARNING names the slot and says the
+        credential could not be read."""
+        import logging
+
+        s = self._two_slots(temp_home)
+        with patch.object(
+            s, "_read_account_credentials_ex", return_value=(None, True)
+        ), caplog.at_level(logging.WARNING):
+            assert s.record_token_refused("sk-ant-oat01-x", 401) is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "account 2" in warnings[0].getMessage()
+        assert "could not be read" in warnings[0].getMessage()
+
     def test_a_browser_login_token_is_never_struck(self, temp_home):
         """Asserts: a refusal of the live browser login's token strikes
         nothing; its refresh machinery owns its verdict."""

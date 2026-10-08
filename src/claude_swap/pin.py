@@ -1671,21 +1671,23 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
 
 
 def _clear_pin_record(switcher) -> None:
-    """Drop ``remoteControl`` from settings.json. Never raises.
+    """Drop ``remoteControl`` from settings.json.
 
-    Only for the path where the package cannot do it — normally ``apply_pin``
-    owns this file's pin section, and going around it would race the daemon's
+    Only for the path where the package cannot do it -- normally ``apply_pin``
+    owns this file's section, and going around it would race the daemon's
     own writes. Here there IS no package, so nothing else can.
+
+    An unreadable settings file raises ``ConfigError`` (and a failed write
+    its ``OSError``) out through ``clear_pin`` to its caller, which reports
+    it: the CLI prints ``Error: ...`` and exits 1, the account-removal path
+    warns with the cause.
     """
     from claude_swap import settings as _s
 
-    try:
-        path = _s.settings_path(switcher.backup_dir)
-        raw = _s._read_raw(path, for_write=True)
-        if raw.pop("remoteControl", None) is not None:
-            _s.atomic_write_json(path, raw)
-    except Exception:  # noqa: BLE001 — the caller re-reads and reports
-        pass
+    path = _s.settings_path(switcher.backup_dir)
+    raw = _s._read_raw(path, for_write=True)
+    if raw.pop("remoteControl", None) is not None:
+        _s.atomic_write_json(path, raw)
 
 
 # -- where the receipt lives -------------------------------------------------

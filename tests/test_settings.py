@@ -398,6 +398,30 @@ class TestSetUnsetSetting:
         raw = json.loads(settings_path(tmp_path).read_text())
         assert raw["schemaVersion"] == 1
 
+    @pytest.mark.parametrize("bad", [[1, 2], "on", 7, None])
+    def test_set_on_a_non_object_section_raises_and_preserves_it(
+        self, tmp_path: Path, bad
+    ):
+        """Asserts: `cswap config set` over a file whose section is not a
+        JSON object raises ConfigError naming the file and the section, and
+        leaves the file as it was, instead of replacing the section with
+        {} and dropping whatever the user had there."""
+        body = json.dumps({"schemaVersion": 1, "autoswitch": bad})
+        settings_path(tmp_path).write_text(body)
+        with pytest.raises(ConfigError, match="autoswitch is .* not a JSON object") as caught:
+            set_setting(tmp_path, "autoswitch.threshold", "80")
+        assert str(settings_path(tmp_path)) in str(caught.value)
+        assert settings_path(tmp_path).read_text() == body
+
+    def test_unset_on_a_non_object_section_raises(self, tmp_path: Path):
+        """Asserts: `cswap config unset` over a non-object section raises
+        ConfigError naming it instead of answering "was not set"."""
+        body = json.dumps({"autoswitch": [1]})
+        settings_path(tmp_path).write_text(body)
+        with pytest.raises(ConfigError, match="autoswitch is .* not a JSON object"):
+            unset_setting(tmp_path, "autoswitch.threshold")
+        assert settings_path(tmp_path).read_text() == body
+
     def test_unset_absent_key_is_noop(self, tmp_path: Path):
         assert unset_setting(tmp_path, "autoswitch.threshold") is False
         assert not settings_path(tmp_path).exists()
@@ -671,59 +695,3 @@ class TestAccountSwitchPoint:
         still switches at threshold, the rule before X3587."""
         s = AutoSwitchSettings(threshold=99.0)
         assert account_switch_point(s, _credit_entry()) == 99.0
-
-
-class TestMenuBarSettingsReads:
-    """The menu bar's two reads of these settings (`menubar.menu_threshold`,
-    `menubar.start_engine_or_report`) surface a broken settings file at
-    ERROR and on screen instead of a silent unticked menu or a WARNING."""
-
-    def test_the_threshold_reads_from_settings(self, tmp_path):
-        """Asserts: a readable settings file gives its threshold, no error."""
-        from claude_swap.menubar import menu_threshold
-
-        save_settings(tmp_path, AutoSwitchSettings(threshold=95.0))
-        assert menu_threshold(tmp_path) == (95, None)
-
-    def test_a_corrupt_settings_file_is_shown_and_logged_at_error(
-        self, tmp_path, caplog
-    ):
-        """Asserts: a settings.json that is not JSON gives no threshold, a
-        menu text naming the failure, and one ERROR line."""
-        from claude_swap.menubar import menu_threshold
-
-        settings_path(tmp_path).write_text("{not json")
-        with caplog.at_level(logging.ERROR, logger="claude-swap"):
-            current, text = menu_threshold(tmp_path)
-        assert current is None
-        assert text is not None and text.startswith("Settings unreadable:")
-        assert str(settings_path(tmp_path)) in text
-        assert [r.levelno for r in caplog.records] == [logging.ERROR]
-
-    def test_an_engine_that_cannot_start_is_reported_at_error(self, caplog):
-        """Asserts: a failed engine build returns None, logs at ERROR, and
-        notifies the user with the failure text."""
-        from claude_swap.menubar import start_engine_or_report
-
-        notes: list = []
-
-        def broken():
-            raise ConfigError("settings.json: autoswitch.threshold out of range")
-
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            got = start_engine_or_report(broken, lambda t, m: notes.append((t, m)))
-        assert got is None
-        assert [r.levelno for r in caplog.records] == [logging.ERROR]
-        assert notes == [(
-            "Auto-switch failed to start",
-            "settings.json: autoswitch.threshold out of range",
-        )]
-
-    def test_an_engine_that_starts_is_returned(self):
-        """Asserts: a successful build is returned and nothing is notified."""
-        from claude_swap.menubar import start_engine_or_report
-
-        notes: list = []
-        engine = object()
-        assert start_engine_or_report(lambda: engine, notes.append) is engine
-        assert notes == []
