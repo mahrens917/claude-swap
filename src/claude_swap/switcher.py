@@ -114,6 +114,7 @@ from claude_swap.usage_store import (
     PERMANENT_AUTH_ERRORS,
     UsageEntry,
     UsageStore,
+    UsageStoreVersionError,
     json_decision_value,
     with_header_only,
     with_sentinel,
@@ -3582,9 +3583,19 @@ class ClaudeAccountSwitcher:
         header_only = oauth.is_setup_token_credential(
             self._read_account_credentials(num, email)
         )
-        return self._usage_store.record_header_reading(
-            num, {num: identity}, headers, header_only=header_only
-        )
+        try:
+            return self._usage_store.record_header_reading(
+                num, {num: identity}, headers, header_only=header_only
+            )
+        except UsageStoreVersionError as e:
+            # The store is in a schema this build cannot read (a newer
+            # install, or a damaged file): the write was refused rather than
+            # emptying it. Zero on a healthy box; a hit means a process older
+            # than the store's last install is still recording.
+            self._logger.error(
+                "Usage-header reading for slot %s not recorded: %s", num, e
+            )
+            raise
 
     def record_credential_refused(
         self, num: str, status: int, fingerprint: str

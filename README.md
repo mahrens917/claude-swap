@@ -34,6 +34,8 @@ uv tool upgrade claude-swap
 pipx upgrade claude-swap
 ```
 
+**Upgrades that move the usage store's schema** (`cache/usage.json` under the backup root, `~/.local/share/claude-swap` on Linux and `~/.claude-swap-backup` on macOS; its `schemaVersion`; 3 to 4 in this release): a process still running the previous build keeps writing the store with its own code. A build before this one reads a newer file as empty and writes back only its own row, which empties the store for every other account. So before the first command of the new build runs, stop every process running the old one: `cswap auto`, the menu bar, and the owner proxy including any draining process it keeps for in-flight requests (the proxy loads cswap into its own process, so an old proxy writes with old cswap code). From this release on, a build never overwrites a store it cannot read: a newer schema version or an unparseable file makes every write raise `UsageStoreVersionError`, logged at ERROR with the file and both versions, and the file stays as it was. That protects the newer file from later builds only; a build older than this release cannot be changed and still needs the stop above.
+
 ## Usage
 
 ### Add your first account

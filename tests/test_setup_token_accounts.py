@@ -280,6 +280,98 @@ class TestAutoswitchGates:
 # ---------------------------------------------------------------------------
 
 
+ON_CREDITS_HEADERS = {
+    usage_store.USAGE_HEADER_5H_PCT: "0.3",
+    usage_store.USAGE_HEADER_7D_PCT: "1.01",
+    usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+    usage_store.USAGE_HEADER_OVERAGE_PCT: "0.0",
+}
+OUT_OF_CREDITS_HEADERS = {
+    usage_store.USAGE_HEADER_5H_PCT: "0.05",
+    usage_store.USAGE_HEADER_7D_PCT: "0.49",
+    usage_store.USAGE_HEADER_OVERAGE_STATUS: "rejected",
+    usage_store.USAGE_HEADER_OVERAGE_DISABLED_REASON: "out_of_credits",
+}
+
+
+class TestHeaderOnlySpendIsShown:
+    """X3655: a setup-token account's stored fraction spend reaches
+    `cswap list --json`, the human list row and the dashboard row."""
+
+    def _switcher(self):
+        switcher = _linux_switcher()
+        switcher.add_account_from_token("sk-ant-oat01-x", "two@example.com", slot=2)
+        switcher.add_account_from_token("sk-ant-oat01-y", "four@example.com", slot=4)
+        assert switcher.record_usage_headers("2", ON_CREDITS_HEADERS) is True
+        assert switcher.record_usage_headers("4", OUT_OF_CREDITS_HEADERS) is True
+        return switcher
+
+    def test_the_stored_shapes_are_the_live_ones(self, temp_home):
+        """Asserts: the recorded spends are the shapes read off the rcbox
+        store (account 2 allowed at 0.0, account 4 out_of_credits)."""
+        entries = self._switcher().usage_entries_by_account(fetch=set())
+        assert entries["2"].last_good["spend"] == {
+            "reported": "fraction", "used": None, "limit": None,
+            "remaining": None, "pct": 0.0, "currency": None,
+            "limit_reached": False, "disabled_reason": None,
+        }
+        assert entries["4"].last_good["spend"]["disabled_reason"] == "out_of_credits"
+        assert entries["4"].last_good["spend"]["limit_reached"] is True
+
+    def test_list_json_carries_the_header_only_spend(self, temp_home):
+        """Asserts: `cswap list --json` emits each setup-token account's
+        stored fraction spend, not a null spend."""
+        payload = self._switcher().list_accounts(json_output=True, read_only=True)
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["usage"]["spend"] == {
+            "reported": "fraction", "used": None, "limit": None,
+            "remaining": None, "pct": 0.0, "currency": None,
+            "limitReached": False, "disabledReason": None,
+        }
+        assert rows[4]["usage"]["spend"]["limitReached"] is True
+        assert rows[4]["usage"]["spend"]["disabledReason"] == "out_of_credits"
+
+    def test_list_row_and_dashboard_show_the_spend_in_words(self, temp_home):
+        """Asserts: the human list lines and the dashboard rows of a
+        setup-token account carry its spend in words."""
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.tui.widgets import usage_rows
+
+        entries = self._switcher().usage_entries_by_account(fetch=set())
+        for num, words in (
+            ("2", "credits on, 0% of cap used"),
+            ("4", "credits on, out of credits"),
+        ):
+            assert any(words in line for line in _usage_entry_lines(entries[num]))
+            row = usage_rows(entries[num].last_good, 0.0)[0]
+            assert row[0] == "$$" and row[2] == words
+
+    def test_a_store_in_a_newer_schema_is_never_overwritten(
+        self, temp_home, caplog
+    ):
+        """Asserts: a header reading against a store file in a schema this
+        code does not know raises UsageStoreVersionError, logs it at ERROR
+        naming the file and both versions, and leaves the file's bytes as
+        they were (the rcbox wipe: an older writer read the newer file as
+        empty and wrote back one row)."""
+        import logging
+
+        switcher = _linux_switcher()
+        switcher.add_account_from_token("sk-ant-oat01-x", "two@example.com", slot=2)
+        path = switcher._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        newer = json.dumps({"schemaVersion": 99, "accounts": {"1": {"x": 1}}})
+        path.write_text(newer, encoding="utf-8")
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(usage_store.UsageStoreVersionError):
+                switcher.record_usage_headers("2", ON_CREDITS_HEADERS)
+        assert path.read_text(encoding="utf-8") == newer
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert str(path) in message and "99" in message and "version 4" in message
+
+
 class TestSwitcherSetupTokenAccounts:
     def test_collector_never_fetches_a_setup_token_account(self, temp_home):
         """Asserts: the usage collector never reserves or fetches a

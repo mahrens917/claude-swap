@@ -70,6 +70,33 @@ _logger = logging.getLogger("claude-swap")
 SCHEMA_VERSION = 4
 _SCHEMA_VERSION_V3 = 3
 
+
+class UsageStoreVersionError(RuntimeError):
+    """The usage store file exists in a form this code cannot read (a newer
+    schema version, an unknown one, or unparseable), so no write may
+    replace it. Raised by every read-modify-write path; the caller logs it
+    at ERROR."""
+
+    def __init__(self, path: Path, found: object, detail: str) -> None:
+        self.path = path
+        self.found = found
+        super().__init__(
+            f"usage store {path} is schema version {found!r} ({detail}); this "
+            f"cswap writes version {SCHEMA_VERSION} and refuses to overwrite it"
+        )
+
+
+def _v3_rows_as_v4(rows: dict) -> dict:
+    """Version-3 rows in version 4: every stored ``spend`` (version 3 took
+    them all from the usage endpoint) gains ``reported: dollars``. Mutates
+    and returns ``rows``."""
+    for row in rows.values():
+        last_good = row.get("lastGood") if isinstance(row, dict) else None
+        spend = last_good.get("spend") if isinstance(last_good, dict) else None
+        if isinstance(spend, dict):
+            spend["reported"] = oauth.SPEND_REPORTED_DOLLARS
+    return rows
+
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
 # without fetching) doubles as the per-account sustained-rate governor: see
@@ -837,10 +864,14 @@ def _header_only_decision_value(last_good: dict | None, now: float) -> dict | No
     Use of the same account from another machine is invisible to this
     reading; the first reply after a switch onto it records the real figure.
 
-    Only the 5h and 7d windows survive. The reply headers carry no per-model
-    window, so a per-model (``scoped``) window is unmeasured for this account
-    and never gates it; a scoped figure left from an earlier endpoint reading
-    is dropped rather than trusted forever. None when no 5h/7d reading exists.
+    The 5h and 7d windows survive, and so does the ``spend`` the reply's
+    overage headers recorded (``reported: fraction``): it is this account's
+    only usage-credit figure, and ``cswap list --json`` reads this value,
+    so dropping it showed no spend for an account whose store held one
+    (X3655). The reply headers carry no per-model window, so a per-model
+    (``scoped``) window is unmeasured for this account and never gates it;
+    a scoped figure left from an earlier endpoint reading is dropped rather
+    than trusted forever. None when no 5h/7d reading exists.
     """
     if not isinstance(last_good, dict):
         return None
@@ -855,7 +886,12 @@ def _header_only_decision_value(last_good: dict | None, now: float) -> dict | No
         result[key] = (
             {"pct": 0.0} if reset is not None and reset <= now else dict(window)
         )
-    return result or None
+    if not result:
+        return None
+    spend = last_good.get("spend")
+    if isinstance(spend, dict):
+        result["spend"] = dict(spend)
+    return result
 
 
 # The same 5h/7d rate-limit headers Claude Code itself reads off every
@@ -1340,33 +1376,22 @@ class UsageStore:
         """Rewrite a version-3 store as version 4, once, under the lock.
 
         Version 3 stored only usage-endpoint spends, so each stored
-        ``spend`` gains ``reported: dollars``; every other field is kept as
-        it was, so no reading is lost. After this the reader accepts only
-        version 4. Nothing happens for an absent, unreadable or other-version
-        file (``_read_rows`` reads those as empty, as before).
+        ``spend`` gains ``reported: dollars`` (:func:`_v3_rows_as_v4`);
+        every other field is kept as it was, so no reading is lost. Nothing
+        happens for an absent file or one in any other version; a file this
+        code cannot read raises :class:`UsageStoreVersionError` here as on
+        every write, rather than being replaced.
         """
         if not self.path.exists():
             return
         with self._lock():
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                raw = self._load_raw()
+            except UsageStoreVersionError:
+                return  # read as no data; every write path refuses it
+            if raw is None or raw.get("schemaVersion") != _SCHEMA_VERSION_V3:
                 return
-            if (
-                not isinstance(raw, dict)
-                or raw.get("schemaVersion") != _SCHEMA_VERSION_V3
-            ):
-                return
-            rows = raw.get("accounts")
-            if not isinstance(rows, dict):
-                rows = {}
-            for row in rows.values():
-                last_good = row.get("lastGood") if isinstance(row, dict) else None
-                spend = (
-                    last_good.get("spend") if isinstance(last_good, dict) else None
-                )
-                if isinstance(spend, dict):
-                    spend["reported"] = oauth.SPEND_REPORTED_DOLLARS
+            rows = self._rows_for_write()
             self._write_rows(rows)
         _logger.info(
             "Usage store %s migrated from schema version %d to %d (%d accounts kept)",
@@ -1381,15 +1406,62 @@ class UsageStore:
     def _lock(self) -> FileLock:
         return FileLock(self._lock_path)
 
-    def _read_rows(self) -> dict[str, dict]:
+    def _load_raw(self) -> dict | None:
+        """The parsed store file, None when it does not exist. Raises
+        :class:`UsageStoreVersionError` when it exists but cannot be read
+        or parsed as a JSON object."""
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as e:
+            raise UsageStoreVersionError(self.path, None, f"unreadable: {e}") from e
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise UsageStoreVersionError(self.path, None, f"not JSON: {e}") from e
+        if not isinstance(raw, dict):
+            raise UsageStoreVersionError(self.path, None, "not a JSON object")
+        return raw
+
+    def _rows_for_write(self) -> dict[str, dict]:
+        """The stored rows for a read-modify-write, under the lock.
+
+        Version 4 is read as is and version 3 through
+        :func:`_v3_rows_as_v4`. A file with no ``schemaVersion`` (the
+        version-less snapshot) or a version below 3 holds nothing this code
+        keeps, so it reads as empty and the write replaces it. Anything else
+        (a newer version, a non-integer version, an unparseable file, a
+        missing ``accounts`` object) raises :class:`UsageStoreVersionError`:
+        writing would replace rows this code cannot read with only the rows
+        it is adding, which is how an older process emptied the store after
+        the version-4 install (X3655).
+        """
+        raw = self._load_raw()
+        if raw is None:
             return {}
-        if not isinstance(raw, dict) or raw.get("schemaVersion") != SCHEMA_VERSION:
-            return {}  # legacy snapshot or future schema: start empty
+        version = raw.get("schemaVersion")
+        if version is None or (
+            isinstance(version, int)
+            and not isinstance(version, bool)
+            and version < _SCHEMA_VERSION_V3
+        ):
+            return {}
+        if version not in (SCHEMA_VERSION, _SCHEMA_VERSION_V3):
+            raise UsageStoreVersionError(self.path, version, "unknown version")
         rows = raw.get("accounts")
-        return rows if isinstance(rows, dict) else {}
+        if not isinstance(rows, dict):
+            raise UsageStoreVersionError(self.path, version, "no accounts object")
+        return _v3_rows_as_v4(rows) if version == _SCHEMA_VERSION_V3 else rows
+
+    def _read_rows(self) -> dict[str, dict]:
+        """The stored rows for a read that writes nothing back. A file this
+        code cannot read is no data here; every write path reads through
+        :meth:`_rows_for_write` instead, which refuses it."""
+        try:
+            return self._rows_for_write()
+        except UsageStoreVersionError:
+            return {}
 
     def _write_rows(self, rows: dict[str, dict]) -> None:
         atomic_write_json(
@@ -1511,7 +1583,7 @@ class UsageStore:
         """Read-modify-write rows for ``nums`` under the lock. A row whose
         stored identity mismatches is replaced with a fresh one first."""
         with self._lock():
-            rows = self._read_rows()
+            rows = self._rows_for_write()
             for num in nums:
                 identity = identities[num]
                 if not self._matches(rows.get(num), identity):
@@ -1580,7 +1652,7 @@ class UsageStore:
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
-            rows = self._read_rows()
+            rows = self._rows_for_write()
             for num in nums:
                 identity = identities[num]
                 row = rows.get(num)
@@ -1742,7 +1814,7 @@ class UsageStore:
                     row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
-            rows = self._read_rows()
+            rows = self._rows_for_write()
             for num in outcomes:
                 identity = identities[num]
                 row = rows.get(num)
@@ -2003,7 +2075,7 @@ class UsageStore:
         """
         now = self.clock()
         with self._lock():
-            rows = self._read_rows()
+            rows = self._rows_for_write()
             row = rows.get(num)
             if not self._matches(row, identities[num]):
                 row = self._fresh_row(identities[num])

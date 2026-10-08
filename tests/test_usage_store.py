@@ -1892,6 +1892,25 @@ class TestHeaderOverageSpend:
             reported="dollars", remaining=591.89
         )
 
+    def test_a_version_3_file_written_after_load_is_kept_on_the_next_write(
+        self, store, clock
+    ):
+        """Asserts: a version-3 file an older process wrote after this
+        store loaded is read through the migration on the next write, so
+        its rows survive beside the new one."""
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(json.dumps({"schemaVersion": 3, "accounts": {
+            "1": {"email": "a@x.com", "organizationUuid": "",
+                  "lastGood": {**USAGE, "spend": {
+                      k: v for k, v in _DOLLAR_SPEND.items() if k != "reported"
+                  }}, "fetchedAt": clock.now},
+        }}), encoding="utf-8")
+        store.record({"2": FetchRecord(usage=dict(USAGE))}, IDENT)
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert raw["schemaVersion"] == 4
+        assert raw["accounts"]["1"]["lastGood"]["spend"] == _DOLLAR_SPEND
+        assert raw["accounts"]["2"]["lastGood"] == USAGE
+
     def test_a_version_2_file_is_still_read_as_empty(self, tmp_path, clock):
         """Asserts: only version 3 is migrated; an older file is read as
         empty, as before."""
@@ -1904,6 +1923,80 @@ class TestHeaderOverageSpend:
         }), encoding="utf-8")
         store = UsageStore(cache, clock=clock)
         assert store.entries(IDENT)["1"].last_good is None
+
+
+_UNREADABLE_FILES = {
+    "newer-version": json.dumps(
+        {"schemaVersion": 5, "accounts": {"1": {"email": "a@x.com"}}}
+    ),
+    "string-version": json.dumps({"schemaVersion": "4", "accounts": {}}),
+    "not-json": "{not json",
+    "not-an-object": "[1, 2]",
+    "no-accounts": json.dumps({"schemaVersion": 4}),
+}
+
+_WRITERS = {
+    "record": lambda s: s.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT),
+    "record_header_reading": lambda s: s.record_header_reading(
+        "1", IDENT, {usage_store.USAGE_HEADER_5H_PCT: "0.5"}, header_only=True
+    ),
+    "mark_at_limit": lambda s: s.mark_at_limit("1", IDENT),
+    "claim": lambda s: s.claim(["1"], IDENT),
+    "strike_refused_credential": lambda s: s.strike_refused_credential(
+        "1", IDENT, "fp"
+    ),
+    "answer_client_usage": lambda s: s.answer_client_usage(
+        "1", IDENT, usage_store.USAGE_VARIANT_PLAIN
+    ),
+}
+
+
+class TestUnreadableStoreIsNeverOverwritten:
+    """X3655: an older process read the version-4 store as empty and wrote
+    back its one row, emptying it. No write path replaces a file it cannot
+    read."""
+
+    @pytest.mark.parametrize("writer", sorted(_WRITERS))
+    @pytest.mark.parametrize("kind", sorted(_UNREADABLE_FILES))
+    def test_every_writer_refuses_and_leaves_the_file(
+        self, tmp_path, clock, writer, kind
+    ):
+        """Asserts: each read-modify-write path raises
+        UsageStoreVersionError naming the file, and the file's bytes are
+        unchanged; a reader still sees no data."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        path = cache / "usage.json"
+        path.write_text(_UNREADABLE_FILES[kind], encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        with pytest.raises(usage_store.UsageStoreVersionError) as raised:
+            _WRITERS[writer](store)
+        assert str(path) in str(raised.value)
+        assert path.read_text(encoding="utf-8") == _UNREADABLE_FILES[kind]
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_the_error_names_both_versions(self, tmp_path, clock):
+        """Asserts: the refusal names the version found and the version
+        this code writes."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "usage.json").write_text(
+            _UNREADABLE_FILES["newer-version"], encoding="utf-8"
+        )
+        store = UsageStore(cache, clock=clock)
+        with pytest.raises(usage_store.UsageStoreVersionError) as raised:
+            store.mark_at_limit("1", IDENT)
+        assert raised.value.found == 5
+        assert "schema version 5" in str(raised.value)
+        assert "writes version 4" in str(raised.value)
+
+    def test_a_versionless_snapshot_is_still_replaced(self, store):
+        """Asserts: the version-less snapshot (known, holding nothing kept)
+        is replaced by a write, as before."""
+        store.path.parent.mkdir(parents=True)
+        store.path.write_text(json.dumps({"timestamp": 1, "data": {}}), encoding="utf-8")
+        store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+        assert store.entries(IDENT)["1"].last_good == USAGE
 
 
 class TestLast429Marker:
