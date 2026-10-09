@@ -222,12 +222,29 @@ def spend_amounts(spend: dict) -> str:
     ``credits on, out of credits``, or the reply's own disabled reason."""
     if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
         return _fraction_spend_words(spend)
+    if spend.get("cap_source") == oauth.CAP_SOURCE_CONFIG:
+        return _configured_cap_words(spend)
     limit = spend["limit"]
     if spend["limit_reached"]:
         return f"cap reached (${limit:,.2f})" if limit is not None else "cap reached"
     if limit is None:
         return f"${spend['used']:,.2f} used, no cap"
     return f"${spend['remaining']:,.2f} left of ${limit:,.2f}"
+
+
+def _configured_cap_words(spend: dict) -> str:
+    """:func:`spend_amounts` for dollars computed from the configured cap
+    (``cap_source: config``): the words say the cap is the operator's own,
+    ``$500.00 left of your $500 cap``. A disabled reason other than out of
+    credits is named, as for the fraction spend it came from."""
+    limit = spend["limit"]
+    cap = f"${limit:,.0f}" if float(limit).is_integer() else f"${limit:,.2f}"
+    reason = spend["disabled_reason"]
+    if reason is not None and reason != "out_of_credits":
+        return f"credits refused ({reason}), your {cap} cap"
+    if spend["limit_reached"]:
+        return f"cap reached (your {cap} cap)"
+    return f"${spend['remaining']:,.2f} left of your {cap} cap"
 
 
 def _fraction_spend_words(spend: dict) -> str:

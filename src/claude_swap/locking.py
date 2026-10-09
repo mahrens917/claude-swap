@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import importlib.metadata
+import json
+import logging
 import os
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Iterator
 
@@ -15,7 +21,170 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-from claude_swap.exceptions import LockError
+from claude_swap.exceptions import ClaudeSwitchError, LockError
+
+_logger = logging.getLogger("claude-swap")
+
+
+# THE BUILD CHECK ON SHARED WRITES (X3697). Several processes write the
+# usage store and the engine state file: `cswap auto`, `cswap list`, the menu
+# bar, and the owner proxy, which imports this package into its own process
+# and keeps a draining process alive across an install. A process keeps
+# running the code it loaded, so after an install the draining proxy wrote
+# the store with the previous build's code beside the new one and emptied it
+# (live 2026-10-08 18:29Z). Every writer of those files therefore compares
+# the build it loaded with the build installed on disk now, and refuses the
+# write on a mismatch (`check_loaded_build_is_installed`). Reads stay
+# allowed: only a write can destroy what the other build keeps.
+#
+# The build's identity is a sha256 over this package's own ``*.py`` files
+# (relative path and bytes), not the distribution's version or the commit in
+# ``direct_url.json``: the version stays ``0.27.0b1`` across every commit,
+# a directory or editable install records no commit, and the files are
+# exactly the code a process runs. The commit, when the installed
+# distribution records one for this same directory, only labels the build
+# in messages.
+
+
+@dataclass(frozen=True)
+class Build:
+    """One claude-swap build: ``digest`` identifies it, ``label`` names it
+    for a reader (version, short digest, and the VCS commit when known)."""
+
+    digest: str
+    label: str
+
+
+class StaleBuildWriteError(ClaudeSwitchError):
+    """A process refused to write a shared file because the claude-swap
+    build it loaded is no longer the one installed on disk."""
+
+    def __init__(self, path: Path, loaded: Build, installed: Build) -> None:
+        self.path = path
+        self.loaded = loaded
+        self.installed = installed
+        super().__init__(
+            f"refusing to write {path}: this process loaded build "
+            f"{loaded.label}, build {installed.label} is installed"
+        )
+
+
+_PACKAGE_DIR = Path(__file__).resolve().parent
+
+
+def _source_files(package_dir: Path) -> list[Path]:
+    """Every ``*.py`` file of the package, sorted, ``__pycache__`` left out."""
+    found: list[Path] = []
+    for root, dirs, files in os.walk(package_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        found.extend(Path(root) / name for name in files if name.endswith(".py"))
+    return sorted(found)
+
+
+def _source_key(package_dir: Path, files: list[Path]) -> tuple:
+    """What a reinstall or an edit changes on every touched file: its path,
+    inode, mtime and size. Equal keys mean the digest is still valid."""
+    key = []
+    for path in files:
+        st = path.stat()
+        key.append(
+            (str(path.relative_to(package_dir)), st.st_ino, st.st_mtime_ns, st.st_size)
+        )
+    return tuple(key)
+
+
+def _source_digest(package_dir: Path, files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(package_dir)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _installed_commit(package_dir: Path) -> str | None:
+    """The VCS commit pip recorded for the installed distribution, when that
+    distribution's package directory is ``package_dir`` and it was installed
+    from a VCS URL; None otherwise (a directory or editable install, or a
+    distribution installed somewhere other than the code this process runs)."""
+    dist = importlib.metadata.distribution("claude-swap")
+    if Path(str(dist.locate_file("claude_swap"))).resolve() != package_dir:
+        return None
+    text = dist.read_text("direct_url.json")
+    if text is None:
+        return None
+    vcs_info = json.loads(text).get("vcs_info")
+    if not isinstance(vcs_info, dict):
+        return None
+    commit = vcs_info.get("commit_id")
+    return commit if isinstance(commit, str) else None
+
+
+def _build_label(package_dir: Path, digest: str) -> str:
+    version = importlib.metadata.version("claude-swap")
+    commit = _installed_commit(package_dir)
+    where = f", commit {commit[:10]}" if commit else ""
+    return f"{version} (source sha256 {digest[:12]}{where})"
+
+
+# (source key, digest) of the package files on disk, under `_build_lock`:
+# a write re-hashes only when a file's path, inode, mtime or size moved.
+_installed_cache: tuple[tuple, str] | None = None
+_build_lock = threading.Lock()
+
+
+def installed_build_digest() -> str:
+    """The digest of the build installed on disk now, re-hashed only when
+    the package files' stat key changed since the last call."""
+    global _installed_cache
+    files = _source_files(_PACKAGE_DIR)
+    key = _source_key(_PACKAGE_DIR, files)
+    with _build_lock:
+        if _installed_cache is not None and _installed_cache[0] == key:
+            return _installed_cache[1]
+    digest = _source_digest(_PACKAGE_DIR, files)
+    with _build_lock:
+        _installed_cache = (key, digest)
+    return digest
+
+
+def _loaded_build() -> Build:
+    digest = installed_build_digest()
+    return Build(digest=digest, label=_build_label(_PACKAGE_DIR, digest))
+
+
+# The build this process loaded: the package files as they were when this
+# module was imported, which is when the package itself was imported.
+LOADED_BUILD = _loaded_build()
+
+# Files this process has already named in its one refusal WARNING.
+_refusal_warned: set[str] = set()
+
+
+def check_loaded_build_is_installed(path: Path) -> None:
+    """Refuse a write to the shared file ``path`` from a process whose loaded
+    build is no longer the installed one.
+
+    Raises :class:`StaleBuildWriteError` on a mismatch, after logging ONE
+    WARNING per file per process naming both builds; the file is not
+    touched. A package file that vanishes mid-check (an install in
+    progress) raises ``OSError``: no build is installed at that instant.
+    """
+    installed_digest = installed_build_digest()
+    if installed_digest == LOADED_BUILD.digest:
+        return
+    installed = Build(
+        digest=installed_digest,
+        label=_build_label(_PACKAGE_DIR, installed_digest),
+    )
+    exc = StaleBuildWriteError(path, LOADED_BUILD, installed)
+    with _build_lock:
+        first = str(path) not in _refusal_warned
+        _refusal_warned.add(str(path))
+    if first:
+        _logger.warning("%s", exc)
+    raise exc
 
 #: How long `add`, `add-token`, `remove`, `import` and `export` wait for the
 #: account store lock (the switcher's ``lock_file``). Every other holder

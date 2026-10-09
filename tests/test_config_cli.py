@@ -305,3 +305,57 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestConfigCreditCaps:
+    """`creditCaps.<email>`: a setup-token account's monthly usage-credit cap
+    in US dollars (X3696)."""
+
+    def test_set_get_list_and_unset(self, temp_home, capsys):
+        """Asserts: a cap set for an email with dots is stored under the
+        `creditCaps` section keyed by the whole email, read back by get
+        and listed, and unset removes it and the empty section."""
+        key = "creditCaps.satoshi@satoshi.report"
+        code, out, _ = _run(["set", key, "500"], capsys)
+        assert code == 0
+        assert f"{key} = 500" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert raw["creditCaps"] == {"satoshi@satoshi.report": 500.0}
+        code, out, _ = _run(["get", key], capsys)
+        assert (code, out.strip()) == (0, "500")
+        code, out, _ = _run(["get", key, "--json"], capsys)
+        assert json.loads(out) == {
+            "schemaVersion": 1, "key": key, "value": 500.0, "isSet": True,
+        }
+        code, out, _ = _run([], capsys)
+        cap_line = next(ln for ln in out.splitlines() if key in ln)
+        assert "500" in cap_line and "(default)" not in cap_line
+        code, out, _ = _run(["--json"], capsys)
+        by_key = {e["key"]: e for e in json.loads(out)["settings"]}
+        assert by_key[key]["value"] == 500.0
+        code, out, _ = _run(["unset", key], capsys)
+        assert code == 0
+        assert "no cap configured" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert "creditCaps" not in raw
+
+    def test_get_unset_cap_reads_none(self, temp_home, capsys):
+        """Asserts: an email with no cap reads `(none)`."""
+        code, out, _ = _run(["get", "creditCaps.a@example.com"], capsys)
+        assert (code, out.strip()) == (0, "(none)")
+
+    @pytest.mark.parametrize("value", ["0", "-5", "abc", "inf", "nan"])
+    def test_a_cap_must_be_a_positive_number(self, temp_home, capsys, value):
+        """Asserts: zero, negative, non-numeric and non-finite caps are
+        refused naming the key, and nothing is written."""
+        key = "creditCaps.a@example.com"
+        code, out, err = _run(["set", key, value], capsys)
+        assert code == 1
+        assert key in out + err
+        assert not _settings_file(capsys).exists()
+
+    def test_a_key_without_an_email_is_refused(self, temp_home, capsys):
+        """Asserts: `creditCaps.` followed by no email is refused."""
+        code, out, err = _run(["set", "creditCaps.nobody", "500"], capsys)
+        assert code == 1
+        assert "name the account's email" in out + err

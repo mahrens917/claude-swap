@@ -20154,3 +20154,30 @@ class TestDynamicArmsReadTheOverloadBackoff:
         })
         assert outcome is not TickOutcome.SWITCHED, h.kinds()
         assert h.active_number() == 1
+
+
+class TestEngineStateStaleBuild:
+    """X3697: an engine whose loaded build is no longer the installed one
+    refuses to write the engine state file."""
+
+    def test_an_old_build_engine_refuses_the_state_write(
+        self, harness, monkeypatch, caplog
+    ):
+        """Asserts: with the loaded build differing from the installed one,
+        a state write raises StaleBuildWriteError, the file keeps its bytes,
+        and ONE WARNING names the state file; the same build writes."""
+        from claude_swap import locking
+
+        harness.engine._mutate_state(lambda s: s.update(probe=1))
+        path = harness.engine.state_path
+        before = path.read_bytes()
+        monkeypatch.setattr(locking, "LOADED_BUILD", locking.Build("0" * 64, "old"))
+        monkeypatch.setattr(locking, "_refusal_warned", set())
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            for _ in range(2):
+                with pytest.raises(locking.StaleBuildWriteError):
+                    harness.engine._mutate_state(lambda s: s.update(probe=2))
+        assert path.read_bytes() == before
+        lines = [r.getMessage() for r in caplog.records
+                 if r.levelno == logging.WARNING and "refusing to write" in r.getMessage()]
+        assert len(lines) == 1 and str(path) in lines[0], lines

@@ -127,6 +127,10 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         }
         if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
             spend_out["disabledReason"] = spend["disabled_reason"]
+        if "cap_source" in spend:
+            # Dollars computed from the configured cap (X3696), not the API.
+            spend_out["capSource"] = spend["cap_source"]
+            spend_out["disabledReason"] = spend["disabled_reason"]
         if "resets_at" in spend:
             spend_out["resetsAt"] = spend["resets_at"]
         cell = oauth.fresh_reset_strings(spend)
@@ -222,8 +226,27 @@ def _spend_from_json(spend: object) -> dict:
         "currency": spend["currency"],
         "limit_reached": spend["limitReached"],
     }
+    if "capSource" in spend:
+        if spend["capSource"] != oauth.CAP_SOURCE_CONFIG:
+            raise ValueError(
+                f"spend.capSource must be {oauth.CAP_SOURCE_CONFIG!r} when "
+                f"present, not {spend['capSource']!r}"
+            )
+        if limit is None:
+            raise ValueError("spend.limit must be set when spend.capSource is set")
+        out["cap_source"] = oauth.CAP_SOURCE_CONFIG
+        out["disabled_reason"] = _disabled_reason_from_json(spend)
     _spend_reset_from_json(spend, out)
     return out
+
+
+def _disabled_reason_from_json(spend: dict) -> str | None:
+    if "disabledReason" not in spend:
+        raise ValueError("spend.disabledReason is missing (null means none)")
+    reason = spend["disabledReason"]
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError("spend.disabledReason must be a string or null")
+    return reason
 
 
 def _fraction_spend_from_json(spend: dict) -> dict:
@@ -244,11 +267,7 @@ def _fraction_spend_from_json(spend: dict) -> dict:
         raise ValueError("spend.pct must be a non-negative number or null")
     if not isinstance(spend.get("limitReached"), bool):
         raise ValueError("spend.limitReached must be a boolean")
-    if "disabledReason" not in spend:
-        raise ValueError("spend.disabledReason is missing (null means none)")
-    reason = spend["disabledReason"]
-    if reason is not None and not isinstance(reason, str):
-        raise ValueError("spend.disabledReason must be a string or null")
+    reason = _disabled_reason_from_json(spend)
     out: dict = {
         "reported": oauth.SPEND_REPORTED_FRACTION,
         "used": None,

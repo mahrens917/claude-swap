@@ -7,7 +7,8 @@ import logging
 
 import pytest
 
-from claude_swap import oauth, usage_store
+from claude_swap import locking, oauth, settings, usage_store
+from claude_swap.exceptions import ConfigError
 from claude_swap.poll_policy import (
     CANDIDATE_MAX_INTERVAL_S,
     POST_429_MIN_INTERVAL_S,
@@ -1858,10 +1859,11 @@ class TestHeaderOverageSpend:
     def test_a_version_3_file_is_migrated_with_every_reading_kept(
         self, tmp_path, clock
     ):
-        """Asserts: a version-3 store holding an account-1 dollar spend and
-        an account-2 header-only reading (the setup-token kind only use can
-        re-acquire, X3650) is rewritten as version 4 on load with both
-        readings intact, the dollar spend marked ``reported: dollars``."""
+        """Asserts: a version-3 ``usage.json`` holding an account-1 dollar
+        spend and an account-2 header-only reading (the setup-token kind
+        only use can re-acquire, X3650) is carried into ``usage-v4.json``
+        on load with both readings intact, the dollar spend marked
+        ``reported: dollars``, and ``usage.json`` is left as it was."""
         cache = tmp_path / "cache"
         cache.mkdir()
         v3_spend = {k: v for k, v in _DOLLAR_SPEND.items() if k != "reported"}
@@ -1880,9 +1882,12 @@ class TestHeaderOverageSpend:
                       "consecutiveFailures": 0, "nextPollAt": None},
             },
         }), encoding="utf-8")
+        before = (cache / "usage.json").read_bytes()
         store = UsageStore(cache, clock=clock)
-        raw = json.loads((cache / "usage.json").read_text(encoding="utf-8"))
+        assert store.path == cache / "usage-v4.json"
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
         assert raw["schemaVersion"] == 4
+        assert (cache / "usage.json").read_bytes() == before
         entries = store.entries(IDENT)
         assert entries["1"].last_good == {**USAGE, "spend": _DOLLAR_SPEND}
         assert entries["1"].fetched_at == clock.now
@@ -1892,28 +1897,10 @@ class TestHeaderOverageSpend:
             reported="dollars", remaining=591.89
         )
 
-    def test_a_version_3_file_written_after_load_is_kept_on_the_next_write(
-        self, store, clock
-    ):
-        """Asserts: a version-3 file an older process wrote after this
-        store loaded is read through the migration on the next write, so
-        its rows survive beside the new one."""
-        store.path.parent.mkdir(parents=True)
-        store.path.write_text(json.dumps({"schemaVersion": 3, "accounts": {
-            "1": {"email": "a@x.com", "organizationUuid": "",
-                  "lastGood": {**USAGE, "spend": {
-                      k: v for k, v in _DOLLAR_SPEND.items() if k != "reported"
-                  }}, "fetchedAt": clock.now},
-        }}), encoding="utf-8")
-        store.record({"2": FetchRecord(usage=dict(USAGE))}, IDENT)
-        raw = json.loads(store.path.read_text(encoding="utf-8"))
-        assert raw["schemaVersion"] == 4
-        assert raw["accounts"]["1"]["lastGood"]["spend"] == _DOLLAR_SPEND
-        assert raw["accounts"]["2"]["lastGood"] == USAGE
-
     def test_a_version_2_file_is_still_read_as_empty(self, tmp_path, clock):
-        """Asserts: only version 3 is migrated; an older file is read as
-        empty, as before."""
+        """Asserts: only versions 3 and 4 are carried forward; an older
+        ``usage.json`` is read as empty and no ``usage-v4.json`` is made
+        from it."""
         cache = tmp_path / "cache"
         cache.mkdir()
         (cache / "usage.json").write_text(json.dumps({
@@ -1923,6 +1910,113 @@ class TestHeaderOverageSpend:
         }), encoding="utf-8")
         store = UsageStore(cache, clock=clock)
         assert store.entries(IDENT)["1"].last_good is None
+        assert not store.path.exists()
+
+
+def _live_shaped_usage_json(now: float) -> dict:
+    """A schema-4 ``usage.json`` shaped like the rcbox's on 2026-10-09: four
+    rows, one usage-endpoint account with a dollar spend, a scoped window and
+    poll bookkeeping, and three setup-token accounts read off reply headers
+    (fraction spends), one of them walled."""
+    fraction = {
+        "reported": "fraction", "used": None, "limit": None, "remaining": None,
+        "pct": 0.0, "currency": None, "limit_reached": False,
+        "disabled_reason": None, "resets_at": "2026-11-01T00:00:00Z",
+    }
+    return {"schemaVersion": 4, "accounts": {
+        "2": {"email": "b@x.com", "organizationUuid": "org-2",
+              "fetchedAt": now, "consecutiveFailures": 0, "backoffUntil": None,
+              "lastError": None, "nextPollAt": None, "pollIntervalS": 300.0,
+              "lastGood": {"five_hour": {"pct": 0.0, "resets_at": "2099-01-01T05:00:00Z"},
+                           "seven_day": {"pct": 100.0, "resets_at": "2099-01-01T07:00:00Z"},
+                           "spend": dict(fraction)}},
+        "1": {"email": "a@x.com", "organizationUuid": "",
+              "fetchedAt": now, "consecutiveFailures": 0, "attempts": [now - 60],
+              "authDeadStrikes": 0, "claimId": None, "claimUntil": None,
+              "lastAttemptAt": now, "pollIntervalS": 300.0, "nextPollAt": now + 300,
+              "lastGood": {"five_hour": {"pct": 0.0},
+                           "seven_day": {"pct": 100.0},
+                           "spend": dict(_DOLLAR_SPEND),
+                           "scoped": [{"name": "Fable", "pct": 23.0}]}},
+        "3": {"email": "c@x.com", "organizationUuid": "org-3",
+              "fetchedAt": now, "consecutiveFailures": 0, "walledUntil": now + 600,
+              "lastGood": {"spend": dict(fraction),
+                           "five_hour": {"pct": 0.0},
+                           "seven_day": {"pct": 100.0}}},
+        "4": {"email": "d@x.com", "organizationUuid": "org-4",
+              "fetchedAt": now, "consecutiveFailures": 0, "walledUntil": None,
+              "lastGood": {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 76.0},
+                           "spend": dict(fraction)}},
+    }}
+
+
+class TestVersionedStoreFile:
+    """X3697: the store's file name carries its schema version, so a process
+    of the previous build that outlives an install writes only the previous
+    file and cannot empty this one."""
+
+    def test_the_store_file_is_named_for_its_schema(self, store):
+        """Asserts: the store lives at ``usage-v<SCHEMA_VERSION>.json``."""
+        assert usage_store.SCHEMA_VERSION == 4
+        assert store.path.name == "usage-v4.json"
+
+    def test_copy_forward_keeps_all_four_live_rows(self, tmp_path, clock):
+        """Asserts: a live-shaped schema-4 ``usage.json`` with four rows is
+        copied into ``usage-v4.json`` row for row, byte-equal as JSON."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        live = _live_shaped_usage_json(clock.now)
+        (cache / "usage.json").write_text(json.dumps(live), encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert raw == live
+        idents = {num: (row["email"], row["organizationUuid"])
+                  for num, row in live["accounts"].items()}
+        entries = store.entries(idents)
+        for num, row in live["accounts"].items():
+            assert entries[num].last_good == row["lastGood"], num
+
+    def test_a_later_write_never_touches_usage_json(self, tmp_path, clock):
+        """Asserts: after the copy, writes land in ``usage-v4.json`` only;
+        ``usage.json`` keeps its bytes, and rows a previous-build process
+        writes there afterwards are never read."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        old = cache / "usage.json"
+        old.write_text(json.dumps(_live_shaped_usage_json(clock.now)), encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        old.write_text(json.dumps({"schemaVersion": 4, "accounts": {}}), encoding="utf-8")
+        before = old.read_bytes()
+        store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+        store.mark_at_limit("2", IDENT)
+        assert old.read_bytes() == before
+        again = UsageStore(cache, clock=clock)
+        assert again.entries(IDENT)["1"].last_good == USAGE
+        raw = json.loads(again.path.read_text(encoding="utf-8"))
+        assert set(raw["accounts"]) == {"1", "2", "3", "4"}
+
+    def test_copy_forward_runs_once(self, tmp_path, clock):
+        """Asserts: with ``usage-v4.json`` present, ``usage.json`` is not
+        read again: rows it gains later never reach the store."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        old = cache / "usage.json"
+        old.write_text(json.dumps({"schemaVersion": 4, "accounts": {}}), encoding="utf-8")
+        UsageStore(cache, clock=clock)
+        old.write_text(json.dumps(_live_shaped_usage_json(clock.now)), encoding="utf-8")
+        store = UsageStore(cache, clock=clock)
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_an_unreadable_previous_file_is_named_and_not_copied(self, tmp_path, clock):
+        """Asserts: a ``usage.json`` this code cannot read raises
+        UsageStoreVersionError naming it, and no ``usage-v4.json`` is made."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "usage.json").write_text("{not json", encoding="utf-8")
+        with pytest.raises(usage_store.UsageStoreVersionError) as raised:
+            UsageStore(cache, clock=clock)
+        assert str(cache / "usage.json") in str(raised.value)
+        assert not (cache / "usage-v4.json").exists()
 
 
 _UNREADABLE_FILES = {
@@ -1966,7 +2060,7 @@ class TestUnreadableStoreIsNeverOverwritten:
         unchanged; a reader still sees no data."""
         cache = tmp_path / "cache"
         cache.mkdir()
-        path = cache / "usage.json"
+        path = cache / "usage-v4.json"
         path.write_text(_UNREADABLE_FILES[kind], encoding="utf-8")
         store = UsageStore(cache, clock=clock)
         with pytest.raises(usage_store.UsageStoreVersionError) as raised:
@@ -1980,7 +2074,7 @@ class TestUnreadableStoreIsNeverOverwritten:
         this code writes."""
         cache = tmp_path / "cache"
         cache.mkdir()
-        (cache / "usage.json").write_text(
+        (cache / "usage-v4.json").write_text(
             _UNREADABLE_FILES["newer-version"], encoding="utf-8"
         )
         store = UsageStore(cache, clock=clock)
@@ -1990,13 +2084,230 @@ class TestUnreadableStoreIsNeverOverwritten:
         assert "schema version 5" in str(raised.value)
         assert "writes version 4" in str(raised.value)
 
-    def test_a_versionless_snapshot_is_still_replaced(self, store):
-        """Asserts: the version-less snapshot (known, holding nothing kept)
-        is replaced by a write, as before."""
-        store.path.parent.mkdir(parents=True)
-        store.path.write_text(json.dumps({"timestamp": 1, "data": {}}), encoding="utf-8")
+    def test_a_versionless_snapshot_is_not_carried_forward(self, tmp_path, clock):
+        """Asserts: the version-less snapshot in ``usage.json`` (known,
+        holding nothing kept) is not copied, and the first write starts
+        ``usage-v4.json`` with only its own row."""
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "usage.json").write_text(
+            json.dumps({"timestamp": 1, "data": {}}), encoding="utf-8"
+        )
+        store = UsageStore(cache, clock=clock)
         store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
         assert store.entries(IDENT)["1"].last_good == USAGE
+
+
+def _stale_build(monkeypatch) -> locking.Build:
+    """Make this process look like one that loaded an older build: the
+    loaded build's digest differs from the files installed on disk."""
+    old = locking.Build(digest="0" * 64, label="0.26.0 (source sha256 000000000000)")
+    monkeypatch.setattr(locking, "LOADED_BUILD", old)
+    monkeypatch.setattr(locking, "_refusal_warned", set())
+    return old
+
+
+class TestStaleBuildRefusesWrites:
+    """X3697: a process whose loaded claude-swap build is no longer the one
+    installed refuses every store write, so it cannot empty the store the
+    installed build keeps."""
+
+    def test_an_old_build_refuses_to_write_and_logs_once(
+        self, store, monkeypatch, caplog
+    ):
+        """Asserts: with the loaded build differing from the installed one,
+        two writes each raise StaleBuildWriteError, the store file is never
+        created, exactly ONE WARNING names the file and both builds, and a
+        read still answers."""
+        old = _stale_build(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(locking.StaleBuildWriteError) as raised:
+                store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+            with pytest.raises(locking.StaleBuildWriteError):
+                store.mark_at_limit("1", IDENT)
+        assert not store.path.exists()
+        assert raised.value.loaded == old
+        assert raised.value.installed.digest == locking.installed_build_digest()
+        lines = [r for r in caplog.records if "refusing to write" in r.getMessage()]
+        assert len(lines) == 1, [r.getMessage() for r in lines]
+        assert lines[0].levelno == logging.WARNING
+        message = lines[0].getMessage()
+        assert str(store.path) in message
+        assert f"this process loaded build {old.label}" in message
+        assert f"build {raised.value.installed.label} is installed" in message
+        assert store.entries(IDENT)["1"].last_good is None
+
+    def test_an_old_build_leaves_an_existing_file_untouched(
+        self, store, monkeypatch
+    ):
+        """Asserts: a file the installed build wrote keeps its bytes when an
+        old-build process tries to write over it."""
+        store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+        before = store.path.read_bytes()
+        _stale_build(monkeypatch)
+        with pytest.raises(locking.StaleBuildWriteError):
+            store.record({"2": FetchRecord(usage=dict(USAGE))}, IDENT)
+        assert store.path.read_bytes() == before
+
+    def test_the_same_build_writes(self, store):
+        """Asserts: a process whose loaded build is the installed one writes,
+        and its loaded digest is the installed digest."""
+        assert locking.LOADED_BUILD.digest == locking.installed_build_digest()
+        store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+        assert store.entries(IDENT)["1"].last_good == USAGE
+
+    def test_the_installed_digest_is_cached_by_file_stat(self, tmp_path, monkeypatch):
+        """Asserts: the installed digest is recomputed only when a package
+        file's stat moved, and an edit changes it."""
+        package = tmp_path / "pkg"
+        (package / "sub").mkdir(parents=True)
+        (package / "a.py").write_text("A = 1\n", encoding="utf-8")
+        (package / "sub" / "b.py").write_text("B = 1\n", encoding="utf-8")
+        monkeypatch.setattr(locking, "_PACKAGE_DIR", package)
+        monkeypatch.setattr(locking, "_installed_cache", None)
+        hashed = []
+        real = locking._source_digest
+        monkeypatch.setattr(
+            locking, "_source_digest",
+            lambda d, f: hashed.append(1) or real(d, f),
+        )
+        first = locking.installed_build_digest()
+        assert locking.installed_build_digest() == first
+        assert len(hashed) == 1
+        (package / "sub" / "b.py").write_text("B = 22\n", encoding="utf-8")
+        assert locking.installed_build_digest() != first
+        assert len(hashed) == 2
+
+
+def _fraction_headers(share: str, status: str = "allowed") -> dict[str, str]:
+    return {
+        usage_store.USAGE_HEADER_5H_PCT: "1.0",
+        usage_store.USAGE_HEADER_7D_PCT: "0.4",
+        usage_store.USAGE_HEADER_OVERAGE_STATUS: status,
+        usage_store.USAGE_HEADER_OVERAGE_PCT: share,
+    }
+
+
+def _set_cap(store: UsageStore, email: str, dollars: str) -> None:
+    settings.set_setting(store._settings_root, settings.credit_cap_key(email), dollars)
+
+
+class TestConfiguredCreditCap:
+    """X3696: a setup-token account's usage credits arrive only as a share of
+    its monthly cap; with the cap configured the store reads them in dollars."""
+
+    def test_a_fraction_spend_reads_in_dollars_against_the_cap(self, store):
+        """Asserts: a 10% share against a $500 cap reads as dollars: $50
+        used, $450 left, limit $500, ``cap_source: config``, the share and
+        the cap verdict kept."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("0.1"), header_only=True
+        )
+        _set_cap(store, "a@x.com", "500")
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["reported"] == oauth.SPEND_REPORTED_DOLLARS
+        assert spend["used"] == pytest.approx(50.0)
+        assert spend["limit"] == 500.0
+        assert spend["remaining"] == pytest.approx(450.0)
+        assert spend["pct"] == pytest.approx(10.0)
+        assert spend["currency"] == "USD"
+        assert spend["limit_reached"] is False
+        assert spend["cap_source"] == oauth.CAP_SOURCE_CONFIG
+        room = oauth.entry_credit_room(store.entries(IDENT)["1"])
+        assert room == oauth.UsageCreditRoom(
+            reported="dollars", remaining=pytest.approx(450.0)
+        )
+
+    def test_the_stored_reading_stays_a_fraction(self, store):
+        """Asserts: the cap is applied on read; the file keeps the measured
+        fraction, so a changed cap takes effect on the next read."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("0.1"), header_only=True
+        )
+        _set_cap(store, "a@x.com", "500")
+        store.entries(IDENT)
+        raw = json.loads(store.path.read_text(encoding="utf-8"))
+        assert raw["accounts"]["1"]["lastGood"]["spend"]["reported"] == "fraction"
+        _set_cap(store, "a@x.com", "200")
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["remaining"] == pytest.approx(180.0)
+
+    def test_the_cap_matches_the_email_without_case(self, store):
+        """Asserts: a cap set for ``A@X.com`` applies to account ``a@x.com``."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("0.0"), header_only=True
+        )
+        _set_cap(store, "A@X.com", "200")
+        assert store.entries(IDENT)["1"].last_good["spend"]["limit"] == 200.0
+
+    def test_a_reached_cap_stays_reached(self, store):
+        """Asserts: a rejected overage reads as dollars with the cap reached,
+        and is no credit room."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("1.0", status="rejected"), header_only=True
+        )
+        _set_cap(store, "a@x.com", "200")
+        entry = store.entries(IDENT)["1"]
+        assert entry.last_good["spend"]["limit_reached"] is True
+        assert entry.last_good["spend"]["remaining"] == pytest.approx(0.0)
+        assert oauth.entry_credit_room(entry) is None
+
+    def test_no_cap_stays_a_fraction_and_warns_once_per_account(
+        self, store, monkeypatch, caplog
+    ):
+        """Asserts: with credits on and no cap configured, the spend stays a
+        fraction and ONE WARNING per account names the account and the key
+        to set, however many reads follow."""
+        monkeypatch.setattr(usage_store, "_warned_no_credit_cap", set())
+        for num in ("1", "2"):
+            store.record_header_reading(
+                num, IDENT, _fraction_headers("0.2"), header_only=True
+            )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            for _ in range(3):
+                entries = store.entries(IDENT)
+        assert entries["1"].last_good["spend"]["reported"] == "fraction"
+        lines = [r.getMessage() for r in caplog.records
+                 if "no cap is configured" in r.getMessage()]
+        assert len(lines) == 2, lines
+        assert any("a@x.com" in m and "cswap config set creditCaps.a@x.com" in m
+                   for m in lines)
+        assert any("b@x.com" in m and "creditCaps.b@x.com" in m for m in lines)
+
+    def test_credits_off_does_not_warn(self, store, monkeypatch, caplog):
+        """Asserts: an account whose replies say credits are disabled is not
+        asked for a cap."""
+        monkeypatch.setattr(usage_store, "_warned_no_credit_cap", set())
+        headers = _fraction_headers("0.0", status="rejected")
+        headers[usage_store.USAGE_HEADER_OVERAGE_DISABLED_REASON] = "org_level_disabled"
+        store.record_header_reading("1", IDENT, headers, header_only=True)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.entries(IDENT)
+        assert not any("no cap is configured" in r.getMessage() for r in caplog.records)
+
+    def test_a_usage_endpoint_dollar_spend_is_untouched(self, store):
+        """Asserts: a cap configured for an account the usage endpoint
+        measures changes nothing: its dollars are the API's own."""
+        store.record(
+            {"1": FetchRecord(usage={**USAGE, "spend": dict(_DOLLAR_SPEND)})}, IDENT
+        )
+        _set_cap(store, "a@x.com", "200")
+        assert store.entries(IDENT)["1"].last_good["spend"] == _DOLLAR_SPEND
+
+    def test_a_bad_hand_edited_cap_raises_naming_the_key(self, store):
+        """Asserts: a cap that is not a positive number in settings.json
+        raises ConfigError naming ``creditCaps.<email>`` on the read of a
+        fraction spend."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("0.1"), header_only=True
+        )
+        path = settings.settings_path(store._settings_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"creditCaps": {"a@x.com": -5}}), encoding="utf-8"
+        )
+        with pytest.raises(ConfigError, match=r"creditCaps\.a@x\.com"):
+            store.entries(IDENT)
 
 
 class TestLast429Marker:

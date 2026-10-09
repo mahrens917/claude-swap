@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import secrets
 import sys
@@ -402,6 +403,115 @@ def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
     atomic_write_json(path, raw)
 
 
+# PER-ACCOUNT MONTHLY USAGE-CREDIT CAPS, in US dollars (X3696). A
+# setup-token account's replies report its usage credits only as a share of
+# its monthly cap (``reported: fraction``), never the cap itself, so the
+# operator configures the cap here and the usage store turns the share into
+# dollars (``usage_store.capped_dollar_spend``). Stored as a ``creditCaps``
+# section keyed by account email, ``{"creditCaps": {"a@x.com": 500}}``, and
+# set with ``cswap config set creditCaps.<email> <dollars>``: the key splits
+# at its first dot, so the email keeps its own dots.
+CREDIT_CAPS_SECTION = "creditCaps"
+
+
+def credit_cap_key(email: str) -> str:
+    """The `cswap config` key of ``email``'s monthly usage-credit cap."""
+    return f"{CREDIT_CAPS_SECTION}.{email}"
+
+
+def credit_cap_email(dotted_key: str) -> str | None:
+    """The account email a ``creditCaps.<email>`` key names, None for any
+    other key. A key with no email after the dot raises ``ConfigError``."""
+    prefix = f"{CREDIT_CAPS_SECTION}."
+    if not dotted_key.startswith(prefix):
+        return None
+    email = dotted_key[len(prefix):]
+    if "@" not in email:
+        raise ConfigError(
+            f"{dotted_key}: name the account's email after '{prefix}', e.g. "
+            f"{credit_cap_key('a@example.com')}"
+        )
+    return email
+
+
+def _credit_cap_value(where: str, value: object) -> float:
+    """A cap value checked: a finite number above zero, else ConfigError
+    naming ``where``."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ConfigError(f"{where} is not a positive number of US dollars")
+    return float(value)
+
+
+def parse_credit_cap(dotted_key: str, raw_value: str) -> float:
+    """Strictly parse `cswap config set creditCaps.<email> VALUE`."""
+    try:
+        value = float(raw_value)
+    except ValueError:
+        raise ConfigError(
+            f"{dotted_key} expects a positive number of US dollars, got '{raw_value}'"
+        ) from None
+    return _credit_cap_value(f"{dotted_key} = {raw_value!r}", value)
+
+
+def load_credit_caps(data_root: Path) -> dict[str, float]:
+    """The configured caps, keyed by lower-cased account email. A missing
+    file or section reads as no caps; a value that is not a positive
+    number, or two emails equal but for case, raises ``ConfigError``
+    naming the file and the key."""
+    path = settings_path(data_root)
+    section = _section(path, _read_raw(path), CREDIT_CAPS_SECTION)
+    caps: dict[str, float] = {}
+    for email, value in section.items():
+        key = credit_cap_key(email)
+        cap = _credit_cap_value(f"{path}: {key} = {value!r}", value)
+        if email.lower() in caps:
+            raise ConfigError(
+                f"{path}: {key} names an account another {CREDIT_CAPS_SECTION} "
+                "key already names (emails compare without case)"
+            )
+        caps[email.lower()] = cap
+    return caps
+
+
+def _set_credit_cap(data_root: Path, dotted_key: str, email: str, raw_value: str) -> float:
+    value = parse_credit_cap(dotted_key, raw_value)
+    path = settings_path(data_root)
+    raw = _read_raw(path, for_write=True)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    section = _section(path, raw, CREDIT_CAPS_SECTION)
+    section[email] = value
+    raw[CREDIT_CAPS_SECTION] = section
+    atomic_write_json(path, raw)
+    return value
+
+
+def _unset_credit_cap(data_root: Path, email: str) -> bool:
+    path = settings_path(data_root)
+    raw = _read_raw(path, for_write=True)
+    section = _section(path, raw, CREDIT_CAPS_SECTION)
+    if email not in section:
+        return False
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    del section[email]
+    if not section:
+        del raw[CREDIT_CAPS_SECTION]
+    atomic_write_json(path, raw)
+    return True
+
+
+def credit_cap_rows(data_root: Path) -> list[tuple[str, float]]:
+    """(``creditCaps.<email>`` key, cap) per configured cap, as stored."""
+    path = settings_path(data_root)
+    section = _section(path, _read_raw(path), CREDIT_CAPS_SECTION)
+    load_credit_caps(data_root)  # every value checked before any is shown
+    return [(credit_cap_key(email), float(value)) for email, value in section.items()]
+
+
 def setting_spec(dotted_key: str) -> SettingSpec:
     """Look up a spec by dotted key; unknown keys raise with the valid list."""
     spec = SETTING_SPECS.get(dotted_key)
@@ -481,8 +591,12 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     Writes only the given key (plus schemaVersion) — deliberately not
     ``save_settings``, which writes every known key and would freeze the
     current defaults into the file, pinning users to them if a later version
-    changes a default. Unknown keys and sections in the file survive.
+    changes a default. Unknown keys and sections in the file survive. A
+    ``creditCaps.<email>`` key writes that account's cap.
     """
+    email = credit_cap_email(dotted_key)
+    if email is not None:
+        return _set_credit_cap(backup_root, dotted_key, email, raw_value)
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
@@ -497,6 +611,9 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
 
 def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     """Remove one key from settings.json; False if it wasn't set (no write)."""
+    email = credit_cap_email(dotted_key)
+    if email is not None:
+        return _unset_credit_cap(backup_root, email)
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
     raw = _read_raw(path, for_write=True)

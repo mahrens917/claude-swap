@@ -51,7 +51,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.locking import FileLock
+from claude_swap.locking import FileLock, check_loaded_build_is_installed
 from claude_swap.logging_config import decision_logger
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -2045,8 +2045,16 @@ class AutoSwitchEngine:
             state = self._read_state()
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             mutator(state)
-            atomic_write_json(self.state_path, state)
+            self._write_state(state)
             return state
+
+    def _write_state(self, state: dict) -> None:
+        """Replace the state file, under the caller's state lock. Refused
+        with :class:`locking.StaleBuildWriteError` when this engine's loaded
+        build is no longer the installed one (X3697): an engine that
+        outlived an install would write the state with its old code."""
+        check_loaded_build_is_installed(self.state_path)
+        atomic_write_json(self.state_path, state)
 
     # -- quarantine -----------------------------------------------------------
 
@@ -5965,7 +5973,7 @@ class AutoSwitchEngine:
             # handed the panel's thread a dict this method's own next call
             # (or the next tick's) can go on mutating in place.
             self._last_probe_cooldown = _numeric_probe_cooldown(probe_cooldown)
-            atomic_write_json(self.state_path, state)
+            self._write_state(state)
 
         # No explicit `_message_trace_offset` reset here: the switch changes
         # `current`, and `_tick_inner` re-baselines off that on the very

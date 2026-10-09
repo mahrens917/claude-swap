@@ -346,6 +346,48 @@ class TestHeaderOnlySpendIsShown:
             row = usage_rows(entries[num].last_good, 0.0)[0]
             assert row[0] == "$$" and row[2] == words
 
+    def test_a_configured_cap_shows_dollars_everywhere(self, temp_home):
+        """Asserts: with a $500 cap configured for account 2 (X3696), `cswap
+        list --json` emits a ``dollars`` spend with ``capSource: config``,
+        and the list line and dashboard row read ``$500.00 left of your
+        $500 cap``; the JSON round-trips through ``usage_from_json``."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+        from claude_swap.settings import set_setting
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.tui.widgets import usage_rows
+
+        switcher = self._switcher()
+        set_setting(switcher.backup_dir, "creditCaps.two@example.com", "500")
+        payload = switcher.list_accounts(json_output=True, read_only=True)
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert rows[2]["usage"]["spend"] == {
+            "reported": "dollars", "used": 0.0, "limit": 500.0,
+            "remaining": 500.0, "pct": 0.0, "currency": "USD",
+            "limitReached": False, "capSource": "config", "disabledReason": None,
+        }
+        entries = switcher.usage_entries_by_account(fetch=set())
+        words = "$500.00 left of your $500 cap"
+        assert any(words in line for line in _usage_entry_lines(entries["2"]))
+        row = usage_rows(entries["2"].last_good, 0.0)[0]
+        assert row[0] == "$$" and row[2] == words
+        spend = entries["2"].last_good["spend"]
+        back = usage_from_json(usage_to_json(entries["2"].last_good))["spend"]
+        assert back["cap_source"] == "config"
+        assert back["remaining"] == spend["remaining"]
+
+    def test_a_cap_source_other_than_config_is_refused_on_import(self):
+        """Asserts: an imported dollars spend whose ``capSource`` is not
+        ``config`` is refused, naming the field."""
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError, match="capSource"):
+            usage_from_json({"spend": {
+                "reported": "dollars", "used": 1.0, "limit": 200.0,
+                "remaining": 199.0, "pct": 0.5, "currency": "USD",
+                "limitReached": False, "capSource": "guess",
+                "disabledReason": None,
+            }})
+
     def test_a_store_in_a_newer_schema_is_never_overwritten(
         self, temp_home, caplog
     ):

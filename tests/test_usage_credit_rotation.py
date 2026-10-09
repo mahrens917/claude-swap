@@ -265,6 +265,73 @@ class TestMoneyLeftRow:
         assert "#8: $$ $8.11 used, no cap" in event.human()
 
 
+class TestConfiguredCapsRankInDollars:
+    """X3696: with every setup-token account's monthly cap configured, the
+    credit rotation ranks the accounts by dollars left, not by share."""
+
+    def _entries(self, tmp_path, caps: dict[str, str]) -> dict[str, UsageEntry]:
+        from claude_swap import usage_store
+        from claude_swap.settings import credit_cap_key, set_setting
+
+        idents = {"1": ("a@example.com", ""), "2": ("b@example.com", ""),
+                  "3": ("c@example.com", "")}
+        store = usage_store.UsageStore(tmp_path / "cache")
+        for num, share in (("2", "0.5"), ("3", "0.5")):
+            store.record_header_reading(num, idents, {
+                usage_store.USAGE_HEADER_5H_PCT: "1.0",
+                usage_store.USAGE_HEADER_7D_PCT: "0.4",
+                usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+                usage_store.USAGE_HEADER_OVERAGE_PCT: share,
+            }, header_only=True)
+        for email, dollars in caps.items():
+            set_setting(tmp_path, credit_cap_key(email), dollars)
+        return store.entries(idents)
+
+    def test_the_larger_dollar_remainder_wins(self, tmp_path):
+        """Asserts: two accounts each half through their credits rank by
+        dollars: $250 left of a $500 cap beats $100 left of a $200 cap,
+        and the switch detail reads the dollars."""
+        from claude_swap.autoswitch import _credit_money, _usage_credit_pick
+
+        entries = self._entries(
+            tmp_path, {"b@example.com": "200", "c@example.com": "500"}
+        )
+        pick = _usage_credit_pick("1", ["2", "3"], entries)
+        assert pick is not None
+        number, room = pick
+        assert number == "3"
+        assert room.reported == "dollars"
+        assert room.remaining == pytest.approx(250.0)
+        assert _credit_money(room) == "$250.00 left"
+
+    def test_without_caps_the_shares_tie(self, tmp_path):
+        """Asserts: the same two readings with no cap configured stay
+        fractions and rank equal, so the larger cap is invisible: the
+        first candidate is taken."""
+        from claude_swap.autoswitch import _usage_credit_pick
+
+        entries = self._entries(tmp_path, {})
+        number, room = _usage_credit_pick("1", ["2", "3"], entries)
+        assert room.reported == "fraction"
+        assert number == "2"
+
+    def test_the_configured_cap_row_names_the_cap_as_yours(self):
+        """Asserts: dollars computed from the configured cap read ``left of
+        your $500 cap``; a reached one ``cap reached (your $500 cap)``."""
+        spend = {"used": 0.0, "limit": 500.0, "remaining": 500.0, "pct": 0.0,
+                 "currency": "USD", "limit_reached": False, "reported": "dollars",
+                 "cap_source": "config", "disabled_reason": None}
+        assert spend_row_body(spend) == "  0%   $500.00 left of your $500 cap"
+        reached = {**spend, "used": 500.0, "remaining": 0.0, "pct": 100.0,
+                   "limit_reached": True, "disabled_reason": "out_of_credits"}
+        assert spend_row_body(reached) == "100%   cap reached (your $500 cap)"
+        refused = {**spend, "limit_reached": True,
+                   "disabled_reason": "org_level_disabled"}
+        assert spend_row_body(refused) == (
+            "  0%   credits refused (org_level_disabled), your $500 cap"
+        )
+
+
 _LOST_ROOM_LINE = "lost its usage-credit room"
 
 

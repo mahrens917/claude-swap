@@ -838,6 +838,12 @@ def _log_usage_failure(
 # ``remaining`` and ``currency`` are None and ``pct`` is the share used.
 SPEND_REPORTED_DOLLARS = "dollars"
 SPEND_REPORTED_FRACTION = "fraction"
+# A ``dollars`` spend computed from a ``fraction`` reading and the monthly
+# cap configured for the account (``creditCaps`` in settings.json,
+# ``usage_store.capped_dollar_spend``) carries ``cap_source: config``. A
+# dollars spend from the usage endpoint has no ``cap_source`` key: the
+# endpoint's own figures need no source note.
+CAP_SOURCE_CONFIG = "config"
 
 
 def _spend_entry(eu: dict) -> dict | None:

@@ -1,7 +1,8 @@
 """Per-account usage table: last-known-good measurements + fetch/backoff state.
 
 Replaces the all-or-nothing 15s snapshot that previously lived in
-``cache/usage.json`` (now ``schemaVersion: 4``; a version-less legacy file is
+``cache/usage.json`` (now ``cache/usage-v4.json``, ``schemaVersion: 4``, the
+version in the name, see :func:`store_file_name`; a version-less file is
 treated as empty — its data had a 15s shelf life anyway). One failed round
 trip no longer blanks every account: a failure updates the error/backoff
 fields and never touches the last-good measurement (stale-on-error). The
@@ -38,8 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from claude_swap.locking import FileLock
-from claude_swap import oauth
+from claude_swap.locking import FileLock, check_loaded_build_is_installed
+from claude_swap import oauth, settings
 from claude_swap.poll_policy import (
     ATTEMPT_WINDOW_S,
     ATTEMPTS_PER_HOUR_MAX,
@@ -65,8 +66,9 @@ _logger = logging.getLogger("claude-swap")
 # reply's overage headers. A version-3 file is NOT discarded: a setup-token
 # account's reading comes back only when the account is used, so dropping
 # it hides the account from the rotation (X3650). ``UsageStore.__init__``
-# rewrites it once as version 4 (``_migrate_v3_file``), every stored spend,
-# all of which version 3 took from the usage endpoint, marked ``dollars``.
+# copies it once into ``usage-v4.json`` (``_copy_forward``), every stored
+# spend, all of which version 3 took from the usage endpoint, marked
+# ``dollars``.
 SCHEMA_VERSION = 4
 _SCHEMA_VERSION_V3 = 3
 
@@ -96,6 +98,69 @@ def _v3_rows_as_v4(rows: dict) -> dict:
         if isinstance(spend, dict):
             spend["reported"] = oauth.SPEND_REPORTED_DOLLARS
     return rows
+
+
+# THE STORE FILE NAME CARRIES ITS SCHEMA VERSION (X3697): ``usage-v4.json``.
+# A process keeps the code it loaded, so a process of the previous build
+# that outlives an install (the owner proxy's draining process did, on
+# 2026-10-08) writes with the previous schema. With one file name for every
+# schema it wrote over the new build's file; with the version in the name it
+# writes only the previous schema's file, which the new build no longer
+# reads or writes. A schema bump is therefore: raise SCHEMA_VERSION (the new
+# name follows), point ``_PREVIOUS_STORE_NAME`` at the old versioned name,
+# and teach :func:`_previous_rows` to migrate the old rows; ``_copy_forward``
+# carries them into the new file once.
+def store_file_name(version: int) -> str:
+    return f"usage-v{version}.json"
+
+
+# The file version 4 is copied forward from: the store's name before the
+# schema version entered it, which held version 3 or 4.
+_PREVIOUS_STORE_NAME = "usage.json"
+
+
+def _load_store_file(path: Path) -> dict | None:
+    """The parsed store file at ``path``, None when it does not exist.
+    Raises :class:`UsageStoreVersionError` when it exists but cannot be
+    read or parsed as a JSON object."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise UsageStoreVersionError(path, None, f"unreadable: {e}") from e
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise UsageStoreVersionError(path, None, f"not JSON: {e}") from e
+    if not isinstance(raw, dict):
+        raise UsageStoreVersionError(path, None, "not a JSON object")
+    return raw
+
+
+def _previous_rows(path: Path, raw: dict | None) -> dict[str, dict] | None:
+    """The previous file's rows as version 4, or None when it holds nothing
+    this code keeps (absent, version-less, or below version 3).
+
+    Version 4 is taken as is and version 3 through :func:`_v3_rows_as_v4`.
+    Any other version, or no ``accounts`` object, raises
+    :class:`UsageStoreVersionError` naming the file.
+    """
+    if raw is None:
+        return None
+    version = raw.get("schemaVersion")
+    if version is None or (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version < _SCHEMA_VERSION_V3
+    ):
+        return None
+    if isinstance(version, bool) or version not in (SCHEMA_VERSION, _SCHEMA_VERSION_V3):
+        raise UsageStoreVersionError(path, version, "unknown version")
+    rows = raw.get("accounts")
+    if not isinstance(rows, dict):
+        raise UsageStoreVersionError(path, version, "no accounts object")
+    return _v3_rows_as_v4(rows) if version == _SCHEMA_VERSION_V3 else rows
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
@@ -983,6 +1048,51 @@ def _header_fraction_spend(headers: Mapping[str, str]) -> dict | None:
     return spend
 
 
+def capped_dollar_spend(spend: dict, cap: float) -> dict | None:
+    """A ``fraction`` spend in dollars against the configured monthly cap
+    ``cap`` (USD): ``used`` is the share used times the cap, ``limit`` the
+    cap, ``remaining`` the cap minus ``used``; ``limit_reached``,
+    ``disabled_reason`` and the reset carry over, and ``cap_source:
+    config`` says the dollars come from the configured cap, not the API.
+    None when the reply carried no utilization share, so no dollar figure
+    can be computed and the spend stays a fraction."""
+    pct = spend["pct"]
+    if pct is None:
+        return None
+    used = pct / 100.0 * cap
+    out = {
+        **spend,
+        "reported": oauth.SPEND_REPORTED_DOLLARS,
+        "used": used,
+        "limit": cap,
+        "remaining": cap - used,
+        "currency": "USD",
+        "cap_source": oauth.CAP_SOURCE_CONFIG,
+    }
+    return out
+
+
+# Accounts this process has already named in `_warn_no_credit_cap`.
+_warned_no_credit_cap: set[str] = set()
+
+
+def _warn_no_credit_cap(email: str) -> None:
+    """Detector: a setup-token account reports its usage credits only as a
+    share of its monthly cap and no cap is configured for it, so its credit
+    room cannot be ranked in dollars beside the other accounts. Once per
+    account per process."""
+    if email in _warned_no_credit_cap:
+        return
+    _warned_no_credit_cap.add(email)
+    _logger.warning(
+        "Account %s reports usage credits only as a share of its monthly cap "
+        "and no cap is configured; set it with `cswap config set %s <dollars>` "
+        "to rank its credits in dollars",
+        email,
+        settings.credit_cap_key(email),
+    )
+
+
 def _header_pct(headers: Mapping[str, str], key: str) -> float | None:
     """A rate-limit header's utilization, as this store's 0-100 ``pct``
     scale (``oauth.build_usage_result``'s shape).
@@ -1355,7 +1465,7 @@ def _failure_backoff_s(
 
 
 class UsageStore:
-    """The ``cache/usage.json`` table. All writes go read-modify-write under
+    """The ``cache/usage-v4.json`` table. All writes go read-modify-write under
     ``cache/.usage.lock``; reads are lock-free (writes are atomic replaces).
 
     Every method takes the caller's current ``identities`` map (slot number →
@@ -1367,38 +1477,46 @@ class UsageStore:
     """
 
     def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
-        self.path = cache_dir / "usage.json"
+        self.path = cache_dir / store_file_name(SCHEMA_VERSION)
+        self._previous_path = cache_dir / _PREVIOUS_STORE_NAME
         self._lock_path = cache_dir / ".usage.lock"
+        # settings.json sits in claude-swap's data directory, the cache
+        # dir's parent (`paths.get_backup_root`); its `creditCaps` section turns a
+        # setup-token account's fraction spend into dollars on read.
+        self._settings_root = cache_dir.parent
+        self._credit_caps_cache: tuple[int | None, dict[str, float]] | None = None
         self.clock = clock
-        self._migrate_v3_file()
+        self._copy_forward()
 
-    def _migrate_v3_file(self) -> None:
-        """Rewrite a version-3 store as version 4, once, under the lock.
+    def _copy_forward(self) -> None:
+        """Carry the previous schema's store into this schema's file, once,
+        under the lock.
 
-        Version 3 stored only usage-endpoint spends, so each stored
-        ``spend`` gains ``reported: dollars`` (:func:`_v3_rows_as_v4`);
-        every other field is kept as it was, so no reading is lost. Nothing
-        happens for an absent file or one in any other version; a file this
-        code cannot read raises :class:`UsageStoreVersionError` here as on
-        every write, rather than being replaced.
+        Runs only while this schema's file is absent and the previous one
+        exists. The previous file is read through :func:`_previous_rows`
+        (version 3 migrated, version 4 as is, a version-less or older file
+        holding nothing kept) and every row is written to this schema's
+        file. From then on the previous file is never read or written: a
+        process still running the previous build writes only there, so it
+        cannot empty this file. A previous file this code cannot read raises
+        :class:`UsageStoreVersionError` naming it and nothing is written.
         """
-        if not self.path.exists():
+        if self.path.exists() or not self._previous_path.exists():
             return
         with self._lock():
-            try:
-                raw = self._load_raw()
-            except UsageStoreVersionError:
-                return  # read as no data; every write path refuses it
-            if raw is None or raw.get("schemaVersion") != _SCHEMA_VERSION_V3:
-                return
-            rows = self._rows_for_write()
+            if self.path.exists():
+                return  # another process copied it first
+            rows = _previous_rows(self._previous_path, _load_store_file(self._previous_path))
+            if rows is None:
+                return  # a version-less or older file: nothing to carry
             self._write_rows(rows)
         _logger.info(
-            "Usage store %s migrated from schema version %d to %d (%d accounts kept)",
+            "Usage store %s copied forward to %s (%d accounts kept); %s is "
+            "no longer read or written",
+            self._previous_path,
             self.path,
-            _SCHEMA_VERSION_V3,
-            SCHEMA_VERSION,
             len(rows),
+            self._previous_path,
         )
 
     # -- raw I/O ------------------------------------------------------------
@@ -1410,49 +1528,28 @@ class UsageStore:
         """The parsed store file, None when it does not exist. Raises
         :class:`UsageStoreVersionError` when it exists but cannot be read
         or parsed as a JSON object."""
-        try:
-            text = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return None
-        except (OSError, UnicodeDecodeError) as e:
-            raise UsageStoreVersionError(self.path, None, f"unreadable: {e}") from e
-        try:
-            raw = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise UsageStoreVersionError(self.path, None, f"not JSON: {e}") from e
-        if not isinstance(raw, dict):
-            raise UsageStoreVersionError(self.path, None, "not a JSON object")
-        return raw
+        return _load_store_file(self.path)
 
     def _rows_for_write(self) -> dict[str, dict]:
         """The stored rows for a read-modify-write, under the lock.
 
-        Version 4 is read as is and version 3 through
-        :func:`_v3_rows_as_v4`. A file with no ``schemaVersion`` (the
-        version-less snapshot) or a version below 3 holds nothing this code
-        keeps, so it reads as empty and the write replaces it. Anything else
-        (a newer version, a non-integer version, an unparseable file, a
-        missing ``accounts`` object) raises :class:`UsageStoreVersionError`:
-        writing would replace rows this code cannot read with only the rows
-        it is adding, which is how an older process emptied the store after
-        the version-4 install (X3655).
+        This file carries the schema version in its name and only this
+        schema's code writes it, so anything but version
+        :data:`SCHEMA_VERSION` with an ``accounts`` object (a damaged file,
+        a hand edit) raises :class:`UsageStoreVersionError`: writing would
+        replace rows this code cannot read with only the rows it is adding,
+        which is how an older process emptied the store (X3655).
         """
         raw = self._load_raw()
         if raw is None:
             return {}
         version = raw.get("schemaVersion")
-        if version is None or (
-            isinstance(version, int)
-            and not isinstance(version, bool)
-            and version < _SCHEMA_VERSION_V3
-        ):
-            return {}
-        if version not in (SCHEMA_VERSION, _SCHEMA_VERSION_V3):
+        if version != SCHEMA_VERSION or isinstance(version, bool):
             raise UsageStoreVersionError(self.path, version, "unknown version")
         rows = raw.get("accounts")
         if not isinstance(rows, dict):
             raise UsageStoreVersionError(self.path, version, "no accounts object")
-        return _v3_rows_as_v4(rows) if version == _SCHEMA_VERSION_V3 else rows
+        return rows
 
     def _read_rows(self) -> dict[str, dict]:
         """The stored rows for a read that writes nothing back. A file this
@@ -1464,9 +1561,54 @@ class UsageStore:
             return {}
 
     def _write_rows(self, rows: dict[str, dict]) -> None:
+        """Replace the store file with ``rows``. Refused with
+        :class:`locking.StaleBuildWriteError` when this process's loaded
+        build is no longer the installed one (X3697)."""
+        check_loaded_build_is_installed(self.path)
         atomic_write_json(
             self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
         )
+
+    def _credit_caps(self) -> dict[str, float]:
+        """The configured monthly usage-credit caps (``creditCaps`` in
+        settings.json, :func:`settings.load_credit_caps`), re-read only when
+        the file's mtime moved."""
+        path = settings.settings_path(self._settings_root)
+        try:
+            mtime: int | None = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime = None
+        cached = self._credit_caps_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        caps = settings.load_credit_caps(self._settings_root)
+        self._credit_caps_cache = (mtime, caps)
+        return caps
+
+    def _with_credit_cap(self, email: str, last_good: object) -> object:
+        """``last_good`` with a ``fraction`` spend turned into dollars when
+        ``email`` has a configured cap (:func:`capped_dollar_spend`), the one
+        place a stored reading meets the configured cap, so every reader
+        (``cswap list``, ``--json``, the credit rotation) sees the same
+        figure. Without a cap a fraction spend with credits on stays a
+        fraction and is named once per account per process at WARNING."""
+        if not isinstance(last_good, dict):
+            return last_good
+        spend = last_good.get("spend")
+        if (
+            not isinstance(spend, dict)
+            or spend["reported"] != oauth.SPEND_REPORTED_FRACTION
+        ):
+            return last_good
+        cap = self._credit_caps().get(email.lower())
+        if cap is None:
+            if spend["disabled_reason"] is None:
+                _warn_no_credit_cap(email)
+            return last_good
+        dollars = capped_dollar_spend(spend, cap)
+        if dollars is None:
+            return last_good
+        return {**last_good, "spend": dollars}
 
     @staticmethod
     def _matches(row: object, identity: Identity) -> bool:
@@ -1505,7 +1647,7 @@ class UsageStore:
             fetched_at = row.get("fetchedAt")
             if not isinstance(fetched_at, (int, float)):
                 fetched_at = None
-            last_good = row.get("lastGood")
+            last_good = self._with_credit_cap(identity[0], row.get("lastGood"))
             age_s = (now - fetched_at) if fetched_at is not None else None
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))

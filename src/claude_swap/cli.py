@@ -1046,8 +1046,11 @@ def _config_command(argv: list[str]) -> None:
     """
     from claude_swap.settings import (
         SETTING_SPECS,
+        credit_cap_email,
+        credit_cap_rows,
         effective_settings,
         format_setting_value,
+        load_credit_caps,
         set_setting,
         setting_spec,
         settings_path,
@@ -1068,6 +1071,8 @@ def _config_command(argv: list[str]) -> None:
         epilog=f"""
 Keys:
 {key_lines}
+  creditCaps.<email>                A setup-token account's monthly usage-credit cap in
+                                    US dollars, so its credits read in dollars (no default)
 
 Examples:
   cswap config                              # list effective settings
@@ -1125,23 +1130,39 @@ Examples:
         if action == "path":
             print(settings_path(root))
         elif action == "list":
-            rows = effective_settings(root)
+            listed = [
+                (spec.dotted, value, is_set)
+                for spec, value, is_set in effective_settings(root)
+            ] + [(key, cap, True) for key, cap in credit_cap_rows(root)]
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
                     "path": str(settings_path(root)),
                     "settings": [
-                        {"key": spec.dotted, "value": value, "isSet": is_set}
-                        for spec, value, is_set in rows
+                        {"key": key, "value": value, "isSet": is_set}
+                        for key, value, is_set in listed
                     ],
                 }
                 print(json.dumps(payload, indent=2))
             else:
-                key_w = max(len(spec.dotted) for spec, _, _ in rows)
-                val_w = max(len(format_setting_value(v)) for _, v, _ in rows)
-                for spec, value, is_set in rows:
-                    line = f"{spec.dotted:<{key_w}}  {format_setting_value(value):<{val_w}}"
+                key_w = max(len(key) for key, _, _ in listed)
+                val_w = max(len(format_setting_value(v)) for _, v, _ in listed)
+                for key, value, is_set in listed:
+                    line = f"{key:<{key_w}}  {format_setting_value(value):<{val_w}}"
                     print(line if is_set else f"{line}  {dimmed('(default)')}")
+        elif action == "get" and credit_cap_email(args.key) is not None:
+            email = credit_cap_email(args.key)
+            value = load_credit_caps(root).get(email.lower())
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "key": args.key,
+                    "value": value,
+                    "isSet": value is not None,
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(format_setting_value(value))
         elif action == "get":
             spec = setting_spec(args.key)
             value, is_set = next(
@@ -1162,8 +1183,11 @@ Examples:
             print(f"{args.key} = {format_setting_value(value)}")
         elif action == "unset":
             if unset_setting(root, args.key):
-                default = setting_spec(args.key).default
-                print(f"{args.key} unset (default: {format_setting_value(default)})")
+                if credit_cap_email(args.key) is not None:
+                    print(f"{args.key} unset (no cap configured)")
+                else:
+                    default = setting_spec(args.key).default
+                    print(f"{args.key} unset (default: {format_setting_value(default)})")
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
