@@ -1,16 +1,18 @@
-"""Usage-credit rotation: when every account's 5h/7d windows are full, the
-auto engine keeps work going on the account that still holds paid usage
-credits (Anthropic's extra usage) instead of waiting for the earliest reset,
-and `cswap list` shows the money left per account."""
+"""Usage credits (Anthropic's extra usage) pay for winding down, never for
+continuing (operator order 2026-10-09, X3733): when every account's 5h/7d
+windows are full the auto engine waits for the earliest reset, and when the
+active still bills credits it says once per stretch to wind down. An account
+with credit room still runs to its 100 percent credit switch point, and
+`cswap list` shows the money left per account."""
 
 import logging
 
 import pytest
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     PollEvent,
-    SpendingUsageCreditsEvent,
     SwitchEvent,
 )
 from claude_swap.settings import AutoSwitchSettings
@@ -18,8 +20,9 @@ from claude_swap.switcher import _format_usage_lines, spend_row_body
 from claude_swap.usage_store import UsageEntry
 from tests.test_autoswitch import EngineHarness, TickOutcome
 
-_CREDITS_LINE = "sessions run on Account-"
-_DETECTOR_LINE = "holds usage-credit room"
+_WIND_DOWN_LINE = "wind down, start nothing new"
+# The lines the removed X3586 credit move logged; none may appear now.
+_REMOVED_CREDIT_LINES = ("sessions run on Account-", "holds usage-credit room")
 
 
 def _spend(remaining: float | None, *, used: float = 8.11, reached: bool = False) -> dict:
@@ -64,122 +67,177 @@ def _warnings(caplog, needle: str) -> list[str]:
     ]
 
 
-class TestRotationOntoUsageCredits:
-    def test_all_windows_full_moves_to_the_account_with_credit_room(
-        self, temp_home, caplog
-    ):
-        """Asserts: with every account's windows full and only #2 holding
-        usage credits, the engine switches to #2 under the `usage-credits`
-        trigger, emits the spending event, and logs it at WARNING."""
+def _exhausted(h: EngineHarness) -> AllExhaustedEvent:
+    return next(e for e in h.events if isinstance(e, AllExhaustedEvent))
+
+
+def _assert_reset_wait(h: EngineHarness, outcome: TickOutcome, active: int) -> None:
+    """The all-exhausted wait as before X3586: BLOCKED, no switch, the
+    long reset-aware wait armed, the sessions left on ``active``."""
+    assert outcome is TickOutcome.BLOCKED, h.kinds()
+    assert h.active_number() == active
+    assert not any(isinstance(e, SwitchEvent) for e in h.events)
+    assert h.engine._blocked_wait_long is True
+    _exhausted(h)
+
+
+def _assert_no_removed_credit_lines(caplog) -> None:
+    for needle in _REMOVED_CREDIT_LINES:
+        assert _warnings(caplog, needle) == [], needle
+
+
+class TestCreditsNeverCarryTheSessionsPastAFullFleet:
+    """X3733: with every window full the engine waits for the earliest
+    reset; usage credits on any account never make it switch or hold."""
+
+    def test_a_peer_with_credit_room_is_not_a_landing(self, temp_home, caplog):
+        """Asserts: every window full and only peer #2 holding credits: the
+        engine stays on #1 and enters the all-exhausted wait, with no switch
+        onto #2 and no wind-down line (the active bills nothing)."""
         h = _harness(temp_home)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             outcome = h.tick_with_usage({
                 "1": _full(), "2": _full(_spend(591.89)), "3": _full(),
             })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 2
-        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.trigger == "usage-credits"
-        assert switch.detail == "$591.89 of limit unused"
-        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
-        assert credits.account["number"] == 2
-        assert credits.room.remaining == 591.89
-        assert credits.to_json()["reported"] == "dollars"
-        assert credits.switched is True
-        assert credits.to_json()["event"] == "spending-usage-credits"
-        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        lines = _warnings(caplog, _CREDITS_LINE)
-        assert lines == [
-            "Every account's usage windows are full; sessions run on "
-            "Account-2 usage credits ($591.89 of limit unused), switching to it"
-        ], lines
-        assert credits.to_json()["remainingBasis"] == "limit"
+        _assert_reset_wait(h, outcome, active=1)
+        event = _exhausted(h)
+        assert event.to_json()["activeBillsCredits"] is False
+        assert event.active_credits is None
+        assert _warnings(caplog, _WIND_DOWN_LINE) == []
+        _assert_no_removed_credit_lines(caplog)
 
-    def test_an_entered_balance_reads_as_money_left_in_the_event_and_warning(
+    def test_an_uncapped_peer_is_not_a_landing_either(self, temp_home):
+        """Asserts: a peer with no monthly cap at all still takes no
+        sessions once every window is full; the fleet waits."""
+        h = _harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _full(), "2": _full(_spend(10_000.0)), "3": _full(_spend(None)),
+        })
+        _assert_reset_wait(h, outcome, active=1)
+
+    def test_a_setup_token_peer_on_credits_is_not_a_landing(self, temp_home):
+        """Asserts: a setup-token peer whose reply allowed its credits takes
+        no sessions once every window is full; the fleet waits."""
+        h = _harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _full(), "2": _full(_fraction(0.0)), "3": _full(),
+        })
+        _assert_reset_wait(h, outcome, active=1)
+
+
+class TestWindDownNotice:
+    """X3733: the active measured at its limit with credit room bills those
+    credits for whatever is in flight during the wait; the operator is told
+    once per all-exhausted stretch to wind down."""
+
+    def test_the_active_with_credits_waits_and_warns_once(self, temp_home, caplog):
+        """Asserts: every window full and the active holding credits: the
+        engine enters the reset wait (BLOCKED, long wait armed, no hold on
+        the active's credits), the event says the active bills credits with
+        the money words, and the WARNING names the account and money."""
+        h = _harness(temp_home)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = h.tick_with_usage({
+                "1": _full(_spend(20.0)), "2": _full(_spend(500.0)), "3": _full(),
+            })
+        _assert_reset_wait(h, outcome, active=1)
+        payload = _exhausted(h).to_json()
+        assert payload["event"] == "all-exhausted"
+        assert payload["activeBillsCredits"] is True
+        assert payload["activeCredits"] == "$20.00 of limit unused"
+        assert "wind down, start nothing new" in _exhausted(h).human()
+        assert _warnings(caplog, _WIND_DOWN_LINE) == [
+            "every account is at its limit; sessions on Account-1 now bill "
+            "its usage credits ($20.00 of limit unused): wind down, start "
+            "nothing new"
+        ]
+        _assert_no_removed_credit_lines(caplog)
+
+    def test_the_warning_fires_once_per_stretch_not_every_tick(
         self, temp_home, caplog
     ):
-        """Asserts: when the account the sessions move onto has an entered
-        balance (remaining_basis balance), the switch detail, the
-        spending-usage-credits event and its WARNING read ``$70.00 left
-        (balance)``, and the event's JSON names the basis."""
+        """Asserts: two consecutive all-exhausted ticks with the active on
+        credits carry the field on both events but log the WARNING once."""
+        h = _harness(temp_home)
+        fleet = {"1": _full(_spend(20.0)), "2": _full(), "3": _full()}
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            h.tick_with_usage(fleet)
+            h.clock.advance(60)
+            h.tick_with_usage(fleet)
+        events = [e for e in h.events if isinstance(e, AllExhaustedEvent)]
+        assert len(events) == 2
+        assert all(e.to_json()["activeBillsCredits"] for e in events)
+        assert len(_warnings(caplog, _WIND_DOWN_LINE)) == 1
+
+    def test_a_new_stretch_warns_again(self, temp_home, caplog):
+        """Asserts: a tick that leaves the all-exhausted state (the active's
+        window reopened, so it stays put on quota) ends the stretch, and
+        the next full fleet logs the WARNING again."""
+        h = _harness(temp_home)
+        full = {"1": _full(_spend(20.0)), "2": _full(), "3": _full()}
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            h.tick_with_usage(full)
+            h.clock.advance(60)
+            outcome = h.tick_with_usage(
+                {"1": _open(50.0), "2": _full(), "3": _full()}
+            )
+            assert outcome is not TickOutcome.BLOCKED, h.kinds()
+            h.clock.advance(60)
+            h.tick_with_usage(full)
+        assert len(_warnings(caplog, _WIND_DOWN_LINE)) == 2
+
+    def test_an_entered_balance_reads_as_money_left(self, temp_home, caplog):
+        """Asserts: an active with an entered balance names ``$70.00 left
+        (balance)`` in the WARNING and the event."""
         h = _harness(temp_home)
         balance = {**_spend(591.89), "remaining": 70.0,
                    "remaining_basis": "balance",
                    "balance_entered_at": "2026-10-09T14:03:00Z"}
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             outcome = h.tick_with_usage({
-                "1": _full(), "2": _full(balance), "3": _full(),
+                "1": _full(balance), "2": _full(), "3": _full(),
             })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.detail == "$70.00 left (balance)"
-        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
-        assert credits.to_json()["remainingBasis"] == "balance"
-        assert "($70.00 left (balance))" in credits.human()
-        assert _warnings(caplog, _CREDITS_LINE) == [
-            "Every account's usage windows are full; sessions run on "
-            "Account-2 usage credits ($70.00 left (balance)), switching to it"
+        _assert_reset_wait(h, outcome, active=1)
+        assert _exhausted(h).to_json()["activeCredits"] == "$70.00 left (balance)"
+        assert _warnings(caplog, _WIND_DOWN_LINE) == [
+            "every account is at its limit; sessions on Account-1 now bill "
+            "its usage credits ($70.00 left (balance)): wind down, start "
+            "nothing new"
         ]
 
-    def test_an_uncapped_account_outranks_any_finite_amount(self, temp_home):
-        """Asserts: when the active has no credits, the peer with no monthly
-        cap takes the sessions over a peer with a finite remainder."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_spend(10_000.0)), "3": _full(_spend(None)),
-        })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 3
-
-    def test_a_reached_cap_is_not_credit_room(self, temp_home):
-        """Asserts: a peer whose cap the API reports reached is never a
-        usage-credit target, and the fleet waits as before."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_spend(5.0, reached=True)), "3": _full(),
-        })
-        assert outcome is TickOutcome.BLOCKED
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-
-
-class TestStayingOnTheActivesCredits:
-    def test_the_active_with_credit_room_keeps_the_sessions(self, temp_home, caplog):
-        """Asserts: with every window full and the active holding credits,
-        the engine stays put (NO_ACTION), arms no reset sleep, and keeps the
-        ordinary cadence, even though a peer has more money left."""
+    def test_a_setup_token_active_names_its_share_of_the_cap(
+        self, temp_home, caplog
+    ):
+        """Asserts: a setup-token active whose reply allowed its credits
+        reads its share of the cap used, not "no cap"."""
         h = _harness(temp_home)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             outcome = h.tick_with_usage({
-                "1": _full(_spend(20.0)), "2": _full(_spend(500.0)), "3": _full(),
+                "1": _full(_fraction(0.0)), "2": _full(), "3": _full(),
             })
-        assert outcome is TickOutcome.NO_ACTION, h.kinds()
-        assert h.active_number() == 1
-        assert not any(isinstance(e, SwitchEvent) for e in h.events)
-        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert h.engine._blocked_wait_long is False
-        assert h.engine._sleep_until_ts is None
-        assert h.engine._next_delay(outcome) <= h.settings.interval_seconds * 1.1
-        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
-        assert credits.switched is False
-        assert credits.account["number"] == 1
-        assert _warnings(caplog, _CREDITS_LINE) == [
-            "Every account's usage windows are full; sessions run on "
-            "Account-1 usage credits ($20.00 of limit unused)"
-        ]
+        _assert_reset_wait(h, outcome, active=1)
+        assert _exhausted(h).to_json()["activeCredits"] == (
+            "credits on, 0% of cap used"
+        )
+        assert len(_warnings(caplog, _WIND_DOWN_LINE)) == 1
 
-    def test_the_warning_fires_once_per_credit_account_not_every_tick(
-        self, temp_home, caplog
-    ):
-        """Asserts: two consecutive ticks on the same account's credits emit
-        the event both times but the WARNING only once."""
+    @pytest.mark.parametrize("shape", ["cap-reached", "out-of-credits"])
+    def test_an_active_with_no_room_logs_no_notice(self, temp_home, caplog, shape):
+        """Asserts: an active whose cap is reached or whose reply says out
+        of credits bills nothing, so the wait carries no notice."""
+        spend = (
+            _spend(5.0, reached=True)
+            if shape == "cap-reached"
+            else _fraction(None, reached=True, reason="out_of_credits")
+        )
         h = _harness(temp_home)
-        fleet = {"1": _full(_spend(20.0)), "2": _full(), "3": _full()}
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            h.tick_with_usage(fleet)
-            h.tick_with_usage(fleet)
-        events = [e for e in h.events if isinstance(e, SpendingUsageCreditsEvent)]
-        assert len(events) == 2
-        assert len(_warnings(caplog, _CREDITS_LINE)) == 1
+            outcome = h.tick_with_usage({
+                "1": _full(spend), "2": _full(), "3": _full(),
+            })
+        _assert_reset_wait(h, outcome, active=1)
+        assert _exhausted(h).to_json()["activeBillsCredits"] is False
+        assert _warnings(caplog, _WIND_DOWN_LINE) == []
 
 
 class TestNoCreditsAnywhere:
@@ -187,76 +245,29 @@ class TestNoCreditsAnywhere:
         self, temp_home, caplog
     ):
         """Asserts: with no account holding credit room the all-exhausted
-        wait is unchanged: BLOCKED, the event, the long wait armed, and
-        neither the credits event nor the detector line."""
+        wait is unchanged: BLOCKED, the event, the long wait armed, and no
+        wind-down line."""
         h = _harness(temp_home)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             outcome = h.tick_with_usage({"1": _full(), "2": _full(), "3": _full()})
-        assert outcome is TickOutcome.BLOCKED
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert h.engine._blocked_wait_long is True
-        assert not any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
-        assert _warnings(caplog, _DETECTOR_LINE) == []
-        assert _warnings(caplog, _CREDITS_LINE) == []
+        _assert_reset_wait(h, outcome, active=1)
+        assert _exhausted(h).to_json()["activeBillsCredits"] is False
+        assert _warnings(caplog, _WIND_DOWN_LINE) == []
+        _assert_no_removed_credit_lines(caplog)
 
-
-class TestMovingBackOffCredits:
-    def test_a_reopened_window_takes_the_sessions_off_credits(self, temp_home):
-        """Asserts: while the active (#2) runs on credits with its windows
-        full, a candidate whose window reopens is taken by the ordinary
-        at-limit rotation on the next tick."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_spend(591.89)), "3": _full(),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-        h.make_live("b@example.com", 2)
-        h.events.clear()
-        h.clock.advance(60)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_spend(590.0)), "3": _open(),
-        })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 3
-        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.trigger == "at-limit"
-        assert not any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
-
-
-class TestUnusedCreditsDetector:
-    def test_exhausted_wait_with_a_quarantined_credit_account_warns(
-        self, temp_home, caplog
-    ):
-        """Asserts: entering the all-exhausted wait while an account outside
-        the rotation (quarantined #3) holds credit room logs a WARNING that
-        names it."""
+    def test_a_quarantined_peers_credits_raise_no_line(self, temp_home, caplog):
+        """Asserts: credit room on an account outside the rotation is the
+        designed state at an all-exhausted wait, so it raises no WARNING
+        (the X3586 unused-credit detector is gone)."""
         h = _harness(temp_home)
         h.engine._quarantine("3", "c@example.com", "invalid_grant")
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             outcome = h.tick_with_usage({
                 "1": _full(), "2": _full(), "3": _full(_spend(42.0)),
             })
-        assert outcome is TickOutcome.BLOCKED
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert _warnings(caplog, _DETECTOR_LINE) == [
-            "All accounts exhausted while Account-3 holds usage-credit room "
-            "($42.00 of limit unused) the rotation did not use"
-        ]
-
-    def test_a_disabled_credit_account_is_the_users_choice_not_a_fault(
-        self, temp_home, caplog
-    ):
-        """Asserts: an account the user disabled is held out of rotation on
-        purpose, so its credits raise no detector line."""
-        h = _harness(temp_home)
-        h.switcher.set_account_disabled("3", True)
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            outcome = h.tick_with_usage({
-                "1": _full(), "2": _full(), "3": _full(_spend(42.0)),
-            })
-        assert outcome is TickOutcome.BLOCKED
-        assert _warnings(caplog, _DETECTOR_LINE) == []
+        _assert_reset_wait(h, outcome, active=1)
+        assert _warnings(caplog, _WIND_DOWN_LINE) == []
+        _assert_no_removed_credit_lines(caplog)
 
 
 class TestMoneyLeftRow:
@@ -327,33 +338,30 @@ class TestConfiguredCapsRankInDollars:
             set_setting(tmp_path, credit_cap_key(email), dollars)
         return store.entries(idents)
 
-    def test_the_larger_dollar_remainder_wins(self, tmp_path):
-        """Asserts: two accounts each half through their credits rank by
-        dollars: $250 unused of a $500 cap beats $100 unused of a $200 cap,
-        and the switch detail reads the dollars as room under the limit."""
-        from claude_swap.autoswitch import _credit_money, _usage_credit_pick
+    def test_a_configured_cap_reads_in_dollars(self, tmp_path):
+        """Asserts: an account half through a configured $500 cap reads its
+        credit room in dollars, worded as room under the limit."""
+        from claude_swap.autoswitch import _credit_money
 
         entries = self._entries(
             tmp_path, {"b@example.com": "200", "c@example.com": "500"}
         )
-        pick = _usage_credit_pick("1", ["2", "3"], entries)
-        assert pick is not None
-        number, room = pick
-        assert number == "3"
+        room = oauth.entry_credit_room(entries["3"])
+        assert room is not None
         assert room.reported == "dollars"
         assert room.remaining == pytest.approx(250.0)
         assert _credit_money(room) == "$250.00 of limit unused"
 
-    def test_without_caps_the_shares_tie(self, tmp_path):
-        """Asserts: the same two readings with no cap configured stay
-        fractions and rank equal, so the larger cap is invisible: the
-        first candidate is taken."""
-        from claude_swap.autoswitch import _usage_credit_pick
+    def test_without_caps_the_room_stays_a_fraction(self, tmp_path):
+        """Asserts: the same reading with no cap configured stays a share of
+        the cap and is worded as one."""
+        from claude_swap.autoswitch import _credit_money
 
         entries = self._entries(tmp_path, {})
-        number, room = _usage_credit_pick("1", ["2", "3"], entries)
+        room = oauth.entry_credit_room(entries["2"])
+        assert room is not None
         assert room.reported == "fraction"
-        assert number == "2"
+        assert _credit_money(room) == "credits on, 50% of cap used"
 
     def test_the_configured_cap_row_names_limit_room_and_out_of_credits(self):
         """Asserts: dollars computed from the configured cap with no
@@ -630,56 +638,43 @@ class TestCreditPointOnTheModelWindow:
 
 
 class TestFleetFableWallWithCredits:
-    """X3647: every account's Fable window full and some account with credit
-    room is the usage-credit move, never the fleet-wide model wall."""
+    """X3733: every account's Fable window full is the fleet-wide model wall
+    whatever credits any account holds; the engine keeps working on the
+    open 5h/7d windows instead of moving onto credits or waiting."""
 
-    def test_dynamic_moves_onto_the_credit_account(self, temp_home, caplog):
-        """Asserts: under `dynamic`, every Fable window at 100 and only #2
-        holding credits, the engine switches to #2 under `usage-credits`
-        and emits the spending event, instead of reading a fleet-wide model
-        wall and ranking on 5h/7d alone."""
+    @pytest.mark.parametrize("credit_num", ["1", "2"])
+    def test_a_credit_account_does_not_cancel_the_fleet_wall(
+        self, temp_home, caplog, credit_num
+    ):
+        """Asserts: under `dynamic` with creditThreshold 100, every Fable
+        window at 100 and one account (the active or a peer) holding
+        credits, the engine reads the fleet-wide model wall and stays on
+        the active on its open 5h/7d windows: no switch, no all-exhausted
+        wait, no credit or wind-down line."""
         h = _fable_harness(
             temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
         )
+        usage = {"1": _fable(100.0), "2": _fable(100.0), "3": _fable(100.0)}
+        usage[credit_num] = _fable(100.0, _spend(80.0))
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            outcome = h.tick_with_usage({
-                "1": _fable(100.0), "2": _fable(100.0, _spend(80.0)),
-                "3": _fable(100.0),
-            })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 2
-        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.trigger == "usage-credits"
-        assert any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
-        assert len(_warnings(caplog, _CREDITS_LINE)) == 1
-
-    def test_dynamic_active_with_credits_keeps_the_sessions(self, temp_home):
-        """Asserts: the active itself holding credits with every Fable
-        window full stays put on its credits (NO_ACTION, no reset sleep)."""
-        h = _fable_harness(
-            temp_home, strategy="dynamic", threshold=90.0, credit_threshold=100.0
-        )
-        outcome = h.tick_with_usage({
-            "1": _fable(100.0, _spend(80.0)), "2": _fable(100.0), "3": _fable(100.0),
-        })
+            outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, h.kinds()
         assert h.active_number() == 1
-        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
-        assert credits.switched is False
-        assert h.engine._blocked_wait_long is False
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
+        assert _warnings(caplog, _WIND_DOWN_LINE) == []
+        _assert_no_removed_credit_lines(caplog)
 
     def test_unset_credit_threshold_keeps_the_model_wall_verdict(self, temp_home):
-        """Asserts: with creditThreshold unset the same fleet takes no
-        usage-credit move: the fleet-wide model wall stands as before."""
+        """Asserts: with creditThreshold unset the same fleet reads the
+        fleet-wide model wall as before: no switch, no wait."""
         h = _fable_harness(temp_home, strategy="dynamic", threshold=90.0)
-        h.tick_with_usage({
+        outcome = h.tick_with_usage({
             "1": _fable(100.0), "2": _fable(100.0, _spend(80.0)), "3": _fable(100.0),
         })
-        assert not any(isinstance(e, SpendingUsageCreditsEvent) for e in h.events)
-        assert not any(
-            isinstance(e, SwitchEvent) and e.trigger == "usage-credits"
-            for e in h.events
-        )
+        assert outcome is TickOutcome.NO_ACTION, h.kinds()
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
 
     def test_a_quarantined_credit_account_does_not_cancel_the_fleet_wall(
         self, temp_home, caplog
@@ -700,7 +695,7 @@ class TestFleetFableWallWithCredits:
             })
         assert outcome is TickOutcome.NO_ACTION, h.kinds()
         assert not any(isinstance(e, AllExhaustedEvent) for e in h.events)
-        assert _warnings(caplog, _DETECTOR_LINE) == []
+        _assert_no_removed_credit_lines(caplog)
 
 
 class TestModelWallPredicateReadsCreditPoints:
@@ -713,13 +708,31 @@ class TestModelWallPredicateReadsCreditPoints:
             for num, value in usage.items()
         }
 
-    def test_a_credit_account_ends_the_fleet_wall(self):
-        """Asserts: two accounts model-walled at Fable 100 and one holding
-        credits at Fable 100: no fleet-wide wall when creditThreshold is
-        set; the plain rule (unset) still reads one."""
+    def test_a_credit_account_at_100_does_not_end_the_fleet_wall(self):
+        """Asserts: every account at Fable 100, one of them holding credits:
+        the fleet-wide wall stands whether or not creditThreshold is set
+        (X3733: credit room no longer cancels the wall)."""
         from claude_swap.autoswitch import _model_window_binds_everywhere
 
         usage = {"1": _fable(100.0), "2": _fable(100.0, _spend(5.0)), "3": _fable(100.0)}
+        entries = self._entries(usage)
+        held = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
+        plain = AutoSwitchSettings(threshold=90.0)
+        rotation = ("1", "2", "3")
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), held, entries, rotation
+        ) is True
+        assert _model_window_binds_everywhere(
+            usage, ("Fable",), plain, entries, rotation
+        ) is True
+
+    def test_a_credit_account_below_its_point_is_open(self):
+        """Asserts: a credit account at Fable 99.5 sits below its 100
+        percent credit point, so it is open and the wall does not bind;
+        with creditThreshold unset the plain threshold walls it."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = {"1": _fable(100.0), "2": _fable(99.5, _spend(5.0)), "3": _fable(100.0)}
         entries = self._entries(usage)
         held = AutoSwitchSettings(threshold=90.0, credit_threshold=100.0)
         plain = AutoSwitchSettings(threshold=90.0)
@@ -862,64 +875,6 @@ def _fraction(
 class TestHeaderMeasuredCredits:
     """X3655: a setup-token account's usage credits, known only as a share
     of its cap from its reply headers, count as credit room."""
-
-    def test_all_full_moves_to_a_setup_token_account_on_credits(
-        self, temp_home, caplog
-    ):
-        """Asserts: with every window full and only #2 holding an allowed
-        fraction spend, the engine switches to #2 on credits, and the event
-        and WARNING name its share of the cap rather than "no cap"."""
-        h = _harness(temp_home)
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            outcome = h.tick_with_usage({
-                "1": _full(), "2": _full(_fraction(0.0)), "3": _full(),
-            })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 2
-        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.trigger == "usage-credits"
-        assert switch.detail == "credits on, 0% of cap used"
-        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
-        payload = credits.to_json()
-        assert payload["reported"] == "fraction"
-        assert payload["remaining"] is None
-        assert payload["capUsedPct"] == 0.0
-        assert _warnings(caplog, _CREDITS_LINE) == [
-            "Every account's usage windows are full; sessions run on "
-            "Account-2 usage credits (credits on, 0% of cap used), switching to it"
-        ]
-
-    def test_out_of_credits_is_not_room(self, temp_home):
-        """Asserts: a fraction spend refused out_of_credits is no credit
-        target, so the fleet waits."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(),
-            "2": _full(_fraction(None, reached=True, reason="out_of_credits")),
-            "3": _full(),
-        })
-        assert outcome is TickOutcome.BLOCKED
-        assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
-
-    def test_a_known_dollar_amount_outranks_a_fraction(self, temp_home):
-        """Asserts: with the active out of credits, a peer with dollars left
-        takes the sessions over a peer with an unused fraction."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_fraction(0.0)), "3": _full(_spend(1.0)),
-        })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 3
-
-    def test_more_of_the_cap_unused_ranks_first_among_fractions(self, temp_home):
-        """Asserts: between two fraction peers, the one with less of its cap
-        used takes the sessions."""
-        h = _harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _full(), "2": _full(_fraction(80.0)), "3": _full(_fraction(10.0)),
-        })
-        assert outcome is TickOutcome.SWITCHED, h.kinds()
-        assert h.active_number() == 3
 
     def test_an_allowed_fraction_account_takes_the_credit_switch_point(self):
         """Asserts: `account_switch_point` gives an account whose reply

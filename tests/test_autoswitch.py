@@ -1326,6 +1326,10 @@ class TestDecisionTable:
         # the flag as False, which would let a real exhaustion be relabelled.
         assert event.deliberate_wait is False
         assert "all accounts exhausted" in event.human()
+        # No account here holds usage credits, so the active bills none.
+        assert event.to_json()["activeBillsCredits"] is False
+        assert event.to_json()["activeCredits"] is None
+        assert "wind down" not in event.human()
 
     def test_a_reset_already_past_is_not_provable_either(self, harness):
         """The active account's own past reset now decides the outcome
@@ -15676,13 +15680,8 @@ class TestStoppedEngineDoesNotAct:
             m.NoSwitchEvent(reason="cooldown"),
             m.QuarantineEvent(number="2", email="b@example.com", reason="x"),
             m.UnquarantineEvent(number="2", email="b@example.com"),
-            m.AllExhaustedEvent(earliest_reset_at=None),
-            m.SpendingUsageCreditsEvent(
-                account={"number": 2, "email": "b@example.com"},
-                room=oauth.UsageCreditRoom(
-                    reported="dollars", remaining=None, remaining_basis="limit"
-                ),
-                switched=False,
+            m.AllExhaustedEvent(
+                earliest_reset_at=None, active_credits="$70.00 left (balance)"
             ),
             m.SleepEvent(seconds=1.0, until="2024-01-01T00:00:00Z"),
             m.ErrorEvent(message="two engines may act once"),

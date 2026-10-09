@@ -61,7 +61,6 @@ _EVENT_ROLES = {
     "all-exhausted": "sev_crit",
     # Paid money is being spent because every window is full: degraded,
     # not broken, the same colour as a quarantine or a transient error.
-    "spending-usage-credits": "sev_warn",
 }
 _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 

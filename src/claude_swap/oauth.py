@@ -924,18 +924,6 @@ class UsageCreditRoom:
     remaining_basis: str | None
     cap_used_pct: float | None = None
 
-    def rank_key(self) -> tuple[int, int, float]:
-        """Sort key, larger is more room: no cap first, then any known
-        dollar amount (larger first), then a fraction (more of the cap
-        unused first, an unknown share last)."""
-        if self.reported == SPEND_REPORTED_FRACTION:
-            if self.cap_used_pct is None:
-                return (0, 0, 0.0)
-            return (0, 1, 100.0 - self.cap_used_pct)
-        if self.remaining is None:
-            return (2, 1, 0.0)
-        return (1, 1, self.remaining)
-
 
 def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
     """How much usage-credit room this account has, or None when it has none.

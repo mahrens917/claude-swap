@@ -409,9 +409,6 @@ class TestFetchUsage:
         assert room == oauth.UsageCreditRoom(
             reported="dollars", remaining=None, remaining_basis="limit"
         )
-        assert room.rank_key() > oauth.UsageCreditRoom(
-            reported="dollars", remaining=1e9, remaining_basis="limit"
-        ).rank_key()
 
     def test_extra_usage_limit_reached_has_no_credit_room(self):
         """Asserts: the API's spend_limit_reached verdict keeps the figure
@@ -463,25 +460,6 @@ class TestFetchUsage:
         usage = self._fraction(None, reached=True, reason="out_of_credits")
         assert oauth.usage_credit_room(usage) is None
 
-    def test_room_ranks_no_cap_then_dollars_then_fractions(self):
-        """Asserts: no cap outranks any dollar amount, any dollar amount
-        (even one cent) outranks any fraction, and among fractions more of
-        the cap unused ranks higher, an unknown share last."""
-        room = oauth.UsageCreditRoom
-        ordered = [
-            room(reported="fraction", remaining=None, remaining_basis=None,
-                 cap_used_pct=None),
-            room(reported="fraction", remaining=None, remaining_basis=None,
-                 cap_used_pct=90.0),
-            room(reported="fraction", remaining=None, remaining_basis=None,
-                 cap_used_pct=0.0),
-            room(reported="dollars", remaining=0.01, remaining_basis="limit"),
-            room(reported="dollars", remaining=500.0, remaining_basis="balance"),
-            room(reported="dollars", remaining=None, remaining_basis="limit"),
-        ]
-        keys = [r.rank_key() for r in ordered]
-        assert keys == sorted(keys)
-        assert len(set(keys)) == len(keys)
 
     def test_enabled_extra_usage_missing_its_verdict_warns_and_drops(self, caplog):
         """Asserts: an enabled extra_usage block without spend_limit_reached is
