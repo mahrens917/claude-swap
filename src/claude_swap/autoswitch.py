@@ -67,11 +67,22 @@ from claude_swap.settings import (
 )
 from claude_swap.switcher import ClaudeAccountSwitcher, EngineStateError, LOGIN_RESTORE_RECHECK_MARGIN_S, LOGIN_RESTORE_SETTLE_FLOOR_S, LoginRestoreOutcome, quarantine_ledger, read_engine_state, spend_row_body
 from claude_swap.usage_store import UsageEntry, WALL_FALLBACK_S, due_candidate, plan_oversleeps_interval
+from claude_swap.start_hold import START_HOLD_MAX_S, StartHold, read_start_hold, remove_start_hold
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
 # Held for the lifetime of a LIVE engine; a second one starts dry-run.
 LIVE_LOCK_FILENAME = ".auto-live.lock"
+# Held across one switch decision (recheck, switch, record), by the engine
+# and by the Remote Control start hold (`start_hold.py`).
+STATE_LOCK_FILENAME = ".autoswitch_state.lock"
+
+
+def engine_state_lock(state_path: Path, timeout: float = 10.0) -> FileLock:
+    """The lock serializing switch decisions over the state file at
+    ``state_path``. One home for its path, because the start hold takes it
+    too and a second spelling would be a second lock."""
+    return FileLock(state_path.parent / STATE_LOCK_FILENAME, timeout=timeout)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -1982,7 +1993,60 @@ class AutoSwitchEngine:
     # -- state file ---------------------------------------------------------
 
     def _state_lock(self) -> FileLock:
-        return FileLock(self.state_path.parent / ".autoswitch_state.lock")
+        return engine_state_lock(self.state_path)
+
+    def _fresh_start_hold(self) -> StartHold | None:
+        """The Remote Control start hold, when one younger than
+        ``START_HOLD_MAX_S`` exists. A corrupt hold file raises
+        ``StartHoldError`` (a ClaudeSwitchError), which the tick reports."""
+        hold = read_start_hold(self.switcher.backup_dir)
+        if hold is None or hold.age_s(self.clock()) >= START_HOLD_MAX_S:
+            return None
+        return hold
+
+    def _emit_start_hold(self, hold: StartHold) -> None:
+        self._emit(NoSwitchEvent(
+            reason="start-hold",
+            detail=(
+                f"owner account {hold.owner} held for a Remote Control start, "
+                f"{max(hold.age_s(self.clock()), 0.0):.0f}s of "
+                f"{START_HOLD_MAX_S:.0f}s"
+            ),
+        ))
+
+    def _start_hold_stops_this_tick(self) -> bool:
+        """Whether a Remote Control start hold stops this tick.
+
+        A fresh hold stops it with ``no-switch`` reason ``start-hold``. A
+        stale one is deleted with a non-transient ERROR event, and the tick
+        then runs as usual.
+
+        DETECTOR: the ERROR counts holds the owner proxy never released,
+        meaning the Remote Control server failed to start or never
+        registered; a nonzero on a healthy box is a defect.
+
+        A dry-run engine reads a stale hold as no hold and leaves it for the
+        LIVE engine to delete and report: dry-run writes nothing, and one
+        report per stale hold is what makes the ERROR countable.
+        """
+        hold = read_start_hold(self.switcher.backup_dir)
+        if hold is None:
+            return False
+        if hold.age_s(self.clock()) < START_HOLD_MAX_S:
+            self._emit_start_hold(hold)
+            return True
+        if self.dry_run:
+            return False
+        remove_start_hold(self.switcher.backup_dir)
+        self._emit(ErrorEvent(
+            message=(
+                f"start hold expired after {START_HOLD_MAX_S:.0f}s with no "
+                f"Remote Control registration (owner account {hold.owner}, "
+                f"was {hold.previous})"
+            ),
+            transient=False,
+        ))
+        return False
 
     def _read_state(self) -> dict:
         """The state file through :func:`read_engine_state`, the reader the
@@ -2682,6 +2746,11 @@ class AutoSwitchEngine:
             # all for accounts it has handed over. A gate further down stops
             # the last of those and none of the earlier ones.
             raise _EngineStopped()
+        # A REMOTE CONTROL START IS IN FLIGHT: nothing below runs, the login
+        # restore included, because each of them can move the live login
+        # off the owner account before the server has read it.
+        if self._start_hold_stops_this_tick():
+            return TickOutcome.NO_ACTION
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -5762,6 +5831,14 @@ class AutoSwitchEngine:
         # switch path (cswap FileLock + Claude Code locks) never takes the
         # state lock.
         with self._state_lock():
+            # THE START HOLD AGAIN, UNDER THE LOCK THE HOLD IS WRITTEN UNDER.
+            # The tick's first read can predate a hold that a Remote Control
+            # start (`start_hold.py`) wrote and switched under since; this
+            # read cannot, so the switch below never undoes that start.
+            hold = self._fresh_start_hold()
+            if hold is not None:
+                self._emit_start_hold(hold)
+                return TickOutcome.NO_ACTION
             state = self._read_state()
             # `left[0]` is the tick's own widened `active_headroom`, taken
             # from the same pass the ranking decided on — the recheck must

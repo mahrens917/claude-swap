@@ -2456,6 +2456,23 @@ def _pin_state(switcher, *, connect_timeout: float = 2.0) -> tuple[str, str]:
     return "NOT-OK", f"serving on port {port}, {why}"
 
 
+def _remote_control_start(switcher, wanted: bool) -> int:
+    """The `--remote-control-start` half of `--ensure`, and its exit code.
+
+    Only the Remote Control launcher passes the flag. A plain `--ensure` also
+    runs before every hand-launched `claude`, where switching the box to the
+    owner account and stopping the rotation would undo the rotation on every
+    interactive start (board row X3768). Exit 0 on every path, like the rest
+    of `--ensure`; `hold_for_remote_control_start` never raises and reports
+    every outcome on stderr.
+    """
+    if wanted:
+        from claude_swap.start_hold import hold_for_remote_control_start
+
+        hold_for_remote_control_start(switcher)
+    return 0
+
+
 def run(
     switcher,
     account: str | None,
@@ -2466,6 +2483,7 @@ def run(
     set_port: int | None = None,
     ensure: bool = False,
     state: bool = False,
+    remote_control_start: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2487,7 +2505,7 @@ def run(
         try:
             # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE.
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
-                return 0
+                return _remote_control_start(switcher, remote_control_start)
             # BUDGETED, like the two probes below it.
             heal(switcher, connect_timeout=_LAUNCH_PROBE_S,
                  lock_timeout=_LAUNCH_LOCK_BUDGET_S)
@@ -2510,7 +2528,10 @@ def run(
                 clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S, only=dead)
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
-        return 0
+        # AFTER the proxy is ensured: the start hold switches the active
+        # login, and the server it is for reaches the owner account only
+        # through that proxy.
+        return _remote_control_start(switcher, remote_control_start)
 
     if set_port is not None:
         # WRITE THE PIN'S OWN SETTING, in the pin's own directory.

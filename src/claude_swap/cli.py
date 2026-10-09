@@ -200,8 +200,22 @@ Examples:
             "stdout, detail on stderr, and always exit 0."
         ),
     )
+    # A modifier of `--ensure`, so outside the one-of group. Only the Remote
+    # Control launcher passes it: plain `--ensure` also runs before every
+    # hand-launched `claude`, where a start hold would undo the rotation.
+    parser.add_argument(
+        "--remote-control-start",
+        action="store_true",
+        help=(
+            "With --ensure only: when the active login cannot start Remote "
+            "Control, make the owner account active and hold the rotation "
+            "until the server registers. One decision line on stderr; exit 0."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    if args.remote_control_start and not args.ensure:
+        parser.error("--remote-control-start is accepted only together with --ensure")
 
     from claude_swap.pin import run as pin_run
 
@@ -218,12 +232,19 @@ Examples:
         # BEFORE `sys.exit(1)` and a handler can only catch the second half.
         # Ask the same question instead of running the printing guard.
         if args.ensure and _is_refused_root(switcher):
+            if args.remote_control_start:
+                print("start hold: failed: refused to run as root",
+                      file=sys.stderr, flush=True)
             sys.exit(0)
         _guard_root(switcher)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — SystemExit is the point
         # NOT BaseException: a Ctrl-C during construction must still reach the
         # user as one, even under a flag that promises never to fail.
         if args.ensure:
+            if args.remote_control_start:
+                # The launcher's journal shows a decision on every start.
+                print(f"start hold: failed: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
             sys.exit(0)
         # Render what the siblings render: the `except ClaudeSwitchError` that
         # prints `Error: ...` wraps only `pin_run`, so the faults above left
@@ -246,6 +267,7 @@ Examples:
                 set_port=args.set_port,
                 ensure=args.ensure,
                 state=args.state,
+                remote_control_start=args.remote_control_start,
             )
         )
     except ClaudeSwitchError as e:
