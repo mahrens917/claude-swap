@@ -31,6 +31,7 @@ from pathlib import Path
 
 from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.locking import check_loaded_build_is_installed
 from claude_swap.printer import warning
 from claude_swap.switcher import (
     SENTINEL_NOTES,
@@ -77,6 +78,11 @@ def ensure_notification_identity(
             data["CFBundleName"] = "claude-swap"
             changed = True
         if changed or not path.exists():
+            # Before the temp is created, so a refused old-build process
+            # leaves nothing behind. StaleBuildWriteError is not one of the
+            # types the handler below logs and drops, so the refusal reaches
+            # the CLI.
+            check_loaded_build_is_installed(path)
             # atomic: an interrupted write must not leave a half-written plist
             tmp = path.with_name(
                 f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"

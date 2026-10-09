@@ -13897,3 +13897,32 @@ class TestClearRecordSurfacesItsErrors:
         monkeypatch.setattr(ops, "env_keys_survive", lambda before: [])
         with pytest.raises(ConfigError, match="is not a JSON object"):
             ops.clear_pin(types.SimpleNamespace(backup_dir=tmp_path))
+
+
+def test_a_stale_build_clears_no_wiring_receipt(temp_home, stale_build, caplog):
+    """Asserts: X3709, ``_clear_ledger`` from a process whose loaded build is
+    no longer the installed one raises StaleBuildWriteError naming the
+    receipt (never a False a caller reads as "re-run once it frees up"),
+    logs the refusal WARNING, and the receipt keeps its bytes with no temp
+    beside it."""
+    import logging
+
+    import claude_swap.pin as ops
+    from claude_swap.locking import StaleBuildWriteError
+
+    cfg = temp_home / ".claude.json"
+    cfg.write_text("{}", encoding="utf-8")
+    side = ops._ledger_path(cfg)
+    side.parent.mkdir(parents=True, exist_ok=True)
+    receipt = json.dumps({ops._WIRE_MARK: ["HTTPS_PROXY"]})
+    side.write_text(receipt, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING), pytest.raises(
+        StaleBuildWriteError
+    ) as raised:
+        ops._clear_ledger(cfg)
+
+    assert raised.value.path == side
+    assert side.read_text(encoding="utf-8") == receipt
+    assert list(side.parent.glob(f"{side.name}.*.tmp")) == []
+    assert any("refusing to write" in r.getMessage() for r in caplog.records)

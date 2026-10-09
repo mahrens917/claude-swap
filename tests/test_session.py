@@ -4827,3 +4827,113 @@ def banner(msg):
             "a `_note` nested inside a method sanctioned its own print, so "
             f"the bypass is one line long: {offenders}"
         )
+
+
+class TestAStaleBuildWritesNoSessionProfile:
+    """X3709: a process whose loaded claude-swap build is no longer the one
+    installed changes nothing in a session profile: no Keychain delete, no
+    seed, no identity, no cleanup removal, no shared-item link or manifest.
+    The refusal reaches the CLI as one line."""
+
+    def test_bootstrap_is_refused_before_the_keychain_delete(
+        self, manager, seeded_switcher, block_real_keychain, request, caplog
+    ):
+        """Asserts: ``_bootstrap`` raises StaleBuildWriteError naming the
+        profile, logs the refusal WARNING, and leaves the profile's hashed
+        Keychain entry and its (absent) seed and identity files untouched."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, "earlier")
+        request.getfixturevalue("stale_build")
+
+        with caplog.at_level(logging.WARNING), pytest.raises(
+            StaleBuildWriteError
+        ) as raised:
+            manager._bootstrap(session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL, ORG_UUID)
+
+        assert raised.value.path == session_dir
+        assert any(
+            r.levelno == logging.WARNING and "refusing to write" in r.getMessage()
+            for r in caplog.records
+        )
+        assert block_real_keychain.get_password(service, account) == "earlier"
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / ".claude.json").exists()
+
+    def test_cleanup_is_refused_before_any_removal(
+        self, manager, seeded_switcher, block_real_keychain, request
+    ):
+        """Asserts: ``_cleanup_failed_session`` raises StaleBuildWriteError
+        and the seed, the identity and the Keychain entry all survive."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text(CREDS, encoding="utf-8")
+        (session_dir / ".claude.json").write_text(CONFIG, encoding="utf-8")
+        service = keychain_service_name(session_dir)
+        account = session_mod._keychain_account_name()
+        block_real_keychain.set_password(service, account, "seeded")
+        request.getfixturevalue("stale_build")
+
+        with pytest.raises(StaleBuildWriteError):
+            manager._cleanup_failed_session(session_dir)
+
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == CREDS
+        assert (session_dir / ".claude.json").read_text(encoding="utf-8") == CONFIG
+        assert block_real_keychain.get_password(service, account) == "seeded"
+
+    def test_sharing_is_refused_before_any_link_or_manifest(
+        self, share_setup, request
+    ):
+        """Asserts: ``_sync_sharing`` raises StaleBuildWriteError and the
+        profile gains no link, no copy and no manifest."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        _source, session_dir, mgr = share_setup
+        before = sorted(p.name for p in session_dir.iterdir())
+        request.getfixturevalue("stale_build")
+
+        with pytest.raises(StaleBuildWriteError):
+            mgr._sync_sharing(session_dir, share=True, share_history=True)
+
+        assert sorted(p.name for p in session_dir.iterdir()) == before
+        assert not (session_dir / SHARE_MANIFEST).exists()
+
+    def test_the_cli_reports_the_refusal_in_one_line(
+        self, seeded_switcher, monkeypatch, capsys, request
+    ):
+        """Asserts: a refusal raised inside ``SessionManager.run`` reaches
+        ``cswap run`` as exit 1 and one ``Error: refusing to write ...`` line
+        on stderr naming the loaded build, never a traceback."""
+        from claude_swap import cli
+        from claude_swap.locking import check_loaded_build_is_installed
+
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def refused_run(self, *args, **kwargs):
+            check_loaded_build_is_installed(session_dir)
+            raise AssertionError("the stale build reached past the refusal")
+
+        monkeypatch.setattr(SessionManager, "run", refused_run)
+        request.getfixturevalue("stale_build")
+
+        with pytest.raises(SystemExit) as exited:
+            cli._run_command([ACCOUNT_NUM])
+
+        assert exited.value.code == 1
+        err_lines = [ln for ln in capsys.readouterr().err.splitlines() if ln]
+        assert len(err_lines) == 1, err_lines
+        assert "Error: refusing to write" in err_lines[0]
+        assert "0.26.0 (source sha256 000000000000)" in err_lines[0]

@@ -24966,6 +24966,35 @@ class TestT1313LoginRestore:
         now = time.time()
         os.utime(path, (now - age_s, now - age_s))
 
+    def test_a_stale_build_restores_nothing_and_says_so(
+        self, temp_home: Path, sample_sequence_data: dict, request, caplog,
+    ):
+        """Asserts: X3709, a settle from a process whose loaded build is no
+        longer the installed one raises StaleBuildWriteError rather than
+        answering "left: an internal error"; the live credential and
+        ``~/.claude.json`` keep N's login and the refusal WARNING is logged,
+        with no "Restoring the active account ... raised" WARNING."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        s, login, _active_backup = self._setup(sample_sequence_data, temp_home)
+        self._make_settled_candidate(s, login)
+        live_config = (temp_home / ".claude.json").read_bytes()
+        request.getfixturevalue("stale_build")
+
+        with caplog.at_level(logging.WARNING), pytest.raises(
+            StaleBuildWriteError
+        ):
+            s._settle_login_restore()
+
+        assert s._read_credentials() == login
+        assert (temp_home / ".claude.json").read_bytes() == live_config
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("refusing to write" in m for m in messages)
+        assert not any("Restoring the active account" in m for m in messages)
+        # No rollback runs over writes that never happened, so nothing
+        # reports a failed rollback at ERROR.
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
     def test_settle_restores_the_active_account_past_the_floor(
         self, temp_home: Path, sample_sequence_data: dict,
     ):
@@ -30336,6 +30365,80 @@ def test_an_unreadable_destination_before_the_copy_is_left_alone(
         "cannot tell a partial from what was already there, and emptying is "
         "the destructive answer to that question"
     )
+
+
+class TestAStaleBuildRefusalIsNotDegraded:
+    """X3709: a stale-build refusal raised inside the consume window or the
+    rotated-backup catch-up propagates; neither broad handler turns it into
+    a transient outcome or a WARNING about a failed operation."""
+
+    ROTATED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-r", "refreshToken": "rt-r",
+        "expiresAt": 99_999_999_999_999}})
+
+    def test_the_consume_window_does_not_defer_a_refusal(
+        self, temp_home, request, caplog
+    ):
+        """Asserts: a refusal from the stashed-successor write inside
+        ``_consume_backup_grant_locked`` raises StaleBuildWriteError, never
+        RefreshOutcome(None, "transient"), and no "Pre-consume window
+        failed" WARNING is logged."""
+        from claude_swap.locking import (
+            StaleBuildWriteError,
+            check_loaded_build_is_installed,
+        )
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        request.getfixturevalue("stale_build")
+
+        def refused_adopt(*_args, **_kwargs):
+            check_loaded_build_is_installed(s.backup_dir)
+
+        with patch.object(
+            s, "_read_account_credentials_ex", return_value=(self.ROTATED, False)
+        ), patch.object(s, "_adopt_stashed_successor", side_effect=refused_adopt), \
+                caplog.at_level(logging.WARNING), \
+                pytest.raises(StaleBuildWriteError):
+            s._consume_backup_grant_locked("1", "a@example.com", self.ROTATED)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("refusing to write" in m for m in messages)
+        assert not any("Pre-consume window failed" in m for m in messages)
+
+    def test_the_rotated_backup_catch_up_does_not_swallow_a_refusal(
+        self, temp_home, request, caplog
+    ):
+        """Asserts: a refusal from the login-restore settle that
+        ``_resync_rotated_backup`` runs raises StaleBuildWriteError; no
+        "refused: resync failed" record and no "Backup resync ... failed"
+        WARNING are written."""
+        from claude_swap.locking import (
+            StaleBuildWriteError,
+            check_loaded_build_is_installed,
+        )
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        request.getfixturevalue("stale_build")
+
+        def refused_settle():
+            check_loaded_build_is_installed(s.backup_dir)
+
+        with patch.object(
+            s, "_read_account_credentials", return_value=self.ROTATED
+        ), patch.object(
+            s, "_get_sequence_data", return_value={"activeAccountNumber": "2"}
+        ), patch.object(s, "_settle_login_restore", side_effect=refused_settle), \
+                patch.object(s._store, "_log_detected_login") as record, \
+                caplog.at_level(logging.WARNING), \
+                pytest.raises(StaleBuildWriteError):
+            s._resync_rotated_backup("1", "a@example.com", "o-1", self.ROTATED)
+
+        record.assert_not_called()
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("refusing to write" in m for m in messages)
+        assert not any("Backup resync" in m for m in messages)
 
 
 class TestAStaleBuildWritesNoAccountStore:

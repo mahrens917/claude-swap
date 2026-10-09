@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.locking import check_loaded_build_is_installed
 
 LABEL = "com.cswap.menubar"
 
@@ -231,6 +232,9 @@ def install(
     target_plist = plist_path(label, home)
     out_log, err_log = log_paths(label, home)
 
+    # Before the first write (the directories, the plist, the launchd
+    # bootout), so an old-build process leaves no half-done install.
+    check_loaded_build_is_installed(target_plist)
     target_plist.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
     target_plist.write_bytes(build_plist(program, label, home))
@@ -272,6 +276,9 @@ def uninstall(
     """
     _require_macos()
     target_plist = plist_path(label, home)
+    # Before the bootout and the unlink, so an old-build process neither
+    # stops the service nor removes its plist.
+    check_loaded_build_is_installed(target_plist)
     was_loaded = is_loaded(label, uid)
     if was_loaded:
         booted_out = _launchctl("bootout", service_target(label, uid))

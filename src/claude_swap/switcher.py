@@ -4600,6 +4600,12 @@ class ClaudeAccountSwitcher:
                 "refresh to the next pass.", account_num,
             )
             return oauth.RefreshOutcome(None, "transient")
+        except StaleBuildWriteError:
+            # Not a transient: this process loaded an older build than the
+            # one installed and must not write the store at all, so a
+            # deferral would only retry the refused write next pass. The
+            # refusal's own WARNING (locking.py) already named both builds.
+            raise
         except Exception:
             # No POST has been issued yet, so no grant of ours is
             # outstanding — degrade to transient instead of raising through
@@ -9021,6 +9027,12 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                 uuid=own_uuid if established else None,
             )
             return  # holder is mid-operation; the next pass retries
+        except StaleBuildWriteError:
+            # Not a failure to warn about and record: this process loaded
+            # an older build than the one installed, so it writes nothing
+            # (the detected-login record included) and the refusal
+            # propagates with its own WARNING from locking.py.
+            raise
         except Exception:
             self._store._log_detected_login(
                 creds, slot=account_num if established else None,
@@ -9384,6 +9396,12 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                                 outcome="waiting: write suppressed",
                             )
                             return LoginRestoreOutcome.WAITING
+                        # THE PAIR, before either write: a refusal raised
+                        # by the credential write inside the `try` below
+                        # would run its rollback, whose config restore is
+                        # refused too and logged at ERROR as a failed
+                        # rollback of a file this process never wrote.
+                        check_loaded_build_is_installed(config_path)
                         creds_written = False
                         try:
                             self._write_credentials(
@@ -9425,6 +9443,11 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
                     consume_lock.release()
         except LockError:
             return _transient("lock contention")
+        except StaleBuildWriteError:
+            # Not "an internal error" left for the user: this process loaded
+            # an older build than the one installed and must not restore the
+            # live login, so the refusal propagates with its own WARNING.
+            raise
         except Exception as e:
             self._logger.warning(
                 "Restoring the active account after a non-active login "

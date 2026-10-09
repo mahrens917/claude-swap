@@ -290,6 +290,45 @@ def test_uninstall_boots_out_and_removes_the_plist(tmp_path):
     ]
 
 
+def test_a_stale_build_installs_nothing(tmp_path, stale_build):
+    """Asserts: X3709, ``install`` from a process whose loaded build is no
+    longer the installed one raises StaleBuildWriteError naming the plist
+    before any write: no LaunchAgents or log directory, no plist, and no
+    launchctl call at all."""
+    from claude_swap.locking import StaleBuildWriteError
+
+    with patch.object(launch_agent.subprocess, "run") as run, pytest.raises(
+        StaleBuildWriteError
+    ) as raised:
+        launch_agent.install(home=tmp_path, program=PROGRAM, uid=UID)
+
+    target = launch_agent.plist_path(home=tmp_path)
+    out_log, _err_log = launch_agent.log_paths(launch_agent.LABEL, tmp_path)
+    assert raised.value.path == target
+    assert not target.parent.exists()
+    assert not out_log.parent.exists()
+    run.assert_not_called()
+
+
+def test_a_stale_build_uninstalls_nothing(tmp_path, stale_build):
+    """Asserts: X3709, ``uninstall`` from a stale build raises
+    StaleBuildWriteError before the bootout and the unlink: the plist keeps
+    its bytes and launchctl is never called."""
+    from claude_swap.locking import StaleBuildWriteError
+
+    target = launch_agent.plist_path(home=tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+
+    with patch.object(launch_agent.subprocess, "run") as run, pytest.raises(
+        StaleBuildWriteError
+    ):
+        launch_agent.uninstall(home=tmp_path, uid=UID)
+
+    assert target.read_bytes() == b"x"
+    run.assert_not_called()
+
+
 def test_uninstall_is_quiet_when_nothing_is_installed(tmp_path):
     with patch.object(launch_agent.subprocess, "run") as run:
         run.side_effect = _router({"print": _completed(1)})

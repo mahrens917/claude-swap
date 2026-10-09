@@ -29,6 +29,7 @@ import os
 from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
+from claude_swap.locking import StaleBuildWriteError, check_loaded_build_is_installed
 
 _logger = logging.getLogger("claude-swap")
 
@@ -591,7 +592,10 @@ def _each_config(level: int = logging.DEBUG):
 
 
 def _clear_ledger(config_path) -> bool:
-    """Record "not wired" in the sidecar. Never raises; SAYS whether it wrote.
+    """Record "not wired" in the sidecar. SAYS whether it wrote; raises only
+    the stale-build refusal (StaleBuildWriteError), which is not a failed
+    write but a process that must not write at all, so a caller cannot read
+    it as "re-run once it frees up".
 
     THE RETURN IS LOAD-BEARING, and discarding it made `--clear` permanently
     non-converging. The config write could succeed while this one failed (an
@@ -615,6 +619,8 @@ def _clear_ledger(config_path) -> bool:
     path = None
     try:
         path = _ledger_path(config_path)
+        # Before the mkdir and the temp: an old-build process writes nothing.
+        check_loaded_build_is_installed(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({_WIRE_MARK: []}), encoding="utf-8")
@@ -627,6 +633,10 @@ def _clear_ledger(config_path) -> bool:
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         return True
+    except StaleBuildWriteError:
+        # Raised before the temp exists, so there is nothing to remove, and
+        # answering False would turn the refusal into a retryable failure.
+        raise
     except Exception:  # noqa: BLE001 — the config write is what matters
         if path is not None:
             try:

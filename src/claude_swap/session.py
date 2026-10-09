@@ -57,7 +57,7 @@ from claude_swap.exceptions import (
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.locking import FileLock
+from claude_swap.locking import FileLock, check_loaded_build_is_installed
 from claude_swap.models import Platform
 from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import get_default_global_config_path
@@ -1055,6 +1055,12 @@ class SessionManager:
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
     ) -> None:
         """Seed the session profile from backup storage. Caller holds the lock."""
+        # BEFORE THE FIRST WRITE (the Keychain delete, then the seed and the
+        # identity): a process that loaded an older build than the one
+        # installed must not write a profile the installed build owns, and
+        # checking only at the later writes would leave the Keychain entry
+        # deleted with no seed behind it. The refusal propagates to the CLI.
+        check_loaded_build_is_installed(session_dir)
         # Claude reads the keychain before the plaintext file — a stale hashed
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
@@ -1132,6 +1138,9 @@ class SessionManager:
             return True  # unknown shape — let the refresh attempt decide
 
     def _cleanup_failed_session(self, session_dir: Path) -> None:
+        # The build check comes before every removal below, so an old-build
+        # process deletes nothing from a profile the installed build owns.
+        check_loaded_build_is_installed(session_dir)
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
         # stale marker is a sibling, so the sweep below does not take it.
@@ -1306,6 +1315,12 @@ class SessionManager:
         """
         if not session_dir.is_dir():
             return
+        # One check for every file operation below (the MCP servers write,
+        # unlink, symlink, copytree, copy, move, rmtree and the manifest):
+        # an old-build process changes none of the profile's shared items.
+        # The refusal is a ClaudeSwitchError, not an OSError, so the
+        # manifest write's OSError arm never sees it.
+        check_loaded_build_is_installed(session_dir)
         self._sync_mcp_servers(session_dir, share)
         # History links are POSIX-only (run() rejects the flag on Windows;
         # this also drops any links left by a POSIX→Windows profile move).

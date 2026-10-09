@@ -68,6 +68,34 @@ def test_notification_identity_is_noop_off_macos(tmp_path: Path):
     assert not (executable.parent / "Info.plist").exists()
 
 
+def test_notification_identity_is_refused_by_a_stale_build(
+    tmp_path: Path, stale_build, caplog
+):
+    """Asserts: X3709, a process whose loaded build is no longer the
+    installed one raises StaleBuildWriteError naming the Info.plist (not the
+    "Could not prepare" WARNING that drops the error), and the plist keeps
+    its bytes with no temp left beside it."""
+    from claude_swap.locking import StaleBuildWriteError
+
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    original = plistlib.dumps({"ExistingKey": "kept"})
+    info.write_bytes(original)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(
+        StaleBuildWriteError
+    ) as raised:
+        menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert raised.value.path == info
+    assert info.read_bytes() == original
+    assert list(executable.parent.glob("Info.plist*.tmp")) == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("refusing to write" in m for m in messages)
+    assert not any("Could not prepare" in m for m in messages)
+
+
 # --- settings ------------------------------------------------------------------
 
 def test_settings_defaults_when_file_missing(tmp_path: Path):
