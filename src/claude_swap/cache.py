@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+from claude_swap.locking import check_loaded_build_is_installed
 from claude_swap.paths import get_backup_root
 
 CACHE_DIR = get_backup_root() / "cache"
@@ -36,7 +37,14 @@ def read_cache(path: Path, ttl: float, default=MISSING):
 
 
 def write_cache(path: Path, data) -> None:
-    """Write data to a cache file with a timestamp."""
+    """Write data to a cache file with a timestamp.
+
+    Every cswap process writes the same cache files (``update_check.json``),
+    so a process whose loaded build is no longer the installed one raises
+    :class:`~claude_swap.locking.StaleBuildWriteError` before touching the
+    file (X3697).
+    """
+    check_loaded_build_is_installed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps({"timestamp": time.time(), "data": data}),

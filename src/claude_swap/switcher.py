@@ -66,7 +66,12 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     shared_credential_fields,
 )
 from claude_swap.fsutil import read_text_with_retry, replace_with_retry
-from claude_swap.locking import STORE_LOCK_WAIT_S, FileLock
+from claude_swap.locking import (
+    STORE_LOCK_WAIT_S,
+    FileLock,
+    StaleBuildWriteError,
+    check_loaded_build_is_installed,
+)
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
     AccountSnapshot,
@@ -993,6 +998,14 @@ class ClaudeAccountSwitcher:
         # survivor can be one document's bytes under the other's rename --
         # which an atomic rename cannot protect against, because the tearing
         # happened before it.
+        # THE BUILD CHECK (X3697): every cswap process and the owner proxy
+        # write this file. A refusal leaves it as it is; the check has logged
+        # its one WARNING naming both builds, and the switch that called this
+        # has already landed, so it is not failed after the fact.
+        try:
+            check_loaded_build_is_installed(path)
+        except StaleBuildWriteError:
+            return
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             tmp.write_text(json.dumps(doc), encoding="utf-8")
@@ -1052,6 +1065,8 @@ class ClaudeAccountSwitcher:
         """
         stem = f"{path.name}.unreadable-{int(time.time())}"
         salvage = path.with_name(stem)
+        # The copy aside is a write beside a shared file (X3697).
+        check_loaded_build_is_installed(salvage)
         created = False
         n = 1
         while salvage.exists():
@@ -2028,6 +2043,7 @@ class ClaudeAccountSwitcher:
         Raises:
             SessionError: a live session-mode instance is using this account.
         """
+        self._refuse_store_write_from_stale_build()
         self._ensure_no_live_session(account_num, email, "the operation")
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -2171,11 +2187,26 @@ class ClaudeAccountSwitcher:
         except Exception:  # noqa: BLE001 — never block a switch
             return config
 
+    def _refuse_store_write_from_stale_build(self) -> None:
+        """Refuse a store operation that writes several files, before its
+        first write, from a process whose loaded build is no longer the
+        installed one (X3697).
+
+        Each file write checks again on its own (``replace_with_retry``, the
+        credential store's writers), so this adds no coverage. What it adds
+        is the order: a refusal at the third write of a switch would leave
+        the first two landed, while a refusal here leaves the store whole.
+        Raises :class:`~claude_swap.locking.StaleBuildWriteError`, named
+        after the account store directory.
+        """
+        check_loaded_build_is_installed(self.backup_dir)
+
     def _write_account_config(
         self, account_num: str, email: str, config: str
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        check_loaded_build_is_installed(config_file)
         config_file.write_text(config, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_file, 0o600)
@@ -2358,6 +2389,7 @@ class ClaudeAccountSwitcher:
         number resolved outside the lock could be renumbered by a concurrent
         swap/move and target the wrong account.
         """
+        self._refuse_store_write_from_stale_build()
         self._get_sequence_data_migrated()
 
         num_a = self._resolve_account_identifier(first)
@@ -2552,6 +2584,7 @@ class ClaudeAccountSwitcher:
         wraps and counts the failure (rollback, stray cleanup).
         """
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        check_loaded_build_is_installed(config_file)
         config_file.unlink(missing_ok=True)
 
     def _discard_staging(self, staging: dict[str, Path]) -> None:
@@ -3202,6 +3235,7 @@ class ClaudeAccountSwitcher:
         the target key are cleaned on failure), after it only best-effort
         cleanup of the old keys remains.
         """
+        self._refuse_store_write_from_stale_build()
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(num_src)
         if not record:
@@ -5271,6 +5305,8 @@ class ClaudeAccountSwitcher:
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
+        # The deletes below are writes to a profile `cswap run` shares (X3697).
+        check_loaded_build_is_installed(session_dir)
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
@@ -5401,6 +5437,8 @@ class ClaudeAccountSwitcher:
         )
 
         session_dir = self._session_dir(account_num, email)
+        # The removals below are writes to a profile `cswap run` shares (X3697).
+        check_loaded_build_is_installed(session_dir)
         if session_dir.exists():
             delete_macos_keychain_entry(session_dir)
             shutil.rmtree(session_dir, ignore_errors=True)
@@ -6833,6 +6871,7 @@ class ClaudeAccountSwitcher:
         ``displaced`` is the ``(email, org_uuid)`` an overwrite removed.
         Nothing here may take ``self.lock_file`` (FileLock is non-reentrant).
         """
+        self._refuse_store_write_from_stale_build()
         self._setup_directories()
         self._init_sequence_file()
         self._migrate_org_fields()
@@ -7236,6 +7275,7 @@ class ClaudeAccountSwitcher:
         ``self.lock_file``. Returns as :meth:`_add_account_locked` does.
         Nothing here may take ``self.lock_file`` (FileLock is non-reentrant).
         """
+        self._refuse_store_write_from_stale_build()
         is_api_key = looks_like_api_key(token)
 
         self._setup_directories()
@@ -7536,6 +7576,7 @@ class ClaudeAccountSwitcher:
         the user already said yes to. Nothing here may take
         ``self.lock_file`` (FileLock is non-reentrant).
         """
+        self._refuse_store_write_from_stale_build()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -11218,7 +11259,13 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         back to plain rotation when usage is unavailable. Both apply only to the
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
+
+        Raises :class:`~claude_swap.locking.StaleBuildWriteError` before any
+        lock, fetch or write when this process's loaded build is no longer
+        the installed one (X3697): a switch writes the live credential and
+        ``sequence.json``, which every other cswap process shares.
         """
+        self._refuse_store_write_from_stale_build()
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
         # Struck THIS call, independent of `_slot_token_dead`: that filter
@@ -13074,6 +13121,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         """
         from claude_swap.session import scan_live_sessions
 
+        self._refuse_store_write_from_stale_build()
         self._refuse_session_shell()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
@@ -14026,6 +14074,7 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
+        self._refuse_store_write_from_stale_build()
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir

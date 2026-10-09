@@ -32,10 +32,15 @@ _logger = logging.getLogger("claude-swap")
 # and keeps a draining process alive across an install. A process keeps
 # running the code it loaded, so after an install the draining proxy wrote
 # the store with the previous build's code beside the new one and emptied it
-# (live 2026-10-08 18:29Z). Every writer of those files therefore compares
-# the build it loaded with the build installed on disk now, and refuses the
-# write on a mismatch (`check_loaded_build_is_installed`). Reads stay
-# allowed: only a write can destroy what the other build keeps.
+# (live 2026-10-08 18:29Z). Every writer of a file more than one process
+# shares therefore compares the build it loaded with the build installed on
+# disk now, and refuses the write on a mismatch
+# (`check_loaded_build_is_installed`): the store files here, every rename
+# `fsutil.replace_with_retry` publishes (credentials, `sequence.json`,
+# settings, migrations, mappings, imports), the Keychain items and deletes
+# in `credentials`, and the multi-file operations in `switcher`, which check
+# once before their first write. Reads stay allowed: only a write can
+# destroy what the other build keeps.
 #
 # The build's identity is a sha256 over this package's own ``*.py`` files
 # (relative path and bytes), not the distribution's version or the commit in
@@ -57,15 +62,36 @@ class Build:
 
 class StaleBuildWriteError(ClaudeSwitchError):
     """A process refused to write a shared file because the claude-swap
-    build it loaded is no longer the one installed on disk."""
+    build it loaded is no longer the one installed on disk.
 
-    def __init__(self, path: Path, loaded: Build, installed: Build) -> None:
+    ``installed`` is None when the installed build could not be read at all
+    (a package file or the distribution metadata vanished or was unreadable
+    mid-install); ``unreadable``
+    then names that error. A build nobody can read is not the loaded build,
+    so the write is refused the same way."""
+
+    def __init__(
+        self,
+        path: "Path | str",
+        loaded: Build,
+        installed: Build | None,
+        unreadable: Exception | None = None,
+    ) -> None:
         self.path = path
         self.loaded = loaded
         self.installed = installed
+        self.unreadable = unreadable
+        if installed is not None:
+            what = f"build {installed.label} is installed"
+        else:
+            what = (
+                f"the installed build cannot be read ({unreadable}), as while "
+                "an install replaces the package files, so it is treated as "
+                "not the loaded build"
+            )
         super().__init__(
             f"refusing to write {path}: this process loaded build "
-            f"{loaded.label}, build {installed.label} is installed"
+            f"{loaded.label}, {what}"
         )
 
 
@@ -162,23 +188,32 @@ LOADED_BUILD = _loaded_build()
 _refusal_warned: set[str] = set()
 
 
-def check_loaded_build_is_installed(path: Path) -> None:
-    """Refuse a write to the shared file ``path`` from a process whose loaded
-    build is no longer the installed one.
+def check_loaded_build_is_installed(path: "Path | str") -> None:
+    """Refuse a write to the shared target ``path`` (a file, or a named
+    Keychain item) from a process whose loaded build is no longer the
+    installed one.
 
     Raises :class:`StaleBuildWriteError` on a mismatch, after logging ONE
-    WARNING per file per process naming both builds; the file is not
-    touched. A package file that vanishes mid-check (an install in
-    progress) raises ``OSError``: no build is installed at that instant.
+    WARNING per target per process naming both builds; the target is not
+    touched. A package file that vanishes or cannot be read mid-check (an
+    install in progress) is the same refusal with ``installed`` None: at
+    that instant no build can be shown to be the loaded one.
     """
-    installed_digest = installed_build_digest()
-    if installed_digest == LOADED_BUILD.digest:
-        return
-    installed = Build(
-        digest=installed_digest,
-        label=_build_label(_PACKAGE_DIR, installed_digest),
-    )
-    exc = StaleBuildWriteError(path, LOADED_BUILD, installed)
+    loaded = LOADED_BUILD
+    try:
+        installed_digest = installed_build_digest()
+        if installed_digest == loaded.digest:
+            return
+        installed: Build | None = Build(
+            digest=installed_digest,
+            label=_build_label(_PACKAGE_DIR, installed_digest),
+        )
+        unreadable: Exception | None = None
+    except (OSError, importlib.metadata.PackageNotFoundError) as e:
+        # The package files (OSError) or the distribution's metadata
+        # (PackageNotFoundError) vanished under an install in progress.
+        installed, unreadable = None, e
+    exc = StaleBuildWriteError(path, loaded, installed, unreadable)
     with _build_lock:
         first = str(path) not in _refusal_warned
         _refusal_warned.add(str(path))

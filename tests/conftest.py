@@ -1284,3 +1284,17 @@ def store_lock_is_free(lock_path: Path) -> bool:
         probe.release()
         return True
     return False
+
+
+@pytest.fixture
+def stale_build(monkeypatch):
+    """Make this process look like one that loaded an older claude-swap build
+    than the one installed (X3697): the loaded build's digest differs from
+    the package files on disk, and no refusal WARNING has been logged yet.
+    Returns the loaded (old) :class:`~claude_swap.locking.Build`."""
+    from claude_swap import locking
+
+    old = locking.Build(digest="0" * 64, label="0.26.0 (source sha256 000000000000)")
+    monkeypatch.setattr(locking, "LOADED_BUILD", old)
+    monkeypatch.setattr(locking, "_refusal_warned", set())
+    return old

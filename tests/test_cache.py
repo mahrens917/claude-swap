@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
 from claude_swap.cache import MISSING, read_cache, write_cache
 
 
@@ -53,6 +55,18 @@ class TestReadCache:
 
 
 class TestWriteCache:
+    def test_a_stale_build_refuses_the_cache_write(self, tmp_path, stale_build):
+        """Asserts: a process whose loaded build is no longer the installed
+        one (X3697) raises StaleBuildWriteError and leaves an existing cache
+        file (``update_check.json``) with its bytes."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        cache_file = tmp_path / "update_check.json"
+        cache_file.write_text('{"timestamp": 1, "data": "0.27.0"}')
+        with pytest.raises(StaleBuildWriteError):
+            write_cache(cache_file, "0.26.0")
+        assert cache_file.read_text() == '{"timestamp": 1, "data": "0.27.0"}'
+
     def test_creates_file_and_parent_dirs(self, tmp_path):
         cache_file = tmp_path / "sub" / "dir" / "test.json"
         write_cache(cache_file, {"key": "value"})

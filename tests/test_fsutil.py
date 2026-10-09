@@ -171,6 +171,38 @@ class TestReadTextWithRetry:
             read_text_with_retry(target, attempts=0)
 
 
+class TestThePublishChecksTheBuild:
+    """X3697: every rename onto a shared file goes through
+    ``replace_with_retry``, so that is where a process whose loaded build is
+    no longer the installed one is refused."""
+
+    def test_a_stale_build_never_publishes(self, tmp_path, stale_build):
+        """Asserts: with the loaded build differing from the installed one,
+        the publish raises StaleBuildWriteError naming the destination, the
+        destination keeps its bytes and the temp is left for the caller."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        dst = tmp_path / "sequence.json"
+        dst.write_text("installed build's bytes")
+        src = tmp_path / "tmp"
+        src.write_text("old build's bytes")
+        with pytest.raises(StaleBuildWriteError) as raised:
+            replace_with_retry(src, dst)
+        assert raised.value.path == dst
+        assert raised.value.loaded == stale_build
+        assert dst.read_text() == "installed build's bytes"
+        assert src.read_text() == "old build's bytes"
+
+    def test_the_installed_build_publishes(self, tmp_path):
+        """Asserts: the process's own build publishes as before."""
+        dst = tmp_path / "sequence.json"
+        src = tmp_path / "tmp"
+        src.write_text("new")
+        replace_with_retry(src, dst)
+        assert dst.read_text() == "new"
+        assert not src.exists()
+
+
 class TestSkipifArgumentsAreEvaluatedEverywhere:
     """A `skipif` ARGUMENT runs at collection on every platform.
 

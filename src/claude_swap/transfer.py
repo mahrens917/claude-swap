@@ -25,7 +25,11 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import replace_with_retry, write_all
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
-from claude_swap.locking import STORE_LOCK_WAIT_S, FileLock
+from claude_swap.locking import (
+    STORE_LOCK_WAIT_S,
+    FileLock,
+    check_loaded_build_is_installed,
+)
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint, refresh_token_spent
 
@@ -433,6 +437,10 @@ def _import_accounts_locked(
     force: bool,
 ) -> None:
     """Body of :func:`import_accounts`; the caller holds ``switcher.lock_file``."""
+    # THE BUILD CHECK BEFORE ANY WRITE (X3697). Each store write below checks
+    # again at its own publish, but a refusal there would land after earlier
+    # accounts were written; refusing here keeps an import whole or absent.
+    check_loaded_build_is_installed(switcher.sequence_file)
     # Pass 1: validate every account before any writes. A malformed account
     # later in the list must not leave earlier accounts half-imported.
     local_data = switcher._get_sequence_data_migrated() or {}

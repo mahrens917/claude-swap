@@ -712,3 +712,73 @@ class TestTheLineageJitterToleranceIsPublic:
 
         assert not newer_login(LINEAGE_STAMP_JITTER_MS, 0)
         assert newer_login(LINEAGE_STAMP_JITTER_MS + 1, 0)
+
+
+class TestAStaleBuildWritesNoCredential:
+    """X3697: the live credential and every stored slot credential are shared
+    by every cswap process and the owner proxy, so a process whose loaded
+    build is no longer the installed one writes and deletes none of them."""
+
+    class _LinuxHost:
+        def __init__(self, credentials_dir: Path):
+            self.platform = Platform.LINUX
+            self.credentials_dir = credentials_dir
+            self._logger = logging.getLogger("claude-swap")
+
+    def test_the_live_credential_file_is_not_written(self, temp_home, stale_build):
+        """Asserts: the live write raises StaleBuildWriteError and Claude
+        Code's ``.credentials.json`` keeps its bytes."""
+        from claude_swap.locking import StaleBuildWriteError
+        from claude_swap.paths import get_credentials_path
+
+        store = CredentialStore(self._LinuxHost(temp_home / "creds"))
+        live = get_credentials_path()
+        live.write_text(DEFAULT_PROFILE_CREDS)
+        with pytest.raises(StaleBuildWriteError):
+            store._write_credentials(CUSTOM_PROFILE_CREDS)
+        assert live.read_text() == DEFAULT_PROFILE_CREDS
+
+    def test_a_stored_slot_credential_is_not_written_or_deleted(
+        self, temp_home, stale_build
+    ):
+        """Asserts: a slot write and a slot delete each raise
+        StaleBuildWriteError; the slot's ``.enc`` keeps its bytes and no
+        ``.prev`` generation is written."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        store = CredentialStore(self._LinuxHost(temp_home / "creds"))
+        enc = store._backup_enc_path("1", "a@x.com")
+        enc.parent.mkdir(parents=True)
+        enc.write_text("installed")
+        with pytest.raises(StaleBuildWriteError):
+            store._write_account_credentials(
+                "1", "a@x.com", CUSTOM_PROFILE_CREDS, attributed=True)
+        with pytest.raises(StaleBuildWriteError):
+            store._delete_account_credentials("1", "a@x.com")
+        assert enc.read_text() == "installed"
+        assert not store._prev_backup_path("1", "a@x.com").exists()
+
+    def test_a_keychain_write_or_delete_never_reaches_the_keychain(
+        self, temp_home, monkeypatch, stale_build
+    ):
+        """Asserts: on macOS a Keychain set, and the active-item delete, each
+        raise StaleBuildWriteError naming the item without calling the
+        Keychain, and the refusal does not mark the Keychain unusable."""
+        from claude_swap import credentials as creds_mod
+        from claude_swap.locking import StaleBuildWriteError
+
+        calls: list[str] = []
+        monkeypatch.setattr(creds_mod.macos_keychain, "set_password",
+                            lambda *a: calls.append("set"))
+        monkeypatch.setattr(creds_mod.macos_keychain, "delete_password",
+                            lambda *a: calls.append("delete"))
+        monkeypatch.setattr(creds_mod.macos_keychain, "keychain_account_name",
+                            lambda: "acct")
+        store = CredentialStore(_Host(temp_home / "creds"))
+        with pytest.raises(StaleBuildWriteError) as raised:
+            store._kc_write_backup("1", "a@x.com", CUSTOM_PROFILE_CREDS)
+        assert "Keychain item 'claude-swap'" in str(raised.value)
+        with pytest.raises(StaleBuildWriteError):
+            store._delete_active_keychain_entry()
+        assert calls == []
+        assert store._keychain_usable_cache is not False

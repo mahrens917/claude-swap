@@ -2098,28 +2098,19 @@ class TestUnreadableStoreIsNeverOverwritten:
         assert store.entries(IDENT)["1"].last_good == USAGE
 
 
-def _stale_build(monkeypatch) -> locking.Build:
-    """Make this process look like one that loaded an older build: the
-    loaded build's digest differs from the files installed on disk."""
-    old = locking.Build(digest="0" * 64, label="0.26.0 (source sha256 000000000000)")
-    monkeypatch.setattr(locking, "LOADED_BUILD", old)
-    monkeypatch.setattr(locking, "_refusal_warned", set())
-    return old
-
-
 class TestStaleBuildRefusesWrites:
     """X3697: a process whose loaded claude-swap build is no longer the one
     installed refuses every store write, so it cannot empty the store the
     installed build keeps."""
 
     def test_an_old_build_refuses_to_write_and_logs_once(
-        self, store, monkeypatch, caplog
+        self, store, stale_build, caplog
     ):
         """Asserts: with the loaded build differing from the installed one,
         two writes each raise StaleBuildWriteError, the store file is never
         created, exactly ONE WARNING names the file and both builds, and a
         read still answers."""
-        old = _stale_build(monkeypatch)
+        old = stale_build
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             with pytest.raises(locking.StaleBuildWriteError) as raised:
                 store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
@@ -2138,13 +2129,13 @@ class TestStaleBuildRefusesWrites:
         assert store.entries(IDENT)["1"].last_good is None
 
     def test_an_old_build_leaves_an_existing_file_untouched(
-        self, store, monkeypatch
+        self, store, request
     ):
         """Asserts: a file the installed build wrote keeps its bytes when an
         old-build process tries to write over it."""
         store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
         before = store.path.read_bytes()
-        _stale_build(monkeypatch)
+        request.getfixturevalue("stale_build")
         with pytest.raises(locking.StaleBuildWriteError):
             store.record({"2": FetchRecord(usage=dict(USAGE))}, IDENT)
         assert store.path.read_bytes() == before
@@ -2177,6 +2168,39 @@ class TestStaleBuildRefusesWrites:
         (package / "sub" / "b.py").write_text("B = 22\n", encoding="utf-8")
         assert locking.installed_build_digest() != first
         assert len(hashed) == 2
+
+    def test_a_package_file_vanishing_mid_install_refuses_the_write(
+        self, store, tmp_path, monkeypatch, caplog
+    ):
+        """Asserts: when a package file listed for the installed build is gone
+        by the time it is read (an install replacing the files), the write is
+        refused with StaleBuildWriteError (never a bare OSError), ``installed``
+        is None and ``unreadable`` names the vanished file, the ONE WARNING
+        says the installed build cannot be read, and the store file is never
+        created."""
+        package = tmp_path / "pkg"
+        package.mkdir()
+        (package / "a.py").write_text("A = 1\n", encoding="utf-8")
+        vanished = package / "b.py"
+        monkeypatch.setattr(locking, "_PACKAGE_DIR", package)
+        monkeypatch.setattr(locking, "_installed_cache", None)
+        monkeypatch.setattr(locking, "_refusal_warned", set())
+        # The walk saw b.py; the install removed it before the stat.
+        monkeypatch.setattr(
+            locking, "_source_files",
+            lambda d: [package / "a.py", vanished],
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(locking.StaleBuildWriteError) as raised:
+                store.record({"1": FetchRecord(usage=dict(USAGE))}, IDENT)
+        assert raised.value.installed is None
+        assert isinstance(raised.value.unreadable, FileNotFoundError)
+        assert str(vanished) in str(raised.value.unreadable)
+        assert "the installed build cannot be read" in str(raised.value)
+        assert not store.path.exists()
+        lines = [r for r in caplog.records if "refusing to write" in r.getMessage()]
+        assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+        assert "treated as not the loaded build" in lines[0].getMessage()
 
 
 def _fraction_headers(share: str, status: str = "allowed") -> dict[str, str]:

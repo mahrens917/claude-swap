@@ -30335,3 +30335,118 @@ def test_an_unreadable_destination_before_the_copy_is_left_alone(
         "cannot tell a partial from what was already there, and emptying is "
         "the destructive answer to that question"
     )
+
+
+class TestAStaleBuildWritesNoAccountStore:
+    """X3697: a process whose loaded claude-swap build is no longer the one
+    installed (the owner proxy or `cswap auto` across an install) writes
+    nothing every other cswap process shares: no switch, swap, move,
+    import, roster or migration record."""
+
+    _post_import_state = TestSwitchToSelfSlotAndForce._post_import_state
+    _install_store_patches = staticmethod(
+        TestPerformSwitchPostDisplay._install_store_patches
+    )
+    IMPORTED_1 = TestSwitchToSelfSlotAndForce.IMPORTED_1
+    LIVE_1 = TestSwitchToSelfSlotAndForce.LIVE_1
+
+    def test_a_switch_is_refused_before_anything_is_written(
+        self, temp_home, mock_claude_config, sample_sequence_data, request
+    ):
+        """Asserts: ``switch()`` and ``switch_to()`` each raise
+        StaleBuildWriteError naming the account store; the live credential,
+        every stored slot and ``sequence.json`` keep what they held. The
+        control is the next test: the same switch_to from the installed
+        build lands."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        roster = switcher.sequence_file.read_bytes()
+        stored = dict(creds)
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            request.getfixturevalue("stale_build")
+            with pytest.raises(StaleBuildWriteError) as raised:
+                switcher.switch(strategy="best", json_output=True,
+                                current_at_limit=True)
+            assert raised.value.path == switcher.backup_dir
+            with pytest.raises(StaleBuildWriteError):
+                switcher.switch_to("2")
+            assert live["creds"] == self.LIVE_1
+            assert creds == stored
+            assert switcher.sequence_file.read_bytes() == roster
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_the_installed_build_switches(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """Asserts: the control for the refusal above; the same switch_to
+        from the process's own build moves the live credential to slot 2."""
+        switcher, creds, configs, live = self._post_import_state(
+            temp_home, sample_sequence_data,
+        )
+        patches = self._install_store_patches(switcher, creds, configs, live)
+        try:
+            switcher.switch_to("2")
+        finally:
+            for p in patches:
+                p.stop()
+        assert live["creds"] != self.LIVE_1
+
+    def test_a_swap_and_a_move_are_refused(
+        self, temp_home, sample_sequence_data, stale_build
+    ):
+        """Asserts: ``swap_accounts`` and ``move_account`` raise
+        StaleBuildWriteError and ``sequence.json`` keeps its bytes."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.sequence_file.write_text(json.dumps(sample_sequence_data))
+        roster = switcher.sequence_file.read_bytes()
+        with pytest.raises(StaleBuildWriteError):
+            switcher.swap_accounts("1", "2")
+        with pytest.raises(StaleBuildWriteError):
+            switcher.move_account("2", "3")
+        assert switcher.sequence_file.read_bytes() == roster
+
+    def test_the_roster_and_the_migration_record_are_not_written(
+        self, temp_home, sample_sequence_data, stale_build
+    ):
+        """Asserts: a ``sequence.json`` write and a ``.migrations.json``
+        record each raise StaleBuildWriteError and leave no file, temp
+        included, behind."""
+        from claude_swap import migrations
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        with pytest.raises(StaleBuildWriteError):
+            switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        with pytest.raises(StaleBuildWriteError):
+            migrations._mark_applied(switcher, "probe")
+        assert not switcher.sequence_file.exists()
+        assert not migrations._state_path(switcher).exists()
+        leftovers = [p.name for p in switcher.backup_dir.iterdir()
+                     if p.name.endswith(".tmp")]
+        assert leftovers == []
+
+    def test_an_import_is_refused_before_any_account_is_written(
+        self, temp_home, sample_sequence_data, stale_build
+    ):
+        """Asserts: an import raises StaleBuildWriteError before its first
+        write, so ``sequence.json`` keeps its bytes (no half-import)."""
+        from claude_swap import transfer
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.sequence_file.write_text(json.dumps(sample_sequence_data))
+        roster = switcher.sequence_file.read_bytes()
+        with pytest.raises(StaleBuildWriteError):
+            transfer._import_accounts_locked(switcher, {}, [], False)
+        assert switcher.sequence_file.read_bytes() == roster

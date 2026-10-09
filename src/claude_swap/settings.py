@@ -26,6 +26,7 @@ from pathlib import Path
 from claude_swap import oauth
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import replace_with_retry, write_all
+from claude_swap.locking import check_loaded_build_is_installed
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -738,6 +739,10 @@ def atomic_write_json(path: Path, data: dict) -> None:
       ours to chmod. The written file still gets 0600, set on the fd before
       the publish, so the secret is never exposed at any point.
     """
+    # THE BUILD CHECK BEFORE THE FIRST TOUCH (X3697). `replace_with_retry`
+    # checks again at the publish; this one stops a stale-build process
+    # before it creates the directory or writes settings.json's `.prev`.
+    check_loaded_build_is_installed(path)
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
     if path.name == SETTINGS_FILENAME:

@@ -1,8 +1,10 @@
-"""Filesystem primitives with no claude_swap dependencies.
+"""Filesystem primitives whose one claude_swap dependency is ``locking``.
 
-Deliberately a leaf module: the atomic-write helpers here are needed by
+Deliberately near the leaf: the atomic-write helpers here are needed by
 settings, credentials, mappings and session, which sit on both sides of
-the paths/models/usage_store import cycle.
+the paths/models/usage_store import cycle. ``locking`` imports only
+``exceptions``, so importing it here closes no cycle; it supplies the build
+check every publish through :func:`replace_with_retry` makes (X3697).
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import os
 import sys
 import time
 from pathlib import Path
+
+from claude_swap.locking import check_loaded_build_is_installed
 
 # Windows error codes that usually mean "someone else has the file open right
 # now": ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
@@ -106,6 +110,15 @@ def replace_with_retry(
     """
     if attempts < 1:
         raise ValueError("attempts must be >= 1")
+    # THE PUBLISH IS WHERE THE BUILD IS CHECKED (X3697). Every caller renames
+    # a temp onto a file another cswap process reads or writes (the stored
+    # and live credentials, `sequence.json`, `.migrations.json`, the
+    # settings, the usage store, the engine state, the mappings, the session
+    # manifests, the model cache, an import), so a process whose loaded build
+    # is no longer the installed one raises `StaleBuildWriteError` here and
+    # `dst` keeps its bytes. `src` is left to the caller's own cleanup, which
+    # every caller already runs for a failed replace.
+    check_loaded_build_is_installed(Path(dst))
     delay = initial_delay
     for attempt in range(attempts):
         try:

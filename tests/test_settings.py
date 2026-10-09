@@ -333,6 +333,34 @@ class TestSettingSpecs:
             assert spec.default == getattr(sources[spec.section], spec.field)
 
 
+class TestAStaleBuildWritesNoSettings:
+    """X3697: settings.json is written by `cswap config`, `cswap auto`, the
+    menu bar and the owner proxy, so a process whose loaded build is no
+    longer the installed one writes none of it."""
+
+    def test_set_setting_and_save_settings_are_refused(
+        self, tmp_path: Path, stale_build
+    ):
+        """Asserts: both settings writers raise StaleBuildWriteError, the
+        file keeps its bytes, and no ``.prev`` copy is written either."""
+        from claude_swap.locking import StaleBuildWriteError
+
+        path = settings_path(tmp_path)
+        path.write_text(json.dumps({"schemaVersion": 1,
+                                    "autoswitch": {"threshold": 80.0}}))
+        before = path.read_bytes()
+        with pytest.raises(StaleBuildWriteError):
+            set_setting(tmp_path, "autoswitch.threshold", "90")
+        with pytest.raises(StaleBuildWriteError):
+            save_settings(tmp_path, AutoSwitchSettings(threshold=70.0))
+        assert path.read_bytes() == before
+        assert not path.with_name(path.name + ".prev").exists()
+
+    def test_the_installed_build_still_writes(self, tmp_path: Path):
+        """Asserts: the process's own build writes settings as before."""
+        assert set_setting(tmp_path, "autoswitch.threshold", "90") == 90.0
+
+
 class TestSetUnsetSetting:
     def test_set_writes_minimal_file(self, tmp_path: Path):
         value = set_setting(tmp_path, "autoswitch.threshold", "80")

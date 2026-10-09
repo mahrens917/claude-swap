@@ -12831,6 +12831,8 @@ class TestAddAccountRefusesASplicedIdentity:
         # `add_account` holds the account store lock around its body; the
         # autouse `_isolate_real_home` fixture gives each test its own home.
         sw.lock_file = pathlib.Path.home() / ".claude-swap-backup" / ".lock"
+        # The store directory the build check (X3697) names in a refusal.
+        sw.backup_dir = sw.lock_file.parent
         sw._setup_directories = lambda: None
         sw._init_sequence_file = lambda: None
         sw._migrate_org_fields = lambda: None
@@ -12932,6 +12934,8 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         # `add_account` holds the account store lock around its body; the
         # autouse `_isolate_real_home` fixture gives each test its own home.
         sw.lock_file = pathlib.Path.home() / ".claude-swap-backup" / ".lock"
+        # The store directory the build check (X3697) names in a refusal.
+        sw.backup_dir = sw.lock_file.parent
         sw._setup_directories = lambda: None
         sw._init_sequence_file = lambda: None
         sw._migrate_org_fields = lambda: None

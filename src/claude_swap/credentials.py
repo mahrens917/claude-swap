@@ -38,6 +38,7 @@ from claude_swap.exceptions import (
     CredentialWriteError,
 )
 from claude_swap.fsutil import replace_with_retry, write_all
+from claude_swap.locking import check_loaded_build_is_installed
 from claude_swap.models import Platform, get_timestamp
 from claude_swap.paths import (
     get_claude_config_home,
@@ -47,6 +48,11 @@ from claude_swap.paths import (
 )
 
 _logger = logging.getLogger("claude-swap")
+
+
+def _keychain_target(service: str, username: str) -> str:
+    """How the build check names a Keychain item it refuses to write."""
+    return f"the macOS Keychain item {service!r} ({username})"
 
 
 def _active_profile_is_default() -> bool:
@@ -454,7 +460,14 @@ class CredentialStore:
 
         Do NOT route ``item_exists`` through here: it returns ``False`` for both
         "absent" and "failed", so a timeout would be misread as a usable Keychain.
+
+        A ``set_password`` or ``delete_password`` is a write to an item every
+        cswap process shares, so it is refused from a process whose loaded
+        build is no longer the installed one (X3697); the refusal is not a
+        Keychain failure and leaves the usability cache alone.
         """
+        if fn is macos_keychain.set_password or fn is macos_keychain.delete_password:
+            check_loaded_build_is_installed(_keychain_target(args[0], args[1]))
         try:
             result = fn(*args)
         except macos_keychain.KEYCHAIN_ERRORS:
@@ -1089,6 +1102,11 @@ class CredentialStore:
         """
         if self._host.platform != Platform.MACOS:
             return True
+        # OUTSIDE the swallowing `try` below, so a stale-build refusal
+        # (X3697) raises instead of reading as a down Keychain.
+        check_loaded_build_is_installed(
+            _keychain_target(CLAUDE_CODE_KEYCHAIN_SERVICE,
+                             macos_keychain.keychain_account_name()))
         # THE SAME SET THE READ WALKS. `_read_active_oauth_keychain` iterates
         # `_active_oauth_keychain_services()`; deleting only the unsuffixed
         # service left the item a custom profile actually uses in place, and
@@ -1123,6 +1141,9 @@ class CredentialStore:
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
+        # BEFORE EITHER AXIS IS TOUCHED (X3697): a refusal after the OAuth
+        # write but before the managed-key clear would leave both live.
+        check_loaded_build_is_installed(get_credentials_path())
         if looks_like_api_key(credentials):
             self._write_managed_credentials(credentials.strip())
         else:
@@ -1229,6 +1250,9 @@ class CredentialStore:
         token while it lies, and a caller must be able to tell "nothing to
         clear" from "could not check".
         """
+        # OUTSIDE the swallowing `try` below (X3697): a stale-build refusal
+        # raises before the Keychain item or `~/.claude.json` is touched.
+        check_loaded_build_is_installed(get_global_config_path())
         cleared = True
         if self._host.platform == Platform.MACOS:
             try:
@@ -1272,8 +1296,10 @@ class CredentialStore:
         Returns the Keychain half's own verdict — see
         :meth:`_delete_active_keychain_entry` for why a caller needs it.
         """
-        cleared = self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
+        # BEFORE the Keychain half (X3697): the unlink below is a write too.
+        check_loaded_build_is_installed(cred_file)
+        cleared = self._delete_active_keychain_entry()
         try:
             if cred_file.exists():
                 cred_file.unlink()
@@ -1670,7 +1696,11 @@ class CredentialStore:
         )
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
-        """Best-effort backup Keychain delete (never raises)."""
+        """Stored-slot Keychain delete that logs a Keychain failure; it raises only
+        the stale-build refusal (X3697), which is not a Keychain failure."""
+        check_loaded_build_is_installed(
+            _keychain_target(SECURITY_SERVICE,
+                             self._backup_username(account_num, email)))
         try:
             self._kc_delete_backup(account_num, email)
         except Exception as e:
@@ -1734,6 +1764,8 @@ class CredentialStore:
         enc_file = self._backup_enc_path(account_num, email)
         if not enc_file.exists():
             return
+        # The unlink is a write; its `except` below must not see a refusal.
+        check_loaded_build_is_installed(enc_file)
         try:
             enc_file.unlink()
             return
@@ -2238,6 +2270,9 @@ class CredentialStore:
         a /login.
         """
         self._check_attribution(account_num, email, credentials, attributed)
+        # BEFORE the `.prev` retention (X3697), whose failures are logged and
+        # passed over, so a stale build writes neither generation.
+        check_loaded_build_is_installed(self._backup_enc_path(account_num, email))
         retained = self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:
@@ -2272,6 +2307,9 @@ class CredentialStore:
         overwrites it via ``-U``; purge sweeps it). Includes the legacy
         ``account-None-{email}`` alias.
         """
+        # BEFORE the logged-and-passed deletes below (X3697): a stale build
+        # deletes nothing, rather than having each refusal logged away.
+        check_loaded_build_is_installed(self._backup_enc_path(account_num, email))
         nums = [account_num]
         if str(account_num) != "None":
             nums.append("None")
@@ -2351,6 +2389,8 @@ class CredentialStore:
         the key's new owner.
         """
         prev_file = self._prev_backup_path(account_num, email)
+        # Outside the logged-and-passed `try` blocks below (X3697).
+        check_loaded_build_is_installed(prev_file)
         try:
             if prev_file.exists():
                 prev_file.unlink()
@@ -2626,8 +2666,10 @@ class CredentialStore:
     def _write_stash_manifest(self, entries: dict) -> None:
         from claude_swap.settings import atomic_write_json
 
-        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         path = self._stash_manifest_path()
+        # BEFORE the corrupt-manifest rename below (X3697), which is a write.
+        check_loaded_build_is_installed(path)
+        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         # A corrupt manifest read as {} must not be silently clobbered — the
         # rows are classification evidence. Set it aside (the entry *bytes*
         # are separate files and keep being listed as orphans either way).
@@ -2791,6 +2833,8 @@ class CredentialStore:
 
     def _remove_unclaimed_credential(self, entry_id: str) -> None:
         """Delete a stash entry (bytes + manifest row) after it was adopted."""
+        # Outside the `try` below, which logs and passes an OSError (X3697).
+        check_loaded_build_is_installed(self._stash_manifest_path())
         try:
             self._stash_entry_path(entry_id).unlink(missing_ok=True)
         except OSError as e:
