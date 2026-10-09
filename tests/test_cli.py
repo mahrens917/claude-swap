@@ -1450,6 +1450,7 @@ class TestAutoCommand:
             reading["spend"] = {
                 "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
                 "currency": "USD", "limit_reached": False, "reported": "dollars",
+                "remaining_basis": "limit",
             }
         entry = UsageEntry(last_good=reading, fetched_at=0.0, age_s=0.0)
 

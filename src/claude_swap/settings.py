@@ -21,6 +21,7 @@ import os
 import secrets
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth
@@ -513,6 +514,197 @@ def credit_cap_rows(data_root: Path) -> list[tuple[str, float]]:
     return [(credit_cap_key(email), float(value)) for email, value in section.items()]
 
 
+# PER-ACCOUNT ENTERED USAGE-CREDIT BALANCES, in US dollars (X3711). The
+# monthly spend limit (``creditCaps``, or the usage endpoint's own limit) is
+# room, not money: the purchased balance can run out first, and no reply or
+# endpoint reports it. The operator enters it with ``cswap config set
+# creditBalances.<email> <dollars>``, and the entry records the account's
+# dollars used against its limit at that moment (``usedAtEntry``) and the
+# limit's next monthly reset then (``resetsAtEntry``, null when the reading
+# named none), so the usage store can take what was spent since
+# (``usage_store.balance_spend``). Stored as ``{"creditBalances":
+# {"a@x.com": {"usd": 70, "enteredAt": "2026-10-09T14:03:00Z",
+# "usedAtEntry": 12.5, "resetsAtEntry": "2026-11-01T00:00:00Z"}}}``.
+CREDIT_BALANCES_SECTION = "creditBalances"
+
+
+@dataclass(frozen=True)
+class CreditBalance:
+    """One account's entered balance: ``usd`` entered at ``entered_at``
+    (ISO-8601 UTC) when ``used_at_entry`` dollars of the monthly limit were
+    used and the limit's next reset was ``resets_at_entry`` (ISO-8601, or
+    None when the reading named no reset)."""
+
+    usd: float
+    entered_at: str
+    used_at_entry: float
+    resets_at_entry: str | None
+
+    def to_json(self) -> dict:
+        return {
+            "usd": self.usd,
+            "enteredAt": self.entered_at,
+            "usedAtEntry": self.used_at_entry,
+            "resetsAtEntry": self.resets_at_entry,
+        }
+
+
+def credit_balance_key(email: str) -> str:
+    """The `cswap config` key of ``email``'s entered usage-credit balance."""
+    return f"{CREDIT_BALANCES_SECTION}.{email}"
+
+
+def credit_balance_email(dotted_key: str) -> str | None:
+    """The account email a ``creditBalances.<email>`` key names, None for
+    any other key. A key with no email after the dot raises ``ConfigError``."""
+    prefix = f"{CREDIT_BALANCES_SECTION}."
+    if not dotted_key.startswith(prefix):
+        return None
+    email = dotted_key[len(prefix):]
+    if "@" not in email:
+        raise ConfigError(
+            f"{dotted_key}: name the account's email after '{prefix}', e.g. "
+            f"{credit_balance_key('a@example.com')}"
+        )
+    return email
+
+
+def _non_negative_dollars(where: str, value: object) -> float:
+    """A finite number of US dollars at or above zero, else ConfigError
+    naming ``where``. A balance of zero is a real entry: the money is gone."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ConfigError(f"{where} is not a non-negative number of US dollars")
+    return float(value)
+
+
+def iso_epoch(value: str) -> float:
+    """Epoch seconds of an ISO-8601 time that names its zone. Raises
+    ValueError for text that does not parse or names no zone (a zone-less
+    time would be read in this machine's zone and move with it)."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"{value!r} names no time zone")
+    return parsed.timestamp()
+
+
+def iso_utc(epoch: float) -> str:
+    """``epoch`` as ISO-8601 UTC to the second, ``2026-10-09T14:03:00Z``."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _iso_time(where: str, value: object) -> str:
+    """An ISO-8601 time string naming its zone, else ConfigError naming
+    ``where``."""
+    if not isinstance(value, str):
+        raise ConfigError(f"{where} is not an ISO-8601 time string")
+    try:
+        iso_epoch(value)
+    except ValueError:
+        raise ConfigError(
+            f"{where} is not an ISO-8601 time with a zone: {value!r}"
+        ) from None
+    return value
+
+
+def parse_credit_balance(dotted_key: str, raw_value: str) -> float:
+    """Strictly parse `cswap config set creditBalances.<email> VALUE`."""
+    try:
+        value = float(raw_value)
+    except ValueError:
+        raise ConfigError(
+            f"{dotted_key} expects a non-negative number of US dollars, got "
+            f"'{raw_value}'"
+        ) from None
+    return _non_negative_dollars(f"{dotted_key} = {raw_value!r}", value)
+
+
+def _credit_balance_entry(where: str, value: object) -> CreditBalance:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} is {value!r}, not a JSON object")
+    for key in ("usd", "enteredAt", "usedAtEntry", "resetsAtEntry"):
+        if key not in value:
+            raise ConfigError(f"{where} has no {key}")
+    resets = value["resetsAtEntry"]
+    return CreditBalance(
+        usd=_non_negative_dollars(f"{where}.usd", value["usd"]),
+        entered_at=_iso_time(f"{where}.enteredAt", value["enteredAt"]),
+        used_at_entry=_non_negative_dollars(
+            f"{where}.usedAtEntry", value["usedAtEntry"]
+        ),
+        resets_at_entry=(
+            _iso_time(f"{where}.resetsAtEntry", resets) if resets is not None else None
+        ),
+    )
+
+
+def load_credit_balances(data_root: Path) -> dict[str, CreditBalance]:
+    """The entered balances, keyed by lower-cased account email. A missing
+    file or section reads as none entered; a malformed entry, or two emails
+    equal but for case, raises ``ConfigError`` naming the file and the key."""
+    path = settings_path(data_root)
+    section = _section(path, _read_raw(path), CREDIT_BALANCES_SECTION)
+    balances: dict[str, CreditBalance] = {}
+    for email, value in section.items():
+        key = credit_balance_key(email)
+        entry = _credit_balance_entry(f"{path}: {key}", value)
+        if email.lower() in balances:
+            raise ConfigError(
+                f"{path}: {key} names an account another "
+                f"{CREDIT_BALANCES_SECTION} key already names (emails compare "
+                "without case)"
+            )
+        balances[email.lower()] = entry
+    return balances
+
+
+def set_credit_balance(data_root: Path, email: str, balance: CreditBalance) -> None:
+    """Write ``email``'s entered balance (already parsed, with its reading
+    recorded by the caller), replacing any earlier entry for it. The entry
+    is checked as the loader checks it before anything is written, so a
+    reading whose reset time names no zone is refused here, not on every
+    later read."""
+    path = settings_path(data_root)
+    _credit_balance_entry(credit_balance_key(email), balance.to_json())
+    raw = _read_raw(path, for_write=True)
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    section = _section(path, raw, CREDIT_BALANCES_SECTION)
+    for stored in [k for k in section if k.lower() == email.lower()]:
+        del section[stored]
+    section[email] = balance.to_json()
+    raw[CREDIT_BALANCES_SECTION] = section
+    atomic_write_json(path, raw)
+
+
+def _unset_credit_balance(data_root: Path, email: str) -> bool:
+    path = settings_path(data_root)
+    raw = _read_raw(path, for_write=True)
+    section = _section(path, raw, CREDIT_BALANCES_SECTION)
+    if email not in section:
+        return False
+    raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
+    del section[email]
+    if not section:
+        del raw[CREDIT_BALANCES_SECTION]
+    atomic_write_json(path, raw)
+    return True
+
+
+def credit_balance_rows(data_root: Path) -> list[tuple[str, CreditBalance]]:
+    """(``creditBalances.<email>`` key, entry) per entered balance, as stored."""
+    path = settings_path(data_root)
+    section = _section(path, _read_raw(path), CREDIT_BALANCES_SECTION)
+    load_credit_balances(data_root)  # every entry checked before any is shown
+    return [
+        (credit_balance_key(email), _credit_balance_entry(credit_balance_key(email), value))
+        for email, value in section.items()
+    ]
+
+
 def setting_spec(dotted_key: str) -> SettingSpec:
     """Look up a spec by dotted key; unknown keys raise with the valid list."""
     spec = SETTING_SPECS.get(dotted_key)
@@ -598,6 +790,15 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     email = credit_cap_email(dotted_key)
     if email is not None:
         return _set_credit_cap(backup_root, dotted_key, email, raw_value)
+    if credit_balance_email(dotted_key) is not None:
+        # The entry records the account's current reading with it, which
+        # only the switcher can read (`ClaudeAccountSwitcher.
+        # set_credit_balance`); a value written without it would compute a
+        # wrong figure.
+        raise ConfigError(
+            f"{dotted_key} is written with the account's current reading; "
+            "set it through `cswap config set`"
+        )
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
@@ -615,6 +816,9 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     email = credit_cap_email(dotted_key)
     if email is not None:
         return _unset_credit_cap(backup_root, email)
+    email = credit_balance_email(dotted_key)
+    if email is not None:
+        return _unset_credit_balance(backup_root, email)
     spec = setting_spec(dotted_key)
     path = settings_path(backup_root)
     raw = _read_raw(path, for_write=True)

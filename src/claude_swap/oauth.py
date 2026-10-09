@@ -844,6 +844,15 @@ SPEND_REPORTED_FRACTION = "fraction"
 # dollars spend from the usage endpoint has no ``cap_source`` key: the
 # endpoint's own figures need no source note.
 CAP_SOURCE_CONFIG = "config"
+# What a ``dollars`` spend's ``remaining`` measures, in its
+# ``remaining_basis`` key (X3711). ``limit``: room under the monthly spend
+# limit (``limit - used``, None with no limit), which is not money: the
+# purchased balance can run out first. ``balance``: money left, from the
+# balance the operator entered (``creditBalances`` in settings.json,
+# ``usage_store.balance_spend``) less what was spent since, never above the
+# limit room. A ``fraction`` spend has no basis: its ``remaining`` is None.
+REMAINING_BASIS_LIMIT = "limit"
+REMAINING_BASIS_BALANCE = "balance"
 
 
 def _spend_entry(eu: dict) -> dict | None:
@@ -883,6 +892,7 @@ def _spend_entry(eu: dict) -> dict | None:
         "used": used,
         "limit": limit,
         "remaining": limit - used if limit is not None else None,
+        "remaining_basis": REMAINING_BASIS_LIMIT,
         "pct": pct,
         "currency": currency,
         "limit_reached": limit_reached,
@@ -898,15 +908,20 @@ class UsageCreditRoom:
     """Usage-credit money an account can still spend past its full windows.
 
     ``reported`` is the spend's measurement kind (``SPEND_REPORTED_*``).
-    For ``dollars``, ``remaining`` is dollars left under the monthly cap, or
-    None when the account has no cap (unlimited). For ``fraction`` (a
+    For ``dollars``, ``remaining`` is the spend's own ``remaining`` whatever
+    its ``remaining_basis`` (money left from an entered balance, else room
+    under the monthly limit: the best figure the account has), or None when
+    the account has no cap and no entered balance (unlimited). For ``fraction`` (a
     setup-token account read off its reply headers), ``remaining`` is None
     and ``cap_used_pct`` is the share of the cap used, None when the reply
-    carried no utilization figure.
+    carried no utilization figure. ``remaining_basis`` is the spend's
+    ``REMAINING_BASIS_*`` for ``dollars`` (what ``remaining`` measures, for
+    the words), None for ``fraction``.
     """
 
     reported: str
     remaining: float | None
+    remaining_basis: str | None
     cap_used_pct: float | None = None
 
     def rank_key(self) -> tuple[int, int, float]:
@@ -943,12 +958,19 @@ def usage_credit_room(usage: dict | None) -> UsageCreditRoom | None:
     reported = spend["reported"]
     if reported == SPEND_REPORTED_FRACTION:
         return UsageCreditRoom(
-            reported=reported, remaining=None, cap_used_pct=spend["pct"]
+            reported=reported,
+            remaining=None,
+            remaining_basis=None,
+            cap_used_pct=spend["pct"],
         )
     remaining = spend["remaining"]
     if remaining is not None and remaining <= 0:
         return None
-    return UsageCreditRoom(reported=reported, remaining=remaining)
+    return UsageCreditRoom(
+        reported=reported,
+        remaining=remaining,
+        remaining_basis=spend["remaining_basis"],
+    )
 
 
 def entry_credit_room(entry) -> UsageCreditRoom | None:

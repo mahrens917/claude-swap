@@ -49,7 +49,7 @@ def capped_spend(used: float, limit: float, pct: float, **extra) -> dict:
     """A capped usage-credit ``spend`` figure in ``oauth.build_usage_result``'s
     shape, ``remaining`` derived the way the parser derives it."""
     return {"used": used, "limit": limit, "remaining": limit - used, "pct": pct,
-            "currency": "USD", "limit_reached": False, "reported": "dollars", **extra}
+            "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit", **extra}
 
 
 def make_entry(
@@ -733,7 +733,7 @@ class TestUsageRows:
         entry = make_entry(spend=capped_spend(12.5, 50.0, 25.0))
         rows = usage_rows(entry.last_good, time.time())
         assert rows[0][0] == "$$"
-        assert "$37.50 left of $50.00" in rows[0][2]
+        assert "$37.50 of $50 limit unused" in rows[0][2]
 
     def test_suffix_full_extends_countdown_with_clock(self):
         from claude_swap.tui.widgets import usage_rows
@@ -753,14 +753,14 @@ class TestUsageRows:
                 "remaining": 37.5,
                 "pct": 25.0,
                 "currency": "USD",
-                "limit_reached": False, "reported": "dollars",
+                "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
                 "resets_at": _iso_in(7200),
             }
         )
         spend = usage_rows(entry.last_good, time.time())[0]
         assert spend[0] == "$$"
         assert " · " in spend[3]
-        assert spend[3].index(" · ") < spend[3].index("$37.50 left of $50.00")
+        assert spend[3].index(" · ") < spend[3].index("$37.50 of $50 limit unused")
 
     def test_uncapped_spend_row_has_no_percent_and_names_no_cap(self):
         """Asserts: an uncapped account's spend row carries a None percent
@@ -769,7 +769,7 @@ class TestUsageRows:
         from claude_swap.tui.widgets import usage_rows
 
         spend = {"used": 8.11, "limit": None, "remaining": None, "pct": None,
-                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
+                 "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit"}
         row = usage_rows({"spend": spend}, time.time())[0]
         assert row == ("$$", None, "$8.11 used, no cap", "$8.11 used, no cap")
 
@@ -1091,7 +1091,7 @@ class TestMiniAccountText:
             f"a spend-only account still reads as unknown: {out!r}"
         )
         assert "51%" in out, out
-        assert "$9.71 left of $20.00" in out, out
+        assert "$9.71 of $20 limit unused" in out, out
         pct_span = next(s for s in text.spans if out[s.start : s.end] == "51%")
         assert ("dim" in str(pct_span.style)) == expect_dim, (
             f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
@@ -2576,7 +2576,7 @@ class TestAutoScreen:
         }))
         spend = {
             "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
-            "currency": "USD", "limit_reached": False, "reported": "dollars",
+            "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
         } if with_credits else None
         ticks: list = []
         real_card = widgets.account_card_text
@@ -3466,7 +3466,7 @@ class TestUnswitchableRowsAreListed:
             **usage,
             "spend": {
                 "used": 50.0, "limit": 100.0, "remaining": 50.0, "pct": 50.0,
-                "currency": "USD", "limit_reached": False, "reported": "dollars",
+                "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
             },
         }
 
@@ -3612,7 +3612,7 @@ class TestUnswitchableRowsAreListed:
         assert "usage unknown" not in out, (
             f"a spend-only account still reads as unknown: {out!r}"
         )
-        assert "$9.71 left of $20.00" in out, out
+        assert "$9.71 of $20 limit unused" in out, out
         assert "51%" in out, out
 
     def test_a_spend_only_candidates_reset_agrees_with_the_dashboard(self):
@@ -3870,7 +3870,7 @@ class TestUnswitchableRowsAreListed:
         hot = {"five_hour": {"pct": 98.0}, "seven_day": {"pct": 10.0}}
         spend = {
             "used": 1.0, "limit": 21.0, "remaining": 20.0, "pct": 4.76,
-            "currency": "USD", "limit_reached": False, "reported": "dollars",
+            "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
         }
         snap = self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=hot),
@@ -4666,7 +4666,7 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1")
         assert "$$" in out, out
-        assert "$37.50 left of $50.00" in out, out
+        assert "$37.50 of $50 limit unused" in out, out
         assert "reset unknown" not in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(

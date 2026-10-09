@@ -163,8 +163,10 @@ def usage_rows(
             suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
         # pct is None for an uncapped account (no cap to be a share of) and
         # for a header-measured spend whose reply sent no utilization; every
-        # renderer of this row branches on it. A header-measured (fraction)
-        # spend's words come from spend_amounts too: "credits on, 0% of cap
+        # renderer of this row branches on it. Every spend's words come from
+        # spend_amounts: "$70.00 left (balance)" for money left from an
+        # entered balance, "$200.00 of $200 limit unused" for limit room,
+        # and for a header-measured (fraction) spend "credits on, 0% of cap
         # used" or "credits on, out of credits".
         pct = float(spend["pct"]) if spend["pct"] is not None else None
         rows.append((SPEND_LABEL, pct, suffix, suffix_full))

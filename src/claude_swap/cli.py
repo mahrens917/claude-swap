@@ -1035,6 +1035,20 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _config_value_text(value: object) -> str:
+    """A `cswap config` value in words: an entered credit balance (its JSON
+    object, X3711) reads ``70 (entered 2026-10-09T14:03:00Z, $12.50 of the
+    limit used then)``; any other value as settings.json writes it."""
+    from claude_swap.settings import format_setting_value
+
+    if isinstance(value, dict):
+        return (
+            f"{format_setting_value(value['usd'])} (entered {value['enteredAt']}, "
+            f"${value['usedAtEntry']:,.2f} of the limit used then)"
+        )
+    return format_setting_value(value)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -1046,9 +1060,13 @@ def _config_command(argv: list[str]) -> None:
     """
     from claude_swap.settings import (
         SETTING_SPECS,
+        CreditBalance,
+        credit_balance_email,
+        credit_balance_rows,
         credit_cap_email,
         credit_cap_rows,
         effective_settings,
+        load_credit_balances,
         format_setting_value,
         load_credit_caps,
         set_setting,
@@ -1073,6 +1091,10 @@ Keys:
 {key_lines}
   creditCaps.<email>                A setup-token account's monthly usage-credit cap in
                                     US dollars, so its credits read in dollars (no default)
+  creditBalances.<email>            The account's purchased usage-credit balance in US
+                                    dollars, entered now: the account's current reading is
+                                    recorded with it, so money left is the balance less
+                                    what was spent since (no default)
 
 Examples:
   cswap config                              # list effective settings
@@ -1133,7 +1155,10 @@ Examples:
             listed = [
                 (spec.dotted, value, is_set)
                 for spec, value, is_set in effective_settings(root)
-            ] + [(key, cap, True) for key, cap in credit_cap_rows(root)]
+            ] + [(key, cap, True) for key, cap in credit_cap_rows(root)] + [
+                (key, balance.to_json(), True)
+                for key, balance in credit_balance_rows(root)
+            ]
             if json_mode:
                 payload = {
                     "schemaVersion": 1,
@@ -1146,9 +1171,9 @@ Examples:
                 print(json.dumps(payload, indent=2))
             else:
                 key_w = max(len(key) for key, _, _ in listed)
-                val_w = max(len(format_setting_value(v)) for _, v, _ in listed)
+                val_w = max(len(_config_value_text(v)) for _, v, _ in listed)
                 for key, value, is_set in listed:
-                    line = f"{key:<{key_w}}  {format_setting_value(value):<{val_w}}"
+                    line = f"{key:<{key_w}}  {_config_value_text(value):<{val_w}}"
                     print(line if is_set else f"{line}  {dimmed('(default)')}")
         elif action == "get" and credit_cap_email(args.key) is not None:
             email = credit_cap_email(args.key)
@@ -1163,6 +1188,20 @@ Examples:
                 print(json.dumps(payload, indent=2))
             else:
                 print(format_setting_value(value))
+        elif action == "get" and credit_balance_email(args.key) is not None:
+            email = credit_balance_email(args.key)
+            balance = load_credit_balances(root).get(email.lower())
+            balance_json = balance.to_json() if balance is not None else None
+            if json_mode:
+                payload = {
+                    "schemaVersion": 1,
+                    "key": args.key,
+                    "value": balance_json,
+                    "isSet": balance is not None,
+                }
+                print(json.dumps(payload, indent=2))
+            else:
+                print(_config_value_text(balance_json))
         elif action == "get":
             spec = setting_spec(args.key)
             value, is_set = next(
@@ -1178,6 +1217,9 @@ Examples:
                 print(json.dumps(payload, indent=2))
             else:
                 print(format_setting_value(value))
+        elif action == "set" and credit_balance_email(args.key) is not None:
+            balance: CreditBalance = switcher.set_credit_balance(args.key, args.value)
+            print(f"{args.key} = {_config_value_text(balance.to_json())}")
         elif action == "set":
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
@@ -1185,6 +1227,8 @@ Examples:
             if unset_setting(root, args.key):
                 if credit_cap_email(args.key) is not None:
                     print(f"{args.key} unset (no cap configured)")
+                elif credit_balance_email(args.key) is not None:
+                    print(f"{args.key} unset (no balance entered)")
                 else:
                     default = setting_spec(args.key).default
                     print(f"{args.key} unset (default: {format_setting_value(default)})")

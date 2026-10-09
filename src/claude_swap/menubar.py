@@ -318,13 +318,12 @@ def usage_summary(
             parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict):
-        if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
-            # A setup-token account's share of its cap, read off its reply
-            # headers: in words ("credits on, 0% of cap used"), so a refused
-            # or unknown share is not shown as a dollar-cap percent.
-            parts.append(f"$ {spend_amounts(spend)}")
-        elif isinstance(spend.get("pct"), (int, float)):
-            parts.append(f"$ {spend['pct']:.0f}%")
+        # Every spend in the shared words (X3711): "$70.00 left (balance)"
+        # for money left from an entered balance, "$200.00 of $200 limit
+        # unused" for room under the limit (not money), and for a
+        # setup-token account's header share "credits on, 0% of cap used",
+        # so limit room is never shown as money or as a bare percent.
+        parts.append(f"$ {spend_amounts(spend)}")
     return " · ".join(parts) if parts else "usage unavailable"
 
 

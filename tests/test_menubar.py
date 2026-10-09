@@ -112,10 +112,18 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     assert s.show_account_name is False
 
 
+def _limit_spend(pct: float = 30.0, used: float = 3.0, limit: float = 10.0) -> dict:
+    """A usage-endpoint dollars spend with no entered balance: remaining
+    is room under the limit."""
+    return {"reported": "dollars", "pct": pct, "used": used, "limit": limit,
+            "remaining": limit - used, "remaining_basis": "limit",
+            "currency": "USD", "limit_reached": False}
+
+
 _USAGE = {
     "five_hour": {"pct": 42.0},
     "seven_day": {"pct": 18.0},
-    "spend": {"reported": "dollars", "pct":30.0, "used": 3.0, "limit": 10.0},
+    "spend": _limit_spend(),
 }
 
 
@@ -132,7 +140,23 @@ def test_tightest_pct_none_for_non_dict_or_empty():
 
 
 def test_usage_summary_dict():
-    assert menubar.usage_summary(_USAGE) == "5h 42% · 7d 18% · $ 30%"
+    """Asserts: a dollars spend with no entered balance reads as room under
+    the limit in the shared words, never as a bare percent."""
+    assert menubar.usage_summary(_USAGE) == (
+        "5h 42% · 7d 18% · $ $7.00 of $10 limit unused"
+    )
+
+
+def test_usage_summary_shows_an_entered_balance_as_money_left():
+    """Asserts: a spend on the balance basis reads as money left, labelled
+    as the balance (X3711)."""
+    spend = {**_limit_spend(15.0, 30.0, 200.0), "remaining": 70.0,
+             "remaining_basis": "balance",
+             "balance_entered_at": "2026-10-09T14:03:00Z"}
+    usage = {"five_hour": {"pct": 5.0}, "spend": spend}
+    assert menubar.usage_summary(usage) == "5h 5% · $ $70.00 left (balance)"
+    limit_room = {"five_hour": {"pct": 5.0}, "spend": _limit_spend(0.0, 0.0, 200.0)}
+    assert menubar.usage_summary(limit_room) == "5h 5% · $ $200.00 of $200 limit unused"
 
 
 @pytest.mark.parametrize("spend, words", [
@@ -164,9 +188,11 @@ def test_usage_summary_includes_scoped_model_limits():
         "five_hour": {"pct": 82.0},
         "seven_day": {"pct": 12.0},
         "scoped": [{"name": "Fable", "pct": 4.0}],
-        "spend": {"reported": "dollars", "pct":30.0},
+        "spend": _limit_spend(),
     }
-    assert menubar.usage_summary(usage) == "5h 82% · 7d 12% · Fable 4% · $ 30%"
+    assert menubar.usage_summary(usage) == (
+        "5h 82% · 7d 12% · Fable 4% · $ $7.00 of $10 limit unused"
+    )
 
 
 def test_usage_summary_scoped_over_limit_marker():
@@ -246,17 +272,17 @@ def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
 
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login ?"
 
 
 def test_format_account_label_with_alias():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
-    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login ?"
 
 
 def test_format_account_label_disabled_marker():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login ?"
 
 
 def test_format_account_label_login_expiry():
@@ -264,12 +290,12 @@ def test_format_account_label_login_expiry():
     label = menubar.format_account_label(
         2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400 + 4 * 3600
     )
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login 23d04h"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login 23d04h"
 
 
 def test_format_account_label_login_expiry_unknown():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, login_expires_at=None)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login ?"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login ?"
 
 
 def test_format_account_label_login_expiry_quarantined():
@@ -277,7 +303,7 @@ def test_format_account_label_login_expiry_quarantined():
     label = menubar.format_account_label(
         2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 999_999, quarantined=True
     )
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · login needed"
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ $7.00 of $10 limit unused · login needed"
 
 
 def test_format_account_label_usage_unavailable_still_carries_login_token():
@@ -447,9 +473,11 @@ def test_usage_summary_live_countdown_from_resets_at():
     usage = {
         "five_hour": {"pct": 42.0, "resets_at": _iso(2 * 3600 + 33 * 60)},
         "seven_day": {"pct": 18.0, "resets_at": _iso(86400 + 19 * 3600)},
-        "spend": {"reported": "dollars", "pct":30.0},
+        "spend": _limit_spend(),
     }
-    assert menubar.usage_summary(usage, _NOW) == "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ 30%"
+    assert menubar.usage_summary(usage, _NOW) == (
+        "5h 42% (2h 33m) · 7d 18% (1d 19h) · $ $7.00 of $10 limit unused"
+    )
 
 
 def test_usage_summary_omits_countdown_when_passed_or_missing():

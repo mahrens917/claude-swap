@@ -363,7 +363,7 @@ class TestFetchUsage:
 
     def test_extra_usage_real_sample_reads_money_left(self):
         """Asserts: the measured response shape (60000 cents cap, 811 used)
-        reads as $591.89 left of $600.00, cap not reached."""
+        reads as $591.89 of room under the $600 limit, cap not reached."""
         result = oauth.build_usage_result({
             "five_hour": {"utilization": 100.0, "resets_at": None},
             "extra_usage": {
@@ -377,7 +377,8 @@ class TestFetchUsage:
         assert result["spend"]["limit"] == 600.0
         assert result["spend"]["remaining"] == pytest.approx(591.89)
         assert oauth.usage_credit_room(result) == oauth.UsageCreditRoom(
-            reported="dollars", remaining=pytest.approx(591.89)
+            reported="dollars", remaining=pytest.approx(591.89),
+            remaining_basis="limit",
         )
 
     def test_extra_usage_unlimited_keeps_spend_with_no_cap(self):
@@ -402,11 +403,14 @@ class TestFetchUsage:
         assert result["spend"] == {
             "used": 8.11, "limit": None, "remaining": None, "pct": None,
             "currency": "USD", "limit_reached": False, "reported": "dollars",
+            "remaining_basis": "limit",
         }
         room = oauth.usage_credit_room(result)
-        assert room == oauth.UsageCreditRoom(reported="dollars", remaining=None)
+        assert room == oauth.UsageCreditRoom(
+            reported="dollars", remaining=None, remaining_basis="limit"
+        )
         assert room.rank_key() > oauth.UsageCreditRoom(
-            reported="dollars", remaining=1e9
+            reported="dollars", remaining=1e9, remaining_basis="limit"
         ).rank_key()
 
     def test_extra_usage_limit_reached_has_no_credit_room(self):
@@ -447,10 +451,10 @@ class TestFetchUsage:
         """Asserts: a header-measured spend the reply allowed is room,
         carrying its share of the cap used (None when unknown)."""
         assert oauth.usage_credit_room(self._fraction(0.0)) == oauth.UsageCreditRoom(
-            reported="fraction", remaining=None, cap_used_pct=0.0
+            reported="fraction", remaining=None, remaining_basis=None, cap_used_pct=0.0
         )
         assert oauth.usage_credit_room(self._fraction(None)) == oauth.UsageCreditRoom(
-            reported="fraction", remaining=None, cap_used_pct=None
+            reported="fraction", remaining=None, remaining_basis=None, cap_used_pct=None
         )
 
     def test_a_refused_fraction_spend_is_no_room(self):
@@ -465,12 +469,15 @@ class TestFetchUsage:
         the cap unused ranks higher, an unknown share last."""
         room = oauth.UsageCreditRoom
         ordered = [
-            room(reported="fraction", remaining=None, cap_used_pct=None),
-            room(reported="fraction", remaining=None, cap_used_pct=90.0),
-            room(reported="fraction", remaining=None, cap_used_pct=0.0),
-            room(reported="dollars", remaining=0.01),
-            room(reported="dollars", remaining=500.0),
-            room(reported="dollars", remaining=None),
+            room(reported="fraction", remaining=None, remaining_basis=None,
+                 cap_used_pct=None),
+            room(reported="fraction", remaining=None, remaining_basis=None,
+                 cap_used_pct=90.0),
+            room(reported="fraction", remaining=None, remaining_basis=None,
+                 cap_used_pct=0.0),
+            room(reported="dollars", remaining=0.01, remaining_basis="limit"),
+            room(reported="dollars", remaining=500.0, remaining_basis="balance"),
+            room(reported="dollars", remaining=None, remaining_basis="limit"),
         ]
         keys = [r.rank_key() for r in ordered]
         assert keys == sorted(keys)

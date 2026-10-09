@@ -32,6 +32,7 @@ def _spend(remaining: float | None, *, used: float = 8.11, reached: bool = False
         "currency": "USD",
         "limit_reached": reached,
         "reported": "dollars",
+        "remaining_basis": "limit",
     }
 
 
@@ -79,7 +80,7 @@ class TestRotationOntoUsageCredits:
         assert h.active_number() == 2
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "usage-credits"
-        assert switch.detail == "$591.89 left"
+        assert switch.detail == "$591.89 of limit unused"
         credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
         assert credits.account["number"] == 2
         assert credits.room.remaining == 591.89
@@ -90,8 +91,35 @@ class TestRotationOntoUsageCredits:
         lines = _warnings(caplog, _CREDITS_LINE)
         assert lines == [
             "Every account's usage windows are full; sessions run on "
-            "Account-2 usage credits ($591.89 left), switching to it"
+            "Account-2 usage credits ($591.89 of limit unused), switching to it"
         ], lines
+        assert credits.to_json()["remainingBasis"] == "limit"
+
+    def test_an_entered_balance_reads_as_money_left_in_the_event_and_warning(
+        self, temp_home, caplog
+    ):
+        """Asserts: when the account the sessions move onto has an entered
+        balance (remaining_basis balance), the switch detail, the
+        spending-usage-credits event and its WARNING read ``$70.00 left
+        (balance)``, and the event's JSON names the basis."""
+        h = _harness(temp_home)
+        balance = {**_spend(591.89), "remaining": 70.0,
+                   "remaining_basis": "balance",
+                   "balance_entered_at": "2026-10-09T14:03:00Z"}
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = h.tick_with_usage({
+                "1": _full(), "2": _full(balance), "3": _full(),
+            })
+        assert outcome is TickOutcome.SWITCHED, h.kinds()
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.detail == "$70.00 left (balance)"
+        credits = next(e for e in h.events if isinstance(e, SpendingUsageCreditsEvent))
+        assert credits.to_json()["remainingBasis"] == "balance"
+        assert "($70.00 left (balance))" in credits.human()
+        assert _warnings(caplog, _CREDITS_LINE) == [
+            "Every account's usage windows are full; sessions run on "
+            "Account-2 usage credits ($70.00 left (balance)), switching to it"
+        ]
 
     def test_an_uncapped_account_outranks_any_finite_amount(self, temp_home):
         """Asserts: when the active has no credits, the peer with no monthly
@@ -136,7 +164,7 @@ class TestStayingOnTheActivesCredits:
         assert credits.account["number"] == 1
         assert _warnings(caplog, _CREDITS_LINE) == [
             "Every account's usage windows are full; sessions run on "
-            "Account-1 usage credits ($20.00 left)"
+            "Account-1 usage credits ($20.00 of limit unused)"
         ]
 
     def test_the_warning_fires_once_per_credit_account_not_every_tick(
@@ -213,7 +241,7 @@ class TestUnusedCreditsDetector:
         assert any(isinstance(e, AllExhaustedEvent) for e in h.events)
         assert _warnings(caplog, _DETECTOR_LINE) == [
             "All accounts exhausted while Account-3 holds usage-credit room "
-            "($42.00 left) the rotation did not use"
+            "($42.00 of limit unused) the rotation did not use"
         ]
 
     def test_a_disabled_credit_account_is_the_users_choice_not_a_fault(
@@ -232,15 +260,26 @@ class TestUnusedCreditsDetector:
 
 
 class TestMoneyLeftRow:
-    def test_capped_row_shows_money_left(self):
-        """Asserts: a capped account's `$$` row reads the dollars left of
-        the cap, percent first."""
+    def test_capped_row_shows_room_under_the_limit(self):
+        """Asserts: a capped account with no entered balance reads its
+        `$$` row as room under the limit, never as money left, percent
+        first."""
         spend = {"used": 8.11, "limit": 600.0, "remaining": 591.89, "pct": 1.35,
-                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
-        assert spend_row_body(spend) == "  1%   $591.89 left of $600.00"
+                 "currency": "USD", "limit_reached": False, "reported": "dollars",
+                 "remaining_basis": "limit"}
+        assert spend_row_body(spend) == "  1%   $591.89 of $600 limit unused"
         assert _format_usage_lines({"spend": spend}) == [
-            "$$:   1%   $591.89 left of $600.00"
+            "$$:   1%   $591.89 of $600 limit unused"
         ]
+
+    def test_balance_row_shows_money_left_as_balance(self):
+        """Asserts: an account with an entered balance reads its `$$` row
+        as money left, labelled as the balance."""
+        spend = {"used": 8.11, "limit": 600.0, "remaining": 70.0, "pct": 1.35,
+                 "currency": "USD", "limit_reached": False, "reported": "dollars",
+                 "remaining_basis": "balance",
+                 "balance_entered_at": "2026-10-09T14:03:00Z"}
+        assert spend_row_body(spend) == "  1%   $70.00 left (balance)"
 
     def test_uncapped_row_shows_used_and_no_cap(self):
         """Asserts: an uncapped account shows what it used and that no cap
@@ -250,7 +289,8 @@ class TestMoneyLeftRow:
     def test_reached_row_names_the_cap(self):
         """Asserts: a reached cap reads as such, naming the cap."""
         spend = {"used": 600.0, "limit": 600.0, "remaining": 0.0, "pct": 100.0,
-                 "currency": "USD", "limit_reached": True, "reported": "dollars"}
+                 "currency": "USD", "limit_reached": True, "reported": "dollars",
+                 "remaining_basis": "limit"}
         assert spend_row_body(spend) == "100%   cap reached ($600.00)"
 
     def test_poll_line_prints_an_uncapped_credit_account(self):
@@ -289,8 +329,8 @@ class TestConfiguredCapsRankInDollars:
 
     def test_the_larger_dollar_remainder_wins(self, tmp_path):
         """Asserts: two accounts each half through their credits rank by
-        dollars: $250 left of a $500 cap beats $100 left of a $200 cap,
-        and the switch detail reads the dollars."""
+        dollars: $250 unused of a $500 cap beats $100 unused of a $200 cap,
+        and the switch detail reads the dollars as room under the limit."""
         from claude_swap.autoswitch import _credit_money, _usage_credit_pick
 
         entries = self._entries(
@@ -302,7 +342,7 @@ class TestConfiguredCapsRankInDollars:
         assert number == "3"
         assert room.reported == "dollars"
         assert room.remaining == pytest.approx(250.0)
-        assert _credit_money(room) == "$250.00 left"
+        assert _credit_money(room) == "$250.00 of limit unused"
 
     def test_without_caps_the_shares_tie(self, tmp_path):
         """Asserts: the same two readings with no cap configured stay
@@ -315,21 +355,25 @@ class TestConfiguredCapsRankInDollars:
         assert room.reported == "fraction"
         assert number == "2"
 
-    def test_the_configured_cap_row_names_the_cap_as_yours(self):
-        """Asserts: dollars computed from the configured cap read ``left of
-        your $500 cap``; a reached one ``cap reached (your $500 cap)``."""
+    def test_the_configured_cap_row_names_limit_room_and_out_of_credits(self):
+        """Asserts: dollars computed from the configured cap with no
+        entered balance read ``$500.00 of $500 limit unused`` (room, not
+        money); a reply saying out of credits reads ``out of credits`` even
+        with the whole limit unused; a reached cap and any other refusal
+        are named."""
         spend = {"used": 0.0, "limit": 500.0, "remaining": 500.0, "pct": 0.0,
                  "currency": "USD", "limit_reached": False, "reported": "dollars",
+                 "remaining_basis": "limit",
                  "cap_source": "config", "disabled_reason": None}
-        assert spend_row_body(spend) == "  0%   $500.00 left of your $500 cap"
+        assert spend_row_body(spend) == "  0%   $500.00 of $500 limit unused"
+        out = {**spend, "limit_reached": True, "disabled_reason": "out_of_credits"}
+        assert spend_row_body(out) == "  0%   out of credits"
         reached = {**spend, "used": 500.0, "remaining": 0.0, "pct": 100.0,
-                   "limit_reached": True, "disabled_reason": "out_of_credits"}
-        assert spend_row_body(reached) == "100%   cap reached (your $500 cap)"
+                   "limit_reached": True}
+        assert spend_row_body(reached) == "100%   cap reached ($500.00)"
         refused = {**spend, "limit_reached": True,
                    "disabled_reason": "org_level_disabled"}
-        assert spend_row_body(refused) == (
-            "  0%   credits refused (org_level_disabled), your $500 cap"
-        )
+        assert spend_row_body(refused) == "  0%   credits refused (org_level_disabled)"
 
 
 _LOST_ROOM_LINE = "lost its usage-credit room"

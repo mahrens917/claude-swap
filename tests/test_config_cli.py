@@ -359,3 +359,92 @@ class TestConfigCreditCaps:
         code, out, err = _run(["set", "creditCaps.nobody", "500"], capsys)
         assert code == 1
         assert "name the account's email" in out + err
+
+
+def _setup_token_account_with_reading(email: str, share: str) -> None:
+    """Add ``email`` as a setup-token account in slot 2 and record a reply
+    whose overage headers say credits are allowed at ``share`` of the cap."""
+    from claude_swap import usage_store
+    from claude_swap.models import Platform
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    switcher = ClaudeAccountSwitcher()
+    switcher.platform = Platform.LINUX
+    switcher._setup_directories()
+    switcher._init_sequence_file()
+    switcher.add_account_from_token("sk-ant-oat01-x", email, slot=2)
+    assert switcher.record_usage_headers("2", {
+        usage_store.USAGE_HEADER_5H_PCT: "0.3",
+        usage_store.USAGE_HEADER_7D_PCT: "0.4",
+        usage_store.USAGE_HEADER_OVERAGE_STATUS: "allowed",
+        usage_store.USAGE_HEADER_OVERAGE_PCT: share,
+    }) is True
+
+
+class TestConfigCreditBalances:
+    """`creditBalances.<email>`: the account's purchased usage-credit
+    balance, entered with the account's current reading (X3711)."""
+
+    def test_set_records_the_reading_then_get_list_and_unset(self, temp_home, capsys):
+        """Asserts: with a $200 cap at 10% used ($20), `set
+        creditBalances.<email> 70` stores {usd 70, enteredAt, usedAtEntry
+        20, resetsAtEntry null}; get and list read it back (text and JSON);
+        unset removes it and the empty section."""
+        email = "support@lucidnews.org"
+        _setup_token_account_with_reading(email, "0.1")
+        assert _run(["set", f"creditCaps.{email}", "200"], capsys)[0] == 0
+        key = f"creditBalances.{email}"
+        code, out, err = _run(["set", key, "70"], capsys)
+        assert code == 0, out + err
+        assert f"{key} = 70 (entered " in out
+        assert "$20.00 of the limit used then" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        entry = raw["creditBalances"][email]
+        assert entry["usd"] == 70.0
+        assert entry["usedAtEntry"] == pytest.approx(20.0)
+        assert entry["resetsAtEntry"] is None
+        assert entry["enteredAt"].endswith("Z")
+        code, out, _ = _run(["get", key, "--json"], capsys)
+        assert json.loads(out) == {
+            "schemaVersion": 1, "key": key, "value": entry, "isSet": True,
+        }
+        code, out, _ = _run(["get", key], capsys)
+        assert out.startswith("70 (entered ")
+        code, out, _ = _run([], capsys)
+        assert any(key in ln and "70 (entered" in ln for ln in out.splitlines())
+        code, out, _ = _run(["--json"], capsys)
+        by_key = {e["key"]: e for e in json.loads(out)["settings"]}
+        assert by_key[key]["value"] == entry
+        code, out, _ = _run(["unset", key], capsys)
+        assert code == 0
+        assert "no balance entered" in out
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert "creditBalances" not in raw
+
+    def test_set_with_no_dollar_reading_is_refused_naming_the_account(
+        self, temp_home, capsys
+    ):
+        """Asserts: a setup-token account with no cap has no dollar reading,
+        so entering its balance exits 1 naming the account and writes
+        nothing."""
+        email = "mahrens9175@gmail.com"
+        _setup_token_account_with_reading(email, "0.0")
+        code, out, err = _run(["set", f"creditBalances.{email}", "70"], capsys)
+        assert code == 1
+        assert email in out + err
+        assert not _settings_file(capsys).exists()
+
+    @pytest.mark.parametrize("value", ["-5", "abc", "inf", "nan"])
+    def test_a_balance_must_be_a_non_negative_number(self, temp_home, capsys, value):
+        """Asserts: negative, non-numeric and non-finite balances are refused
+        naming the key, and nothing is written."""
+        key = "creditBalances.a@example.com"
+        code, out, err = _run(["set", key, value], capsys)
+        assert code == 1
+        assert key in out + err
+        assert not _settings_file(capsys).exists()
+
+    def test_get_unset_balance_reads_none(self, temp_home, capsys):
+        """Asserts: an email with no balance reads `(none)`."""
+        code, out, _ = _run(["get", "creditBalances.a@example.com"], capsys)
+        assert (code, out.strip()) == (0, "(none)")

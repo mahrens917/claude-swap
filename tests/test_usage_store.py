@@ -1674,6 +1674,7 @@ _OUT_OF_CREDITS_HEADERS = {
 _DOLLAR_SPEND = {
     "reported": "dollars", "used": 8.11, "limit": 600.0, "remaining": 591.89,
     "pct": 1.35, "currency": "USD", "limit_reached": False,
+    "remaining_basis": "limit",
 }
 
 
@@ -1701,7 +1702,7 @@ class TestHeaderOverageSpend:
         }
         room = oauth.entry_credit_room(store.entries(IDENT)["1"])
         assert room == oauth.UsageCreditRoom(
-            reported="fraction", remaining=None, cap_used_pct=0.0
+            reported="fraction", remaining=None, remaining_basis=None, cap_used_pct=0.0
         )
 
     def test_out_of_credits_records_a_reached_fraction_spend(self, store, clock):
@@ -1894,7 +1895,7 @@ class TestHeaderOverageSpend:
         assert entries["2"].last_good == header_only_good
         assert entries["2"].fetched_at == clock.now
         assert oauth.entry_credit_room(entries["1"]) == oauth.UsageCreditRoom(
-            reported="dollars", remaining=591.89
+            reported="dollars", remaining=591.89, remaining_basis="limit"
         )
 
     def test_a_version_2_file_is_still_read_as_empty(self, tmp_path, clock):
@@ -2239,7 +2240,8 @@ class TestConfiguredCreditCap:
         assert spend["cap_source"] == oauth.CAP_SOURCE_CONFIG
         room = oauth.entry_credit_room(store.entries(IDENT)["1"])
         assert room == oauth.UsageCreditRoom(
-            reported="dollars", remaining=pytest.approx(450.0)
+            reported="dollars", remaining=pytest.approx(450.0),
+            remaining_basis="limit",
         )
 
     def test_the_stored_reading_stays_a_fraction(self, store):
@@ -2332,6 +2334,180 @@ class TestConfiguredCreditCap:
         )
         with pytest.raises(ConfigError, match=r"creditCaps\.a@x\.com"):
             store.entries(IDENT)
+
+
+def _balance(
+    usd: float, used_at_entry: float, resets_at_entry: str | None = None
+) -> settings.CreditBalance:
+    return settings.CreditBalance(
+        usd=usd,
+        entered_at="2026-10-09T14:03:00Z",
+        used_at_entry=used_at_entry,
+        resets_at_entry=resets_at_entry,
+    )
+
+
+def _endpoint_spend(used: float, limit: float | None = 600.0) -> dict:
+    return {
+        "reported": "dollars", "used": used, "limit": limit,
+        "remaining": None if limit is None else limit - used,
+        "remaining_basis": "limit", "pct": None, "currency": "USD",
+        "limit_reached": False,
+    }
+
+
+@pytest.fixture
+def fresh_balance_notes(monkeypatch):
+    monkeypatch.setattr(usage_store, "_noted_month_resets", set())
+    monkeypatch.setattr(usage_store, "_warned_balance_overspent", set())
+
+
+@pytest.mark.usefixtures("fresh_balance_notes")
+class TestEnteredCreditBalance:
+    """X3711: the monthly limit is room, not money; an entered balance less
+    the spend since entry is the money left, never above the limit room."""
+
+    def test_no_balance_is_limit_room_recomputed_on_read(self):
+        """Asserts: with no balance entered, remaining is limit - used on
+        the ``limit`` basis whatever the stored figure said, and None with
+        no limit."""
+        stored = {**_endpoint_spend(30.0), "remaining": 999.0}
+        out = usage_store.balance_spend("a@x.com", stored, None, 0.0)
+        assert out["remaining"] == 570.0
+        assert out["remaining_basis"] == "limit"
+        assert "balance_entered_at" not in out
+        uncapped = usage_store.balance_spend(
+            "a@x.com", _endpoint_spend(30.0, limit=None), None, 0.0
+        )
+        assert uncapped["remaining"] is None
+
+    def test_spend_since_entry_comes_off_the_balance(self):
+        """Asserts: $70 entered at $10 used, now $30 used: $50 left on the
+        ``balance`` basis, with the entry time carried."""
+        out = usage_store.balance_spend(
+            "a@x.com", _endpoint_spend(30.0), _balance(70.0, 10.0), 0.0
+        )
+        assert out["remaining"] == pytest.approx(50.0)
+        assert out["remaining_basis"] == "balance"
+        assert out["balance_entered_at"] == "2026-10-09T14:03:00Z"
+
+    def test_the_limit_room_bounds_the_balance(self):
+        """Asserts: $100 entered at $585 used of a $600 limit, now $590
+        used: the balance leaves $95 but the limit only $10, so $10."""
+        out = usage_store.balance_spend(
+            "a@x.com", _endpoint_spend(590.0), _balance(100.0, 585.0), 0.0
+        )
+        assert out["remaining"] == pytest.approx(10.0)
+
+    def test_a_balance_with_no_limit_is_the_balance_alone(self):
+        """Asserts: an account with no monthly limit and a balance entered
+        reads the balance less the spend since entry."""
+        out = usage_store.balance_spend(
+            "a@x.com", _endpoint_spend(30.0, limit=None), _balance(70.0, 10.0), 0.0
+        )
+        assert out["remaining"] == pytest.approx(50.0)
+
+    def test_a_reached_limit_leaves_nothing(self):
+        """Asserts: the endpoint's limit-reached verdict reads remaining 0
+        on the balance basis even with balance left."""
+        spend = {**_endpoint_spend(30.0), "limit_reached": True}
+        out = usage_store.balance_spend("a@x.com", spend, _balance(70.0, 10.0), 0.0)
+        assert out["remaining"] == 0.0
+
+    def test_a_used_figure_below_the_entry_is_the_month_reset(self, caplog):
+        """Asserts: $70 entered at $30 used, now $5 used (the limit reset
+        for the month): spend since entry is $5, $65 left, and ONE INFO line
+        notes the reset across repeated reads."""
+        balance = _balance(70.0, 30.0)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            for _ in range(3):
+                out = usage_store.balance_spend(
+                    "a@x.com", _endpoint_spend(5.0), balance, 0.0
+                )
+        assert out["remaining"] == pytest.approx(65.0)
+        notes = [r for r in caplog.records if "limit reset since" in r.getMessage()]
+        assert len(notes) == 1
+        assert notes[0].levelno == logging.INFO
+        assert "a@x.com" in notes[0].getMessage()
+
+    def test_the_clock_past_the_recorded_reset_is_the_month_reset(self):
+        """Asserts: with the clock past the reset recorded at entry, the
+        new month's used figure is the spend since entry even once it climbs
+        above the figure recorded then: $70 at $30 used, now $40 used, $30
+        left (not the $60 a same-month reading would give)."""
+        balance = _balance(70.0, 30.0, resets_at_entry="2026-11-01T00:00:00Z")
+        after = settings.iso_epoch("2026-11-01T00:00:01Z")
+        out = usage_store.balance_spend("a@x.com", _endpoint_spend(40.0), balance, after)
+        assert out["remaining"] == pytest.approx(30.0)
+        before = settings.iso_epoch("2026-10-31T23:59:59Z")
+        same = usage_store.balance_spend("a@x.com", _endpoint_spend(40.0), balance, before)
+        assert same["remaining"] == pytest.approx(60.0)
+
+    def test_an_overspent_balance_is_named_at_warning_once(self, caplog):
+        """Asserts: $10 entered at $0, now $30 used with the credits still
+        allowed: remaining floors at 0 and one WARNING names the account and
+        the -$20.00 figure, once across repeated reads."""
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            for _ in range(2):
+                out = usage_store.balance_spend(
+                    "a@x.com", _endpoint_spend(30.0), _balance(10.0, 0.0), 0.0
+                )
+        assert out["remaining"] == 0.0
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "below zero" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "a@x.com" in warnings[0].getMessage()
+        assert "$-20.00" in warnings[0].getMessage()
+
+    def test_out_of_credits_reads_zero_with_no_warning(self, store, caplog):
+        """Asserts: a capped setup-token account whose reply says
+        out_of_credits (0% of its $200 limit used) with a $70 balance entered
+        reads remaining 0 on the balance basis and raises no overspent
+        WARNING (the venue itself said the money is gone)."""
+        headers = {
+            **_fraction_headers("0.0", status="rejected"),
+            usage_store.USAGE_HEADER_OVERAGE_DISABLED_REASON: "out_of_credits",
+        }
+        store.record_header_reading("1", IDENT, headers, header_only=True)
+        _set_cap(store, "a@x.com", "200")
+        settings.set_credit_balance(store._settings_root, "a@x.com", _balance(70.0, 0.0))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["remaining"] == 0.0
+        assert spend["remaining_basis"] == "balance"
+        assert not [r for r in caplog.records if "below zero" in r.getMessage()]
+
+    def test_the_store_applies_the_balance_to_a_capped_share(self, store):
+        """Asserts: a $200 cap at 15% used ($30) with $70 entered at $10
+        used reads $50 left through ``entries``; unsetting the balance
+        returns the $170 limit room on the next read."""
+        store.record_header_reading(
+            "1", IDENT, _fraction_headers("0.15"), header_only=True
+        )
+        _set_cap(store, "a@x.com", "200")
+        settings.set_credit_balance(store._settings_root, "a@x.com", _balance(70.0, 10.0))
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["remaining"] == pytest.approx(50.0)
+        assert spend["remaining_basis"] == "balance"
+        settings.unset_setting(store._settings_root, "creditBalances.a@x.com")
+        spend = store.entries(IDENT)["1"].last_good["spend"]
+        assert spend["remaining"] == pytest.approx(170.0)
+        assert spend["remaining_basis"] == "limit"
+
+    def test_the_credit_room_ranks_by_the_balance_figure(self, store):
+        """Asserts: the credit rotation's room for a balance-basis account
+        is the balance figure (the best one available)."""
+        store.record(
+            {"1": FetchRecord(usage={**USAGE, "spend": _endpoint_spend(30.0)})}, IDENT
+        )
+        settings.set_credit_balance(store._settings_root, "a@x.com", _balance(70.0, 10.0))
+        room = oauth.entry_credit_room(store.entries(IDENT)["1"])
+        assert room == oauth.UsageCreditRoom(
+            reported="dollars", remaining=pytest.approx(50.0),
+            remaining_basis="balance",
+        )
 
 
 class TestLast429Marker:

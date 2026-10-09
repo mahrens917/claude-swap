@@ -127,6 +127,14 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         }
         if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
             spend_out["disabledReason"] = spend["disabled_reason"]
+            # A fraction spend's remaining is null, so it measures nothing.
+            spend_out["remainingBasis"] = None
+        else:
+            # What remaining measures (X3711): money left from an entered
+            # balance, or room under the monthly limit.
+            spend_out["remainingBasis"] = spend["remaining_basis"]
+            if spend["remaining_basis"] == oauth.REMAINING_BASIS_BALANCE:
+                spend_out["balanceEnteredAt"] = spend["balance_entered_at"]
         if "cap_source" in spend:
             # Dollars computed from the configured cap (X3696), not the API.
             spend_out["capSource"] = spend["cap_source"]
@@ -176,7 +184,10 @@ def _spend_from_json(spend: object) -> dict:
     ``limit`` and ``remaining`` are null together for an account with no
     monthly cap and numbers otherwise, and ``remaining`` must equal
     ``limit - used`` so an edited document cannot claim money the cap does
-    not leave. ``pct`` is null when the API sent no utilization (always so
+    not leave. That holds for ``remainingBasis: limit``; for ``balance``
+    (money left from an entered balance) ``remaining`` is a non-negative
+    number not above ``limit - used`` and ``balanceEnteredAt`` names the
+    entry. ``pct`` is null when the API sent no utilization (always so
     for an uncapped account). ``reported`` names the measurement:
     ``dollars`` (the usage endpoint) or ``fraction`` (a setup-token
     account's reply headers, see :func:`_fraction_spend_from_json`).
@@ -198,18 +209,37 @@ def _spend_from_json(spend: object) -> dict:
         if key not in spend:
             raise ValueError(f"spend.{key} is missing (null means no cap or no figure)")
     limit, remaining, pct = spend["limit"], spend["remaining"], spend["pct"]
-    if limit is None:
-        if remaining is not None:
-            raise ValueError("spend.remaining must be null when spend.limit is null")
-    else:
-        for key, value in (("limit", limit), ("remaining", remaining)):
-            if not _is_number(value):
-                raise ValueError(f"spend.{key} must be a number when spend.limit is set")
+    basis = _remaining_basis_from_json(spend)
+    if limit is not None:
+        if not _is_number(limit):
+            raise ValueError("spend.limit must be a number or null")
         if limit < 0:
             raise ValueError("spend.limit must be non-negative")
-        if not math.isclose(remaining, limit - used, abs_tol=0.005):
+    if basis == oauth.REMAINING_BASIS_LIMIT:
+        if limit is None:
+            if remaining is not None:
+                raise ValueError("spend.remaining must be null when spend.limit is null")
+        elif not _is_number(remaining):
+            raise ValueError("spend.remaining must be a number when spend.limit is set")
+        elif not math.isclose(remaining, limit - used, abs_tol=0.005):
             raise ValueError(
                 f"spend.remaining {remaining!r} is not spend.limit - spend.used"
+            )
+    else:
+        # Money left from an entered balance: never negative, never above
+        # the room the limit leaves.
+        if not _is_number(remaining) or remaining < 0:
+            raise ValueError(
+                "spend.remaining must be a non-negative number for a balance basis"
+            )
+        if limit is not None and remaining > max(0.0, limit - used) + 0.005:
+            raise ValueError(
+                f"spend.remaining {remaining!r} is above spend.limit - spend.used"
+            )
+        entered_at = spend.get("balanceEnteredAt")
+        if not isinstance(entered_at, str):
+            raise ValueError(
+                "spend.balanceEnteredAt must be a string for a balance basis"
             )
     if pct is not None and (not _is_number(pct) or pct < 0):
         raise ValueError("spend.pct must be a non-negative number or null")
@@ -222,10 +252,13 @@ def _spend_from_json(spend: object) -> dict:
         "used": float(used),
         "limit": float(limit) if limit is not None else None,
         "remaining": float(remaining) if remaining is not None else None,
+        "remaining_basis": basis,
         "pct": float(pct) if pct is not None else None,
         "currency": spend["currency"],
         "limit_reached": spend["limitReached"],
     }
+    if basis == oauth.REMAINING_BASIS_BALANCE:
+        out["balance_entered_at"] = spend["balanceEnteredAt"]
     if "capSource" in spend:
         if spend["capSource"] != oauth.CAP_SOURCE_CONFIG:
             raise ValueError(
@@ -238,6 +271,19 @@ def _spend_from_json(spend: object) -> dict:
         out["disabled_reason"] = _disabled_reason_from_json(spend)
     _spend_reset_from_json(spend, out)
     return out
+
+
+def _remaining_basis_from_json(spend: dict) -> str:
+    """A dollars spend's ``remainingBasis``: ``limit`` or ``balance``."""
+    if "remainingBasis" not in spend:
+        raise ValueError("spend.remainingBasis is missing")
+    basis = spend["remainingBasis"]
+    if basis not in (oauth.REMAINING_BASIS_LIMIT, oauth.REMAINING_BASIS_BALANCE):
+        raise ValueError(
+            f"spend.remainingBasis must be {oauth.REMAINING_BASIS_LIMIT!r} or "
+            f"{oauth.REMAINING_BASIS_BALANCE!r} for a dollars spend, not {basis!r}"
+        )
+    return basis
 
 
 def _disabled_reason_from_json(spend: dict) -> str | None:
@@ -257,7 +303,7 @@ def _fraction_spend_from_json(spend: dict) -> dict:
     ``pct`` is the share used (null when the reply sent none) and
     ``disabledReason`` the reply's reason credits are off, or null.
     """
-    for key in ("used", "limit", "remaining", "currency"):
+    for key in ("used", "limit", "remaining", "remainingBasis", "currency"):
         if key not in spend or spend[key] is not None:
             raise ValueError(f"spend.{key} must be null for a fraction spend")
     if "pct" not in spend:

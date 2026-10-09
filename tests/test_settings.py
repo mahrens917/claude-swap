@@ -687,6 +687,7 @@ def _credit_entry(*, remaining: float | None = 50.0, reached: bool = False,
         "currency": "USD",
         "limit_reached": reached,
         "reported": "dollars",
+        "remaining_basis": "limit",
     }
     return UsageEntry(
         sentinel=sentinel,
@@ -724,3 +725,75 @@ class TestAccountSwitchPoint:
         still switches at threshold, the rule before X3587."""
         s = AutoSwitchSettings(threshold=99.0)
         assert account_switch_point(s, _credit_entry()) == 99.0
+
+
+class TestCreditBalances:
+    """`creditBalances.<email>`: an entered balance stored with the reading
+    it was entered at (X3711)."""
+
+    ENTRY = {
+        "usd": 70.0, "enteredAt": "2026-10-09T14:03:00Z",
+        "usedAtEntry": 12.5, "resetsAtEntry": "2026-11-01T00:00:00Z",
+    }
+
+    def test_a_written_entry_loads_back_by_lower_cased_email(self, tmp_path: Path):
+        """Asserts: `set_credit_balance` writes the four fields under the
+        email as given and `load_credit_balances` reads them back keyed by
+        the lower-cased email; a second entry replaces the first."""
+        from claude_swap.settings import (
+            CreditBalance,
+            load_credit_balances,
+            set_credit_balance,
+        )
+
+        first = CreditBalance(70.0, "2026-10-09T14:03:00Z", 12.5, "2026-11-01T00:00:00Z")
+        set_credit_balance(tmp_path, "A@x.com", first)
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["creditBalances"] == {"A@x.com": self.ENTRY}
+        assert load_credit_balances(tmp_path) == {"a@x.com": first}
+        second = CreditBalance(40.0, "2026-10-10T09:00:00Z", 20.0, None)
+        set_credit_balance(tmp_path, "a@x.com", second)
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert list(raw["creditBalances"]) == ["a@x.com"]
+        assert load_credit_balances(tmp_path) == {"a@x.com": second}
+
+    @pytest.mark.parametrize("entry", [
+        70,
+        {"usd": 70.0, "enteredAt": "2026-10-09T14:03:00Z", "usedAtEntry": 12.5},
+        {"usd": -1.0, "enteredAt": "2026-10-09T14:03:00Z", "usedAtEntry": 0.0,
+         "resetsAtEntry": None},
+        {"usd": 70.0, "enteredAt": "yesterday", "usedAtEntry": 0.0,
+         "resetsAtEntry": None},
+        {"usd": 70.0, "enteredAt": "2026-10-09T14:03:00", "usedAtEntry": 0.0,
+         "resetsAtEntry": None},
+        {"usd": 70.0, "enteredAt": "2026-10-09T14:03:00Z", "usedAtEntry": True,
+         "resetsAtEntry": None},
+    ])
+    def test_a_malformed_entry_raises_naming_the_key(self, tmp_path: Path, entry):
+        """Asserts: an entry that is not an object, lacks a field, holds a
+        negative or non-number figure, or a time that does not parse or
+        names no zone raises ConfigError naming `creditBalances.<email>`."""
+        from claude_swap.settings import load_credit_balances
+
+        settings_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+        settings_path(tmp_path).write_text(
+            json.dumps({"creditBalances": {"a@x.com": entry}}), encoding="utf-8"
+        )
+        with pytest.raises(ConfigError, match=r"creditBalances\.a@x\.com"):
+            load_credit_balances(tmp_path)
+
+    def test_set_setting_refuses_a_balance_without_its_reading(self, tmp_path: Path):
+        """Asserts: the generic `set_setting` refuses a creditBalances key
+        (its reading is recorded only through the switcher), writing
+        nothing; `unset_setting` removes an entry and the empty section."""
+        from claude_swap.settings import CreditBalance, set_credit_balance
+
+        with pytest.raises(ConfigError, match="current reading"):
+            set_setting(tmp_path, "creditBalances.a@x.com", "70")
+        assert not settings_path(tmp_path).exists()
+        set_credit_balance(
+            tmp_path, "a@x.com", CreditBalance(70.0, "2026-10-09T14:03:00Z", 0.0, None)
+        )
+        assert unset_setting(tmp_path, "creditBalances.a@x.com") is True
+        assert "creditBalances" not in json.loads(settings_path(tmp_path).read_text())
+        assert unset_setting(tmp_path, "creditBalances.a@x.com") is False

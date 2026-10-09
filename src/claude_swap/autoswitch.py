@@ -1086,8 +1086,9 @@ class SpendingUsageCreditsEvent(AutoSwitchEvent):
 
     ``account`` (an ``_ref`` shape) is the account the sessions run on from
     this tick, ``room`` its usage-credit room (``oauth.UsageCreditRoom``:
-    dollars left under the monthly cap, None for no cap, or for a
-    setup-token account the share of the cap used), and ``switched``
+    money left from an entered balance or room under the monthly limit, per
+    ``remainingBasis``, None for no cap, or for a setup-token account the
+    share of the cap used), and ``switched``
     whether the engine moved onto it this tick rather than staying on the
     active."""
 
@@ -1101,6 +1102,7 @@ class SpendingUsageCreditsEvent(AutoSwitchEvent):
             "account": self.account,
             "reported": self.room.reported,
             "remaining": self.room.remaining,
+            "remainingBasis": self.room.remaining_basis,
             "capUsedPct": self.room.cap_used_pct,
             "switched": self.switched,
         }
@@ -1619,16 +1621,21 @@ def _usage_credit_pick(
 
 
 def _credit_money(room: oauth.UsageCreditRoom) -> str:
-    """The room in words, for the switch detail and the WARNING line:
-    dollars left, ``no cap``, or for a header-measured (setup-token) account
-    the share of its cap used, which is all its replies report."""
+    """The room in words, for the switch detail and the WARNING line, by
+    what ``remaining`` measures (X3711): ``$70.00 left (balance)`` for money
+    left from an entered balance, ``$200.00 of limit unused`` for room under
+    the monthly limit (not money), ``no cap`` with neither, or for a
+    header-measured (setup-token) account the share of its cap used, which
+    is all its replies report."""
     if room.reported == oauth.SPEND_REPORTED_FRACTION:
         if room.cap_used_pct is None:
             return "credits on, share of cap used unknown"
         return f"credits on, {room.cap_used_pct:.0f}% of cap used"
     if room.remaining is None:
         return "no cap"
-    return f"${room.remaining:,.2f} left"
+    if room.remaining_basis == oauth.REMAINING_BASIS_BALANCE:
+        return f"${room.remaining:,.2f} left (balance)"
+    return f"${room.remaining:,.2f} of limit unused"
 
 
 def _headroom_by_account(

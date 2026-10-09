@@ -108,9 +108,14 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances, scan_sessions
 from claude_swap import poll_policy
 from claude_swap.settings import (
+    CreditBalance,
     account_switch_point,
+    credit_balance_email,
+    iso_utc,
     load_settings,
+    parse_credit_balance,
     parse_model_names,
+    set_credit_balance,
     settings_path,
 )
 from claude_swap.usage_store import (
@@ -221,35 +226,37 @@ def spend_row_body(spend: dict) -> str:
 
 def spend_amounts(spend: dict) -> str:
     """The money words of a ``spend`` figure, shared by ``cswap list`` and
-    the dashboard: ``$591.89 left of $600.00``, ``$8.11 used, no cap``
-    (``limit`` None), or ``cap reached ($600.00)``. A ``fraction`` spend
-    (reply headers, no money figures) reads ``credits on, 0% of cap used``,
-    ``credits on, out of credits``, or the reply's own disabled reason."""
+    the dashboard. What ``remaining`` measures decides the words (X3711):
+    ``$70.00 left (balance)`` is money left from an entered balance, and
+    ``$200.00 of $200 limit unused`` is room under the monthly limit, which
+    is not money (the purchased balance can run out first). An account
+    with no limit and no entered balance reads ``$8.11 used, no cap``; a
+    reached limit reads ``cap reached ($600)``; a reply saying the credits
+    ran out reads ``out of credits``. A ``fraction`` spend (reply headers,
+    no money figures) reads ``credits on, 0% of cap used``, ``credits on,
+    out of credits``, or the reply's own disabled reason."""
     if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
         return _fraction_spend_words(spend)
-    if spend.get("cap_source") == oauth.CAP_SOURCE_CONFIG:
-        return _configured_cap_words(spend)
+    # A dollars spend from the usage endpoint carries no disabled reason
+    # (`oauth._spend_entry`); one computed from reply headers does.
+    reason = spend["disabled_reason"] if "cap_source" in spend else None
+    if reason == "out_of_credits":
+        return "out of credits"
+    if reason is not None:
+        return f"credits refused ({reason})"
     limit = spend["limit"]
     if spend["limit_reached"]:
         return f"cap reached (${limit:,.2f})" if limit is not None else "cap reached"
+    if spend["remaining_basis"] == oauth.REMAINING_BASIS_BALANCE:
+        return f"${spend['remaining']:,.2f} left (balance)"
     if limit is None:
         return f"${spend['used']:,.2f} used, no cap"
-    return f"${spend['remaining']:,.2f} left of ${limit:,.2f}"
+    return f"${spend['remaining']:,.2f} of {_dollars(limit)} limit unused"
 
 
-def _configured_cap_words(spend: dict) -> str:
-    """:func:`spend_amounts` for dollars computed from the configured cap
-    (``cap_source: config``): the words say the cap is the operator's own,
-    ``$500.00 left of your $500 cap``. A disabled reason other than out of
-    credits is named, as for the fraction spend it came from."""
-    limit = spend["limit"]
-    cap = f"${limit:,.0f}" if float(limit).is_integer() else f"${limit:,.2f}"
-    reason = spend["disabled_reason"]
-    if reason is not None and reason != "out_of_credits":
-        return f"credits refused ({reason}), your {cap} cap"
-    if spend["limit_reached"]:
-        return f"cap reached (your {cap} cap)"
-    return f"${spend['remaining']:,.2f} left of your {cap} cap"
+def _dollars(amount: float) -> str:
+    """A limit in dollars, whole dollars without cents: ``$200``, ``$12.50``."""
+    return f"${amount:,.0f}" if float(amount).is_integer() else f"${amount:,.2f}"
 
 
 def _fraction_spend_words(spend: dict) -> str:
@@ -3608,6 +3615,58 @@ class ClaudeAccountSwitcher:
             num: entry.fetched_at
             for num, entry in self._usage_store.entries(identities).items()
         }
+
+    def set_credit_balance(self, dotted_key: str, raw_value: str) -> CreditBalance:
+        """Enter ``creditBalances.<email>`` (X3711): the balance in
+        ``raw_value`` with the account's dollars used against its monthly
+        limit right now and the limit's next reset, read off its stored
+        reading (for a setup-token account, the configured cap times the
+        reply's share used; else the usage endpoint's own figure). Refused
+        with ``ConfigError`` naming the account when no slot holds it, more
+        than one does, or its reading has no dollar figure: a balance
+        entered without that baseline would give a wrong figure."""
+        email = credit_balance_email(dotted_key)
+        if email is None:
+            raise ConfigError(f"{dotted_key} is not a creditBalances.<email> key")
+        usd = parse_credit_balance(dotted_key, raw_value)
+        data = self._get_sequence_data() or {}
+        identities = {
+            num: (info.get("email", ""), info.get("organizationUuid", "") or "")
+            for num, info in data.get("accounts", {}).items()
+            if info.get("email", "").lower() == email.lower()
+        }
+        if not identities:
+            raise ConfigError(f"{dotted_key}: no account {email} is added to cswap")
+        if len(identities) > 1:
+            raise ConfigError(
+                f"{dotted_key}: {email} is added in {len(identities)} slots "
+                f"({', '.join(sorted(identities))}); its balance cannot be "
+                "told apart"
+            )
+        (entry,) = self._usage_store.entries(identities).values()
+        last_good = entry.last_good
+        spend = last_good.get("spend") if isinstance(last_good, dict) else None
+        if not isinstance(spend, dict) or spend["used"] is None:
+            raise ConfigError(
+                f"{dotted_key}: account {email} has no current usage-credit "
+                "reading in dollars (no reading yet, credits off, or a "
+                "setup-token account with no creditCaps entry), so the "
+                "spend since entry could not be measured; refresh its usage "
+                "and try again"
+            )
+        balance = CreditBalance(
+            usd=usd,
+            entered_at=iso_utc(self._usage_store.clock()),
+            used_at_entry=float(spend["used"]),
+            # default: EXTERNAL -- source: the usage endpoint's extra_usage
+            # block and the overage reset header, either of which may name
+            # no reset (`oauth._spend_entry`, `usage_store._header_reset`)
+            # -- why: no recorded reset leaves the month rollover to the
+            # used-figure drop alone.
+            resets_at_entry=spend.get("resets_at"),
+        )
+        set_credit_balance(self.backup_dir, email, balance)
+        return balance
 
     def record_usage_headers(self, num: str, headers: Mapping[str, str]) -> bool:
         """Public entry point for the pin: record a 5h/7d usage reading

@@ -12116,6 +12116,7 @@ class TestFormatUsageLines:
                 "pct": 10.0,
                 "currency": "USD",
                 "limit_reached": False, "reported": "dollars",
+                "remaining_basis": "limit",
                 "resets_at": resets_at,
                 "clock": "stale-clock",
             }

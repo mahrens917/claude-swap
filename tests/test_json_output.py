@@ -40,7 +40,7 @@ class TestJsonHelpers:
                           "countdown": "4h", "clock": "02:00"},
             "seven_day": {"pct": 16.0},
             "spend": {"used": 12.5, "limit": 300.0, "remaining": 287.5, "pct": 4.0,
-                      "currency": "USD", "limit_reached": False, "reported": "dollars",
+                      "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
                       "resets_at": resets_at},
         }
         out = usage_to_json(usage)
@@ -98,7 +98,7 @@ class TestJsonHelpers:
         resets_at = (datetime.now(timezone.utc) + timedelta(hours=2, seconds=30)).isoformat()
         countdown, clock = oauth.format_reset(resets_at)
         usage = {"spend": {"used": 1.0, "limit": 10.0, "remaining": 9.0, "pct": 10.0,
-                           "currency": "USD", "limit_reached": False, "reported": "dollars",
+                           "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
                            "resets_at": resets_at,
                            "countdown": "stale", "clock": "stale-clock"}}
         out = usage_to_json(usage)
@@ -638,7 +638,7 @@ class TestStatusJson:
         set_setting(switcher.backup_dir, "autoswitch.creditThreshold", "100")
         now = time.time()
         spend = {"used": 10.0, "limit": 60.0, "remaining": 50.0, "pct": 16.67,
-                 "currency": "USD", "limit_reached": False, "reported": "dollars"}
+                 "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit"}
         entries = {
             "1": UsageEntry(last_good={"five_hour": {"pct": 99.5}, "spend": spend},
                             fetched_at=now, age_s=0.0),
@@ -973,7 +973,7 @@ class TestUsageFromJson:
         "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
         "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
         "spend": {"used": 5.0, "limit": 50.0, "remaining": 45.0, "pct": 10.0,
-                  "currency": "USD", "limit_reached": False, "reported": "dollars",
+                  "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit",
                   "resets_at": "2099-02-01T00:00:00+00:00"},
         "scoped": [{"name": "Fable", "pct": 30.0,
                     "resets_at": "2099-01-07T00:00:00+00:00"}],
@@ -1024,12 +1024,12 @@ class TestUsageFromJson:
         internal = {
             "five_hour": {"pct": 100.0},
             "spend": {"used": 8.11, "limit": None, "remaining": None, "pct": None,
-                      "currency": "USD", "limit_reached": False, "reported": "dollars"},
+                      "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit"},
         }
         out = usage_to_json(internal)
         assert out["spend"] == {
             "used": 8.11, "limit": None, "remaining": None, "pct": None,
-            "currency": "USD", "limitReached": False, "reported": "dollars",
+            "currency": "USD", "limitReached": False, "reported": "dollars", "remainingBasis": "limit",
         }
         assert usage_from_json(out) == internal
 
@@ -1040,27 +1040,68 @@ class TestUsageFromJson:
 
         out = usage_to_json({
             "spend": {"used": 8.11, "limit": 600.0, "remaining": 591.89, "pct": 1.0,
-                      "currency": "USD", "limit_reached": False, "reported": "dollars"},
+                      "currency": "USD", "limit_reached": False, "reported": "dollars", "remaining_basis": "limit"},
         })
         assert out["spend"]["remaining"] == 591.89
         assert out["spend"]["limitReached"] is False
+        assert out["spend"]["remainingBasis"] == "limit"
+        assert "balanceEnteredAt" not in out["spend"]
+
+    def test_a_balance_spend_round_trips_with_its_basis_and_entry_time(self):
+        """Asserts: a spend whose remaining is money left from an entered
+        balance serializes ``remainingBasis: balance`` and
+        ``balanceEnteredAt``, and reads back to the same internal dict."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "spend": {"used": 30.0, "limit": 200.0, "remaining": 40.0, "pct": 15.0,
+                      "currency": "USD", "limit_reached": False, "reported": "dollars",
+                      "remaining_basis": "balance",
+                      "balance_entered_at": "2026-10-09T14:03:00Z",
+                      "cap_source": "config", "disabled_reason": None},
+        }
+        out = usage_to_json(internal)
+        assert out["spend"] == {
+            "reported": "dollars", "used": 30.0, "limit": 200.0, "remaining": 40.0,
+            "pct": 15.0, "currency": "USD", "limitReached": False,
+            "remainingBasis": "balance", "balanceEnteredAt": "2026-10-09T14:03:00Z",
+            "capSource": "config", "disabledReason": None,
+        }
+        assert usage_from_json(out) == internal
 
     @pytest.mark.parametrize("spend", [
         # remaining disagrees with limit - used: an edited document claiming money
         {"used": 1, "limit": 10, "remaining": 50, "pct": 10, "currency": "USD",
-         "limitReached": False, "reported": "dollars"},
+         "limitReached": False, "reported": "dollars", "remainingBasis": "limit"},
         # a finite cap with no remaining figure
         {"used": 1, "limit": 10, "remaining": None, "pct": 10, "currency": "USD",
-         "limitReached": False, "reported": "dollars"},
+         "limitReached": False, "reported": "dollars", "remainingBasis": "limit"},
         # no cap but a remaining figure
         {"used": 1, "limit": None, "remaining": 5, "pct": None, "currency": "USD",
-         "limitReached": False, "reported": "dollars"},
+         "limitReached": False, "reported": "dollars", "remainingBasis": "limit"},
         # the cap verdict missing
         {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD",
-         "reported": "dollars"},
+         "reported": "dollars", "remainingBasis": "limit"},
+        # the remaining basis missing
+        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD",
+         "limitReached": False, "reported": "dollars"},
+        # an unknown remaining basis
+        {"used": 1, "limit": 10, "remaining": 9, "pct": 10, "currency": "USD",
+         "limitReached": False, "reported": "dollars", "remainingBasis": "cash"},
+        # a balance basis above the room the limit leaves
+        {"used": 1, "limit": 10, "remaining": 20, "pct": 10, "currency": "USD",
+         "limitReached": False, "reported": "dollars", "remainingBasis": "balance",
+         "balanceEnteredAt": "2026-10-09T14:03:00Z"},
+        # a balance basis with negative money left
+        {"used": 1, "limit": 10, "remaining": -1, "pct": 10, "currency": "USD",
+         "limitReached": False, "reported": "dollars", "remainingBasis": "balance",
+         "balanceEnteredAt": "2026-10-09T14:03:00Z"},
+        # a balance basis naming no entry time
+        {"used": 1, "limit": 10, "remaining": 5, "pct": 10, "currency": "USD",
+         "limitReached": False, "reported": "dollars", "remainingBasis": "balance"},
         # remaining key absent rather than null
         {"used": 1, "limit": None, "pct": None, "currency": "USD",
-         "limitReached": False, "reported": "dollars"},
+         "limitReached": False, "reported": "dollars", "remainingBasis": "limit"},
     ])
     def test_an_inconsistent_spend_is_refused(self, spend):
         """Asserts: a ``spend`` object whose cap, remainder and verdict do not
@@ -1086,7 +1127,7 @@ class TestUsageFromJson:
         out.pop("clock")
         assert out == {
             "reported": "fraction", "used": None, "limit": None,
-            "remaining": None, "pct": 0.0, "currency": None,
+            "remaining": None, "remainingBasis": None, "pct": 0.0, "currency": None,
             "limitReached": False, "disabledReason": None,
             "resetsAt": "2099-02-01T00:00:00+00:00",
         }
@@ -1108,15 +1149,20 @@ class TestUsageFromJson:
     @pytest.mark.parametrize("spend", [
         # money on a fraction spend
         {"reported": "fraction", "used": 1.0, "limit": None, "remaining": None,
-         "pct": 0.0, "currency": None, "limitReached": False,
-         "disabledReason": None},
+         "remainingBasis": None, "pct": 0.0, "currency": None,
+         "limitReached": False, "disabledReason": None},
         # a currency on a fraction spend
         {"reported": "fraction", "used": None, "limit": None, "remaining": None,
-         "pct": 0.0, "currency": "USD", "limitReached": False,
-         "disabledReason": None},
+         "remainingBasis": None, "pct": 0.0, "currency": "USD",
+         "limitReached": False, "disabledReason": None},
         # the disabled reason key absent
         {"reported": "fraction", "used": None, "limit": None, "remaining": None,
-         "pct": 0.0, "currency": None, "limitReached": False},
+         "remainingBasis": None, "pct": 0.0, "currency": None,
+         "limitReached": False},
+        # a remaining basis on a fraction spend
+        {"reported": "fraction", "used": None, "limit": None, "remaining": None,
+         "remainingBasis": "limit", "pct": 0.0, "currency": None,
+         "limitReached": False, "disabledReason": None},
         # an unknown measurement kind
         {"reported": "cents", "used": 1, "limit": 10, "remaining": 9,
          "pct": 10, "currency": "USD", "limitReached": False},

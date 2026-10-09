@@ -6333,11 +6333,12 @@ class TestAModelWindowIsNotABlackout:
             threshold=90.0,
             spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0,
                          "remaining": 258.31, "currency": "USD",
-                         "limit_reached": False, "reported": "dollars"}},
+                         "limit_reached": False, "reported": "dollars",
+                         "remaining_basis": "limit"}},
         )
         text = event.human()
         assert "#8: ?" not in text, text
-        assert "#8: $$  45%   $258.31 left of $466.00" in text, text
+        assert "#8: $$  45%   $258.31 of $466 limit unused" in text, text
 
     def test_a_genuinely_unreadable_account_still_prints_a_bare_mark(self):
         """The discrimination must survive: an account with no windows, no
@@ -15678,7 +15679,9 @@ class TestStoppedEngineDoesNotAct:
             m.AllExhaustedEvent(earliest_reset_at=None),
             m.SpendingUsageCreditsEvent(
                 account={"number": 2, "email": "b@example.com"},
-                room=oauth.UsageCreditRoom(reported="dollars", remaining=None),
+                room=oauth.UsageCreditRoom(
+                    reported="dollars", remaining=None, remaining_basis="limit"
+                ),
                 switched=False,
             ),
             m.SleepEvent(seconds=1.0, until="2024-01-01T00:00:00Z"),

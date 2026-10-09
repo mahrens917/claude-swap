@@ -325,8 +325,8 @@ class TestHeaderOnlySpendIsShown:
         rows = {r["number"]: r for r in payload["accounts"]}
         assert rows[2]["usage"]["spend"] == {
             "reported": "fraction", "used": None, "limit": None,
-            "remaining": None, "pct": 0.0, "currency": None,
-            "limitReached": False, "disabledReason": None,
+            "remaining": None, "remainingBasis": None, "pct": 0.0,
+            "currency": None, "limitReached": False, "disabledReason": None,
         }
         assert rows[4]["usage"]["spend"]["limitReached"] is True
         assert rows[4]["usage"]["spend"]["disabledReason"] == "out_of_credits"
@@ -349,8 +349,9 @@ class TestHeaderOnlySpendIsShown:
     def test_a_configured_cap_shows_dollars_everywhere(self, temp_home):
         """Asserts: with a $500 cap configured for account 2 (X3696), `cswap
         list --json` emits a ``dollars`` spend with ``capSource: config``,
-        and the list line and dashboard row read ``$500.00 left of your
-        $500 cap``; the JSON round-trips through ``usage_from_json``."""
+        and ``remainingBasis: limit``, and the list line and dashboard row
+        read ``$500.00 of $500 limit unused`` (room under the limit, not
+        money); the JSON round-trips through ``usage_from_json``."""
         from claude_swap.json_output import usage_from_json, usage_to_json
         from claude_swap.settings import set_setting
         from claude_swap.switcher import _usage_entry_lines
@@ -362,11 +363,12 @@ class TestHeaderOnlySpendIsShown:
         rows = {r["number"]: r for r in payload["accounts"]}
         assert rows[2]["usage"]["spend"] == {
             "reported": "dollars", "used": 0.0, "limit": 500.0,
-            "remaining": 500.0, "pct": 0.0, "currency": "USD",
-            "limitReached": False, "capSource": "config", "disabledReason": None,
+            "remaining": 500.0, "remainingBasis": "limit", "pct": 0.0,
+            "currency": "USD", "limitReached": False, "capSource": "config",
+            "disabledReason": None,
         }
         entries = switcher.usage_entries_by_account(fetch=set())
-        words = "$500.00 left of your $500 cap"
+        words = "$500.00 of $500 limit unused"
         assert any(words in line for line in _usage_entry_lines(entries["2"]))
         row = usage_rows(entries["2"].last_good, 0.0)[0]
         assert row[0] == "$$" and row[2] == words
@@ -383,10 +385,86 @@ class TestHeaderOnlySpendIsShown:
         with pytest.raises(ValueError, match="capSource"):
             usage_from_json({"spend": {
                 "reported": "dollars", "used": 1.0, "limit": 200.0,
-                "remaining": 199.0, "pct": 0.5, "currency": "USD",
-                "limitReached": False, "capSource": "guess",
+                "remaining": 199.0, "remainingBasis": "limit", "pct": 0.5,
+                "currency": "USD", "limitReached": False, "capSource": "guess",
                 "disabledReason": None,
             }})
+
+    def test_a_balance_entered_now_records_the_reading_and_reads_as_money(
+        self, temp_home
+    ):
+        """Asserts: `config set creditBalances.<email> 70` on a capped
+        setup-token account records ``usedAtEntry`` as the configured cap
+        times the reply's share used and the entry time from the store
+        clock; the account then lists ``$70.00 left (balance)`` with
+        ``remainingBasis: balance`` and ``balanceEnteredAt``, and the JSON
+        round-trips."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+        from claude_swap.settings import load_credit_balances, set_setting
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.tui.widgets import usage_rows
+
+        switcher = self._switcher()
+        set_setting(switcher.backup_dir, "creditCaps.two@example.com", "200")
+        balance = switcher.set_credit_balance("creditBalances.two@example.com", "70")
+        assert balance.usd == 70.0
+        assert balance.used_at_entry == 0.0
+        assert load_credit_balances(switcher.backup_dir) == {
+            "two@example.com": balance
+        }
+        payload = switcher.list_accounts(json_output=True, read_only=True)
+        spend = {r["number"]: r for r in payload["accounts"]}[2]["usage"]["spend"]
+        assert spend["remaining"] == 70.0
+        assert spend["remainingBasis"] == "balance"
+        assert spend["balanceEnteredAt"] == balance.entered_at
+        entries = switcher.usage_entries_by_account(fetch=set())
+        words = "$70.00 left (balance)"
+        assert any(words in line for line in _usage_entry_lines(entries["2"]))
+        assert usage_rows(entries["2"].last_good, 0.0)[0][2] == words
+        back = usage_from_json(usage_to_json(entries["2"].last_good))["spend"]
+        assert back["remaining_basis"] == "balance"
+        assert back["remaining"] == 70.0
+
+    def test_an_out_of_credits_account_with_a_balance_has_nothing_left(
+        self, temp_home
+    ):
+        """Asserts: account 4 (reply says out_of_credits, 0% of its $200
+        limit used) with a $50 balance entered reads remaining 0 on the
+        balance basis and ``out of credits`` in words, never as money."""
+        from claude_swap.settings import set_setting
+        from claude_swap.tui.widgets import usage_rows
+
+        switcher = self._switcher()
+        # Accounts 3 and 4 answered out_of_credits with 0% of the limit used.
+        assert switcher.record_usage_headers("4", {
+            **OUT_OF_CREDITS_HEADERS,
+            usage_store.USAGE_HEADER_OVERAGE_PCT: "0.0",
+        }) is True
+        set_setting(switcher.backup_dir, "creditCaps.four@example.com", "200")
+        switcher.set_credit_balance("creditBalances.four@example.com", "50")
+        payload = switcher.list_accounts(json_output=True, read_only=True)
+        spend = {r["number"]: r for r in payload["accounts"]}[4]["usage"]["spend"]
+        assert spend["remaining"] == 0.0
+        assert spend["remainingBasis"] == "balance"
+        entries = switcher.usage_entries_by_account(fetch=set())
+        assert usage_rows(entries["4"].last_good, 0.0)[0][2] == "out of credits"
+
+    def test_a_balance_with_no_dollar_reading_is_refused_naming_the_account(
+        self, temp_home
+    ):
+        """Asserts: entering a balance for an account whose reading has no
+        dollar figure (a setup-token account with no cap) or for an email no
+        slot holds raises ConfigError naming the account, and writes
+        nothing."""
+        from claude_swap.exceptions import ConfigError
+        from claude_swap.settings import load_credit_balances
+
+        switcher = self._switcher()
+        with pytest.raises(ConfigError, match="two@example.com"):
+            switcher.set_credit_balance("creditBalances.two@example.com", "70")
+        with pytest.raises(ConfigError, match="nobody@example.com"):
+            switcher.set_credit_balance("creditBalances.nobody@example.com", "70")
+        assert load_credit_balances(switcher.backup_dir) == {}
 
     def test_a_store_in_a_newer_schema_is_never_overwritten(
         self, temp_home, caplog

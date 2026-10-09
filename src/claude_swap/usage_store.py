@@ -1066,10 +1066,113 @@ def capped_dollar_spend(spend: dict, cap: float) -> dict | None:
         "used": used,
         "limit": cap,
         "remaining": cap - used,
+        "remaining_basis": oauth.REMAINING_BASIS_LIMIT,
         "currency": "USD",
         "cap_source": oauth.CAP_SOURCE_CONFIG,
     }
     return out
+
+
+# (account, balance entry time) pairs this process has already named in
+# `_note_limit_month_reset`, and accounts already named in
+# `_warn_balance_overspent`.
+_noted_month_resets: set[tuple[str, str]] = set()
+_warned_balance_overspent: set[str] = set()
+
+
+def _note_limit_month_reset(email: str, balance: settings.CreditBalance, used: float) -> None:
+    """INFO, once per balance entry per process: the monthly limit reset
+    since the balance was entered, so the spend since entry is this month's
+    ``used`` alone."""
+    key = (email.lower(), balance.entered_at)
+    if key in _noted_month_resets:
+        return
+    _noted_month_resets.add(key)
+    _logger.info(
+        "Account %s: the monthly usage-credit limit reset since its balance "
+        "was entered at %s ($%.2f used then, $%.2f now); spend since entry "
+        "is this month's $%.2f",
+        email,
+        balance.entered_at,
+        balance.used_at_entry,
+        used,
+        used,
+    )
+
+
+def _warn_balance_overspent(email: str, balance_left: float) -> None:
+    """Detector: the entered balance less the spend since entry fell below
+    zero while the reply does not say out of credits. Zero on a healthy
+    system: a nonzero means the entered balance or its recorded reading was
+    wrong, since the venue would refuse credits at zero. Once per account
+    per process."""
+    if email.lower() in _warned_balance_overspent:
+        return
+    _warned_balance_overspent.add(email.lower())
+    _logger.warning(
+        "Account %s: entered usage-credit balance less the spend since entry "
+        "is $%.2f, below zero, yet its credits are not refused as out of "
+        "credits; the entered balance or its recorded reading is wrong "
+        "(re-enter it with `cswap config set %s <dollars>`)",
+        email,
+        balance_left,
+        settings.credit_balance_key(email),
+    )
+
+
+def balance_spend(
+    email: str,
+    spend: dict,
+    balance: settings.CreditBalance | None,
+    now: float,
+) -> dict:
+    """A ``dollars`` spend with ``remaining`` and ``remaining_basis`` set.
+
+    With no entered ``balance``: ``remaining`` is room under the monthly
+    limit, ``limit - used`` (None with no limit), basis ``limit``. With one:
+    basis ``balance`` and ``remaining`` is the balance less the spend since
+    entry, never above the limit room, floored at zero, and zero when the
+    reply says out of credits or the limit is reached; ``balance_entered_at``
+    names the entry. The spend since entry is ``used - used_at_entry``,
+    unless the monthly limit reset since (``used`` below the recorded
+    figure, or the clock past the reset recorded at entry), when it is this
+    month's ``used`` alone (one INFO line per entry).
+    """
+    limit, used = spend["limit"], spend["used"]
+    limit_room = limit - used if limit is not None else None
+    if balance is None:
+        return {
+            **spend,
+            "remaining": limit_room,
+            "remaining_basis": oauth.REMAINING_BASIS_LIMIT,
+        }
+    rolled = used < balance.used_at_entry or (
+        balance.resets_at_entry is not None
+        and now >= settings.iso_epoch(balance.resets_at_entry)
+    )
+    if rolled:
+        _note_limit_month_reset(email, balance, used)
+        spent = used
+    else:
+        spent = used - balance.used_at_entry
+    balance_left = balance.usd - spent
+    # A dollars spend from the usage endpoint carries no disabled reason
+    # (`oauth._spend_entry`); one computed from reply headers does.
+    reason = spend["disabled_reason"] if "cap_source" in spend else None
+    out_of_credits = reason == "out_of_credits"
+    if balance_left < 0 and not out_of_credits:
+        _warn_balance_overspent(email, balance_left)
+    remaining = balance_left if limit_room is None else min(balance_left, limit_room)
+    if out_of_credits or spend["limit_reached"]:
+        remaining = 0.0
+    return {
+        **spend,
+        # Floored: money left is never negative; a negative balance figure
+        # outside out of credits was named just above.
+        "remaining": max(0.0, remaining),
+        "remaining_basis": oauth.REMAINING_BASIS_BALANCE,
+        "balance_entered_at": balance.entered_at,
+    }
 
 
 # Accounts this process has already named in `_warn_no_credit_cap`.
@@ -1482,9 +1585,12 @@ class UsageStore:
         self._lock_path = cache_dir / ".usage.lock"
         # settings.json sits in claude-swap's data directory, the cache
         # dir's parent (`paths.get_backup_root`); its `creditCaps` section turns a
-        # setup-token account's fraction spend into dollars on read.
+        # setup-token account's fraction spend into dollars on read, and its
+        # `creditBalances` section turns room under the limit into money left.
         self._settings_root = cache_dir.parent
-        self._credit_caps_cache: tuple[int | None, dict[str, float]] | None = None
+        self._credit_config_cache: (
+            tuple[int | None, dict[str, float], dict[str, settings.CreditBalance]] | None
+        ) = None
         self.clock = clock
         self._copy_forward()
 
@@ -1569,46 +1675,55 @@ class UsageStore:
             self.path, {"schemaVersion": SCHEMA_VERSION, "accounts": rows}
         )
 
-    def _credit_caps(self) -> dict[str, float]:
-        """The configured monthly usage-credit caps (``creditCaps`` in
-        settings.json, :func:`settings.load_credit_caps`), re-read only when
-        the file's mtime moved."""
+    def _credit_config(
+        self,
+    ) -> tuple[dict[str, float], dict[str, settings.CreditBalance]]:
+        """The configured monthly usage-credit caps (``creditCaps``,
+        :func:`settings.load_credit_caps`) and entered balances
+        (``creditBalances``, :func:`settings.load_credit_balances`) in
+        settings.json, re-read only when the file's mtime moved."""
         path = settings.settings_path(self._settings_root)
         try:
             mtime: int | None = path.stat().st_mtime_ns
         except FileNotFoundError:
             mtime = None
-        cached = self._credit_caps_cache
+        cached = self._credit_config_cache
         if cached is not None and cached[0] == mtime:
-            return cached[1]
+            return cached[1], cached[2]
         caps = settings.load_credit_caps(self._settings_root)
-        self._credit_caps_cache = (mtime, caps)
-        return caps
+        balances = settings.load_credit_balances(self._settings_root)
+        self._credit_config_cache = (mtime, caps, balances)
+        return caps, balances
 
-    def _with_credit_cap(self, email: str, last_good: object) -> object:
-        """``last_good`` with a ``fraction`` spend turned into dollars when
-        ``email`` has a configured cap (:func:`capped_dollar_spend`), the one
-        place a stored reading meets the configured cap, so every reader
-        (``cswap list``, ``--json``, the credit rotation) sees the same
-        figure. Without a cap a fraction spend with credits on stays a
-        fraction and is named once per account per process at WARNING."""
+    def _with_credit_figures(self, email: str, last_good: object) -> object:
+        """``last_good`` with its spend in the figures every reader shows,
+        the one place a stored reading meets the credit config, so every
+        reader (``cswap list``, ``--json``, the credit rotation) sees the
+        same figure. A ``fraction`` spend turns into dollars when ``email``
+        has a configured cap (:func:`capped_dollar_spend`); without one a
+        fraction spend with credits on stays a fraction and is named once per
+        account per process at WARNING. Every ``dollars`` spend then gets its
+        ``remaining`` and ``remaining_basis`` from the entered balance, or
+        the limit room when none is entered (:func:`balance_spend`)."""
         if not isinstance(last_good, dict):
             return last_good
         spend = last_good.get("spend")
-        if (
-            not isinstance(spend, dict)
-            or spend["reported"] != oauth.SPEND_REPORTED_FRACTION
-        ):
+        if not isinstance(spend, dict):
             return last_good
-        cap = self._credit_caps().get(email.lower())
-        if cap is None:
-            if spend["disabled_reason"] is None:
-                _warn_no_credit_cap(email)
-            return last_good
-        dollars = capped_dollar_spend(spend, cap)
-        if dollars is None:
-            return last_good
-        return {**last_good, "spend": dollars}
+        caps, balances = self._credit_config()
+        if spend["reported"] == oauth.SPEND_REPORTED_FRACTION:
+            cap = caps.get(email.lower())
+            if cap is None:
+                if spend["disabled_reason"] is None:
+                    _warn_no_credit_cap(email)
+                return last_good
+            dollars = capped_dollar_spend(spend, cap)
+            if dollars is None:
+                return last_good
+            spend = dollars
+        balance = balances.get(email.lower())
+        figured = balance_spend(email, spend, balance, self.clock())
+        return {**last_good, "spend": figured}
 
     @staticmethod
     def _matches(row: object, identity: Identity) -> bool:
@@ -1647,7 +1762,7 @@ class UsageStore:
             fetched_at = row.get("fetchedAt")
             if not isinstance(fetched_at, (int, float)):
                 fetched_at = None
-            last_good = self._with_credit_cap(identity[0], row.get("lastGood"))
+            last_good = self._with_credit_figures(identity[0], row.get("lastGood"))
             age_s = (now - fetched_at) if fetched_at is not None else None
             consecutive_failures = int(row.get("consecutiveFailures") or 0)
             next_poll_at = _num_or_none(row.get("nextPollAt"))
