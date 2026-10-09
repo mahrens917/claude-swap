@@ -13926,3 +13926,237 @@ def test_a_stale_build_clears_no_wiring_receipt(temp_home, stale_build, caplog):
     assert side.read_text(encoding="utf-8") == receipt
     assert list(side.parent.glob(f"{side.name}.*.tmp")) == []
     assert any("refusing to write" in r.getMessage() for r in caplog.records)
+
+
+class TestStaleBuildRefusalSurfacesFromHostCatches:
+    """X3709 unit 2: every host-side catch in pin.py that wraps a write
+    (through the package or through this module's own wiring clear) lets a
+    stale build's StaleBuildWriteError through, so the refusal reaches the
+    caller instead of reading as a failed repair, a lock, or a launch that
+    simply went unrouted. Each write here is the real build check against
+    the ``stale_build`` fixture."""
+
+    @staticmethod
+    def _refusing_write(target):
+        from claude_swap.locking import check_loaded_build_is_installed
+
+        def _write(*a, **k):
+            check_loaded_build_is_installed(target)
+            raise AssertionError("the build check let a stale write through")
+
+        return _write
+
+    @staticmethod
+    def _host_reads(monkeypatch, ops):
+        monkeypatch.setattr(ops, "identity_for_config",
+                            lambda sw, email=None, num=None: {"emailAddress": email})
+        monkeypatch.setattr(ops, "_slot_for", lambda sw, email, org: "1")
+        monkeypatch.setattr(ops, "_pinned_email_now", lambda sw: None)
+        monkeypatch.setattr(ops, "_live_login_for_config", lambda sw: None)
+
+    def test_reapply_current(self, temp_home, stale_build, monkeypatch, caplog):
+        """Asserts: a refused `apply_pin` inside `repin_current` raises the
+        refusal (not the False a caller reads as a daemon that cannot mint)
+        and logs its WARNING."""
+        import logging
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        self._host_reads(monkeypatch, ops)
+        impl = types.SimpleNamespace(
+            load_pin=lambda root: ("a@b.c", ""),
+            apply_pin=self._refusing_write(temp_home / "settings.json"))
+        monkeypatch.setattr(ops, "_live_impl", lambda: impl)
+        with caplog.at_level(logging.WARNING), pytest.raises(StaleBuildWriteError):
+            ops.repin_current(types.SimpleNamespace(backup_dir=temp_home))
+        assert any("refusing to write" in r.getMessage() for r in caplog.records)
+
+    def test_record_roll_back(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused `apply_pin` while putting the previous record
+        back raises the refusal rather than grading the roll back."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        self._host_reads(monkeypatch, ops)
+        impl = types.SimpleNamespace(
+            apply_pin=self._refusing_write(temp_home / "settings.json"))
+        monkeypatch.setattr(ops, "_impl", lambda: impl)
+        with pytest.raises(StaleBuildWriteError):
+            ops._restore_pin(types.SimpleNamespace(), ("a@b.c", ""))
+
+    def test_set_pin(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused `apply_pin` in `set_pin` raises the refusal and
+        attempts no roll back (the refusal wrote nothing to undo)."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        self._host_reads(monkeypatch, ops)
+        calls = []
+        refuse = self._refusing_write(temp_home / "settings.json")
+
+        def _apply(*a, **k):
+            calls.append(a)
+            refuse()
+
+        monkeypatch.setattr(ops, "_impl",
+                            lambda: types.SimpleNamespace(apply_pin=_apply))
+        sw = types.SimpleNamespace(_account_kind=lambda num: "oauth")
+        with pytest.raises(StaleBuildWriteError):
+            ops.set_pin(sw, "a@b.c", "", num="1")
+        assert len(calls) == 1, calls
+
+    def test_clear_pin(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused `apply_pin` in `clear_pin` raises the refusal
+        instead of taking the path for a package that does not work."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        self._host_reads(monkeypatch, ops)
+        monkeypatch.setattr(ops, "wired_env_keys", lambda sw=None: {})
+        cleared = []
+        monkeypatch.setattr(ops, "clear_wiring",
+                            lambda *a, **k: cleared.append(a) or False)
+        monkeypatch.setattr(ops, "_impl", lambda: types.SimpleNamespace(
+            apply_pin=self._refusing_write(temp_home / "settings.json")))
+        with pytest.raises(StaleBuildWriteError):
+            ops.clear_pin(types.SimpleNamespace(backup_dir=temp_home))
+        assert cleared == []
+
+    def test_heal_restart(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused write inside the package's `heal` raises the
+        refusal instead of falling through to the unwire."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        refuse = self._refusing_write(temp_home / "proxy.json")
+
+        def _heal(backup_dir):
+            refuse()
+
+        monkeypatch.setattr(ops, "_live_impl",
+                            lambda: types.SimpleNamespace(heal=_heal))
+        probes = []
+        monkeypatch.setattr(ops, "_wired_port_is_serving",
+                            lambda *a, **k: probes.append(a) or False)
+        with pytest.raises(StaleBuildWriteError):
+            ops.heal(types.SimpleNamespace(backup_dir=temp_home))
+        assert probes == []
+
+    def test_heal_dead_wiring_clear(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused clear of a dead wiring in `heal` raises the
+        refusal, not the "could not heal" message."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        cfg = temp_home / ".claude.json"
+        monkeypatch.setattr(ops, "_live_impl", lambda: None)
+        monkeypatch.setattr(ops, "_wired_port_is_serving", lambda *a, **k: False)
+        monkeypatch.setattr(ops, "_dead_wired_configs", lambda *a, **k: [cfg])
+        monkeypatch.setattr(ops, "wired_env_keys", lambda sw=None: {})
+        monkeypatch.setattr(ops, "clear_wiring", self._refusing_write(cfg))
+        with pytest.raises(StaleBuildWriteError):
+            ops.heal(types.SimpleNamespace(backup_dir=temp_home))
+
+    def test_clear_wiring(self, temp_home, stale_build, monkeypatch, caplog):
+        """Asserts: `clear_wiring` raises a refusal from the locked clear of
+        one config instead of logging it as a config that could not be
+        unwired and moving on."""
+        import logging
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        cfg = temp_home / ".claude.json"
+        cfg.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(ops, "_clear_wiring_locked",
+                            self._refusing_write(ops._ledger_path(cfg)))
+        with caplog.at_level(logging.WARNING), pytest.raises(StaleBuildWriteError):
+            ops.clear_wiring(types.SimpleNamespace(backup_dir=temp_home),
+                             timeout=1.0, only=[cfg])
+        assert not any("could not be unwired" in r.getMessage()
+                       for r in caplog.records)
+
+    def test_launch_route(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused write while starting the proxy for a launch
+        raises the refusal instead of launching unrouted."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        monkeypatch.setattr(ops, "_impl", lambda: types.SimpleNamespace(
+            ensure_proxy=self._refusing_write(temp_home / "proxy.json")))
+        with pytest.raises(StaleBuildWriteError):
+            ops.wire_launch_env(types.SimpleNamespace(backup_dir=temp_home), {})
+
+    def test_launch_dead_wiring_clear_without_package(
+        self, temp_home, stale_build, monkeypatch
+    ):
+        """Asserts: with no package, a refused clear of a dead wiring at
+        launch raises the refusal."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        cfg = temp_home / ".claude.json"
+
+        def _no_package():
+            raise ImportError("no package")
+
+        monkeypatch.setattr(ops, "_impl", _no_package)
+        monkeypatch.setattr(ops, "_dead_wired_configs", lambda *a, **k: [cfg])
+        monkeypatch.setattr(ops, "clear_wiring", self._refusing_write(cfg))
+        with pytest.raises(StaleBuildWriteError):
+            ops.wire_launch_env(types.SimpleNamespace(backup_dir=temp_home), {})
+
+    def test_launch_unwire_if_dead(self, temp_home, stale_build, monkeypatch):
+        """Asserts: with no proxy this launch, a refused unwire of a dead
+        port raises the refusal."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        monkeypatch.setattr(ops, "_impl", lambda: types.SimpleNamespace(
+            ensure_proxy=lambda sw: None,
+            unwire_if_dead=self._refusing_write(temp_home / ".claude.json")))
+        monkeypatch.setattr(ops, "_config_lock_is_free", lambda budget: True)
+        monkeypatch.setattr(ops, "_certdir", lambda sw: temp_home)
+        with pytest.raises(StaleBuildWriteError):
+            ops.wire_launch_env(types.SimpleNamespace(backup_dir=temp_home), {})
+
+    def test_session_exec_stops_the_launch(self, temp_home, stale_build, monkeypatch):
+        """Asserts: `SessionManager._exec` lets a refusal from
+        `wire_launch_env` stop the launch (claude is never exec'd) instead of
+        dropping it as an optional feature's failure."""
+        import types
+
+        import claude_swap.pin as ops
+        from claude_swap import session as session_mod
+        from claude_swap.locking import StaleBuildWriteError
+
+        monkeypatch.setattr(ops, "wire_launch_env", self._refusing_write(
+            temp_home / ".claude.json"))
+        execs = []
+        monkeypatch.setattr(session_mod.os, "execvpe",
+                            lambda *a: execs.append(a))
+        monkeypatch.setattr(session_mod.subprocess, "run",
+                            lambda *a, **k: execs.append(a))
+        with pytest.raises(StaleBuildWriteError):
+            session_mod.SessionManager._exec(
+                types.SimpleNamespace(switcher=None), "claude", [], {})
+        assert execs == []

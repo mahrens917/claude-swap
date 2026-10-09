@@ -57,7 +57,11 @@ from claude_swap.exceptions import (
     SessionError,
 )
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.locking import FileLock, check_loaded_build_is_installed
+from claude_swap.locking import (
+    FileLock,
+    StaleBuildWriteError,
+    check_loaded_build_is_installed,
+)
 from claude_swap.models import Platform
 from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import get_default_global_config_path
@@ -769,6 +773,10 @@ class SessionManager:
             from claude_swap import pin as _pin
 
             env = _pin.wire_launch_env(self.switcher, env)
+        except StaleBuildWriteError:
+            # A stale build writes nothing: the refusal stops this launch,
+            # with its own WARNING from locking.py, rather than be dropped.
+            raise
         except Exception:  # noqa: BLE001 — an optional feature cannot block a launch
             pass
         argv = [claude_bin, *claude_args]

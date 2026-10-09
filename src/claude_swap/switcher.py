@@ -6788,6 +6788,11 @@ class ClaudeAccountSwitcher:
                     "The cloud pin is set but the daemon serving now cannot "
                     f"mint it. Run `cswap pin {account_num}` to re-apply it."
                 )
+        except StaleBuildWriteError:
+            # This process loaded an older build than the one installed: the
+            # refusal (its own WARNING from locking.py) stops it here rather
+            # than vanishing into a DEBUG line.
+            raise
         except Exception:  # noqa: BLE001 — the add already succeeded
             self._logger.debug("post-add re-pin skipped", exc_info=True)
 
@@ -7572,6 +7577,8 @@ class ClaudeAccountSwitcher:
                 return
             ok, msg = _pin.clear_pin(self)
             warning(f"Cloud pin: {msg}")
+        except StaleBuildWriteError:
+            raise
         except Exception as exc:  # noqa: BLE001 — removal already succeeded
             # The account IS gone; failing here would report a removal that
             # happened as an error. Say what was left behind instead.
@@ -14261,6 +14268,10 @@ refresh_input, timeout_s=6.0, slot=account_num, condemned=_condemned,
         # `warning()` and continue.
         try:
             _pin.clear_pin(self)
+        except StaleBuildWriteError:
+            # A stale build stops the purge at its first destructive step
+            # rather than carrying on to half-finish it.
+            raise
         except Exception as exc:  # noqa: BLE001 — purge continues, always
             warning(
                 f"Could not clear the cloud pin ({type(exc).__name__}: {exc}). "

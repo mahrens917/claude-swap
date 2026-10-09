@@ -30554,3 +30554,87 @@ class TestAStaleBuildWritesNoAccountStore:
         with pytest.raises(StaleBuildWriteError):
             transfer._import_accounts_locked(switcher, {}, [], False)
         assert switcher.sequence_file.read_bytes() == roster
+
+
+class TestAStaleBuildRefusalFromTheCloudRouteSurfaces:
+    """X3709 unit 2: the switcher's catches around the cloud route's
+    re-apply after an add and its clear on remove and purge let a stale
+    build's StaleBuildWriteError through, so the old process stops instead
+    of logging it at DEBUG, printing it as a leftover, or carrying on to
+    half-finish a purge. Each write is the real build check against the
+    ``stale_build`` fixture."""
+
+    @staticmethod
+    def _refusing_write(target):
+        from claude_swap.locking import check_loaded_build_is_installed
+
+        def _write(*a, **k):
+            check_loaded_build_is_installed(target)
+            raise AssertionError("the build check let a stale write through")
+
+        return _write
+
+    def test_the_reapply_after_an_add_raises(
+        self, temp_home, stale_build, monkeypatch, caplog
+    ):
+        """Asserts: a refused re-apply after an add raises the refusal and
+        logs its WARNING, rather than a DEBUG "skipped" line."""
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        monkeypatch.setattr(ops, "is_available", lambda: True)
+        monkeypatch.setattr(ops, "pinned_slot", lambda sw: "1")
+        monkeypatch.setattr(ops, "pin_is_applying", lambda sw: False)
+        monkeypatch.setattr(ops, "repin_current", self._refusing_write(
+            temp_home / ".claude" / "settings.json"))
+        with caplog.at_level(logging.DEBUG), pytest.raises(StaleBuildWriteError):
+            switcher._repin_if_pin_slot_refreshed("1")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("refusing to write" in m for m in messages)
+        assert not any("skipped" in m for m in messages)
+
+    def test_the_clear_on_remove_raises(self, temp_home, stale_build, monkeypatch):
+        """Asserts: a refused clear after a remove raises the refusal instead
+        of printing it as a leftover to clear by hand."""
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        monkeypatch.setattr(ops, "_pinned_email_now", lambda sw: ("a@b.c", ""))
+        monkeypatch.setattr(ops, "clear_pin", self._refusing_write(
+            temp_home / ".claude" / "settings.json"))
+        with pytest.raises(StaleBuildWriteError):
+            switcher._clear_pin_if_removed("a@b.c", "")
+
+    def test_the_clear_on_purge_stops_the_purge(
+        self, temp_home, request, monkeypatch
+    ):
+        """Asserts: when an install lands while the purge waits for its
+        confirmation (the purge's own up-front build check passed), a refused
+        clear at its first destructive step raises the refusal there (the
+        survivor check that follows it never runs) and the backup directory
+        is left in place."""
+        import claude_swap.pin as ops
+        from claude_swap.locking import StaleBuildWriteError
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        marker = switcher.backup_dir / "sequence.json"
+        marker.write_text("{}", encoding="utf-8")
+
+        def _confirm_while_an_install_lands(prompt=""):
+            request.getfixturevalue("stale_build")
+            return "y"
+
+        monkeypatch.setattr(builtins, "input", _confirm_while_an_install_lands)
+        monkeypatch.setattr(ops, "wired_env_keys", lambda sw=None: {})
+        later = []
+        monkeypatch.setattr(ops, "env_keys_survive",
+                            lambda before: later.append(before) or {})
+        monkeypatch.setattr(ops, "clear_pin", self._refusing_write(
+            temp_home / ".claude" / "settings.json"))
+        with pytest.raises(StaleBuildWriteError):
+            switcher.purge()
+        assert marker.read_text(encoding="utf-8") == "{}"
+        assert later == [], "the purge went on past the refused clear"

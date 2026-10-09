@@ -387,6 +387,11 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
             ):
                 if _clear_wiring_locked(switcher, path, unsplice):
                     changed = True
+        except StaleBuildWriteError:
+            # This process loaded an older build than the one installed: it
+            # writes nothing, and the refusal (with its own WARNING from
+            # locking.py) reaches the caller instead of reading as a lock.
+            raise
         except Exception as exc:  # noqa: BLE001
             # A lock we cannot take skips THIS file, never the other one.
             # Say which and why: this is the only record naming what stopped
@@ -887,6 +892,8 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
                 # so calling a copy here would enforce that guarantee with the
                 # implementation that does not survive our death.
                 clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S, only=dead)
+        except StaleBuildWriteError:
+            raise
         except Exception:  # noqa: BLE001
             pass
         return env
@@ -908,6 +915,8 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
                 isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
             ):
                 return wired
+    except StaleBuildWriteError:
+        raise
     except Exception:  # noqa: BLE001 — never block the launch
         pass
     # No proxy this launch. The env block is applied at boot, so a wiring a
@@ -918,6 +927,8 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     try:
         if _config_lock_is_free(_LAUNCH_LOCK_BUDGET_S):
             pin.unwire_if_dead(_certdir(switcher))
+    except StaleBuildWriteError:
+        raise
     except Exception:  # noqa: BLE001
         pass
     return env
@@ -1425,6 +1436,8 @@ def repin_current(switcher) -> bool:
                                    identity=identity_for_config(
                                        switcher, email=email,
                                        num=_slot_for(switcher, email, org))))
+    except StaleBuildWriteError:
+        raise
     except Exception:  # noqa: BLE001 — a repair must not take its caller down
         return False
 
@@ -1584,6 +1597,8 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
             unspliced or _back is None or bool(result)
             or _config_already_names(_back)
         )
+    except StaleBuildWriteError:
+        raise
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
     return unspliced and _pinned_email_now(switcher) == before
@@ -1869,6 +1884,8 @@ def clear_pin(switcher) -> tuple[bool, str]:
         impl = _impl()
         impl.apply_pin(switcher, None, None, identity=_back_to)
         _unsplice = False
+    except StaleBuildWriteError:
+        raise
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
         # WHOSE WRITE CAN BE LOST RUNS LAST. Killed here, the worst case is
         # record-live + wiring-gone: the next `--clear` re-triggers this same
@@ -2020,6 +2037,8 @@ def set_pin(
         started = _impl().apply_pin(
             switcher, email, org_uuid,
             identity=identity_for_config(switcher, email=email, num=num))
+    except StaleBuildWriteError:
+        raise
     except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
         rolled = _restore_pin(switcher, before)
         return False, (
@@ -2236,6 +2255,8 @@ def heal(
                 switcher, connect_timeout=connect_timeout
             ):
                 return True, "Restored the cloud pin"
+        except StaleBuildWriteError:
+            raise
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
             pass
         # The restart may have succeeded while returning False (it also uses
@@ -2297,6 +2318,8 @@ def heal(
                 "`cswap pin --heal --debug` for the reason (a held config "
                 "lock and a config directory you cannot write both land here)"
             )
+    except StaleBuildWriteError:
+        raise
     except Exception as exc:  # noqa: BLE001
         return False, f"Could not heal the cloud pin ({_safe(exc)})"
     # Refusing to act is not a reason to report the all-clear. A marker with
